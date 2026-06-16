@@ -57,6 +57,7 @@
       # Consumers inject their server with pkgs.zotero.override { apiUrl = ...; }.
       overlays.default = _final: prev: {
         zotero = prev.callPackage ./pkgs/zotero { inherit (prev) zotero; };
+        zhost = prev.callPackage ./pkgs/zhost { };
       };
 
       # programs.zotero — install + configure + (darwin) sign-on-activation.
@@ -81,9 +82,13 @@
       );
 
       checks = eachSystem (
-        { system, ... }:
+        { system, pkgs, ... }:
         {
           formatting = treefmtEval.${system}.config.build.check self;
+        }
+        # nixosTest needs a linux VM, so wire it only on linux systems.
+        // lib.optionalAttrs pkgs.stdenv.hostPlatform.isLinux {
+          nixos-sync = import ./checks/nixos-sync.nix { inherit pkgs self; };
         }
       );
 

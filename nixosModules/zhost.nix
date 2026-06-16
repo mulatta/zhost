@@ -85,6 +85,11 @@ in
     };
     users.groups.${cfg.user} = { };
 
+    # ReadWritePaths below requires the storage directory to already exist.
+    systemd.tmpfiles.rules = [
+      "d ${cfg.storageDir} 0750 ${cfg.user} ${cfg.user} -"
+    ];
+
     systemd.services.zhost = {
       description = "Self-hosted Zotero sync server";
       wantedBy = [ "multi-user.target" ];
@@ -106,7 +111,6 @@ in
         User = cfg.user;
         Group = cfg.user;
         LoadCredential = [ "api-key:${cfg.apiKeyFile}" ];
-        StateDirectory = "zhost";
         Restart = "on-failure";
 
         # Hardening: the service only needs its state dir and the PG socket.
