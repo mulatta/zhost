@@ -42,6 +42,10 @@
             deadnix.enable = true;
             keep-sorted.enable = true;
             nixfmt.enable = true;
+            rustfmt = {
+              enable = true;
+              edition = "2021";
+            };
             statix.enable = true;
           };
         }
@@ -67,6 +71,7 @@
           # Default build keeps upstream endpoints; consumers override the URLs.
           # Useful for `nix build`/eval smoke tests.
           zotero = pkgs.callPackage ./pkgs/zotero { };
+          zhost = pkgs.callPackage ./pkgs/zhost { };
         }
       );
 
