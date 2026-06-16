@@ -65,6 +65,11 @@
       homeModules.zotero = ./homeModules/zotero.nix;
       homeModules.default = ./homeModules/zotero.nix;
 
+      # malt deployment: systemd service + local postgres + credential-loaded key.
+      # The host wires the sops secret, wg bind and reverse proxy.
+      nixosModules.zhost = ./nixosModules/zhost.nix;
+      nixosModules.default = ./nixosModules/zhost.nix;
+
       packages = eachSystem (
         { pkgs, ... }:
         {
