@@ -83,5 +83,21 @@
       );
 
       formatter = eachSystem ({ system, ... }: treefmtEval.${system}.config.build.wrapper);
+
+      devShells = eachSystem (
+        { pkgs, ... }:
+        {
+          default = pkgs.mkShell {
+            packages = [
+              pkgs.cargo
+              pkgs.rustc
+              pkgs.rustfmt
+              pkgs.clippy
+              pkgs.postgresql_16
+              pkgs.sqlx-cli
+            ];
+          };
+        }
+      );
     };
 }
