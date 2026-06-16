@@ -26,6 +26,10 @@ struct Config {
     key: String,
     user_id: u64,
     bind: String,
+    /// Client-facing base URL (e.g. the reverse-proxy address). Used for the
+    /// login, upload and download URLs handed to the client, which must be
+    /// reachable by it — not the internal bind address.
+    public_url: String,
     database_url: String,
     storage_dir: String,
 }
@@ -109,7 +113,7 @@ async fn create_session() -> Response {
         StatusCode::CREATED,
         Json(json!({
             "sessionToken": "zhost-session",
-            "loginURL": format!("http://{}/login", cfg().bind),
+            "loginURL": format!("{}/login", cfg().public_url),
         })),
     )
         .into_response()
@@ -294,7 +298,7 @@ async fn file_post(
                 );
                 // Empty prefix/suffix: the client PUTs the raw file bytes to url.
                 Json(json!({
-                    "url": format!("http://{}/uploads/{}", cfg().bind, key),
+                    "url": format!("{}/uploads/{}", cfg().public_url, key),
                     "uploadKey": key,
                     "contentType": "application/octet-stream",
                     "prefix": "",
@@ -333,7 +337,7 @@ async fn file_get(Path((_id, key)): Path<(String, String)>) -> Response {
     let mut headers = HeaderMap::new();
     headers.insert(
         "location",
-        format!("http://{}/files/{}", cfg().bind, key)
+        format!("{}/files/{}", cfg().public_url, key)
             .parse()
             .unwrap(),
     );
@@ -486,13 +490,24 @@ async fn main() {
         )
         .init();
 
+    // The key is a single-line bearer token. Prefer a file (sops-nix /
+    // systemd LoadCredential) over the env, which is visible in /proc.
+    let key = match std::env::var("ZHOST_API_KEY_FILE") {
+        Ok(path) => std::fs::read_to_string(&path)
+            .expect("read ZHOST_API_KEY_FILE")
+            .trim()
+            .to_string(),
+        Err(_) => std::env::var("ZHOST_API_KEY").unwrap_or_else(|_| "zhost-dev-key".into()),
+    };
+    let bind = std::env::var("ZHOST_BIND").unwrap_or_else(|_| "127.0.0.1:8189".into());
     let _ = CFG.set(Config {
-        key: std::env::var("ZHOST_API_KEY").unwrap_or_else(|_| "zhost-dev-key".into()),
+        key,
         user_id: std::env::var("ZHOST_USER_ID")
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(1),
-        bind: std::env::var("ZHOST_BIND").unwrap_or_else(|_| "127.0.0.1:8189".into()),
+        public_url: std::env::var("ZHOST_PUBLIC_URL").unwrap_or_else(|_| format!("http://{bind}")),
+        bind,
         database_url: std::env::var("ZHOST_DATABASE_URL")
             .or_else(|_| std::env::var("DATABASE_URL"))
             .unwrap_or_else(|_| "postgres://localhost/zhost".into()),
