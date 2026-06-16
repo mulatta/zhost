@@ -1,11 +1,34 @@
 # zhost sync server — Zotero Web API v3 implementation spec
 
 Derived from the Zotero client sync code (`~/git/zotero/chrome/content/zotero/xpcom/sync/`,
-`storage/zfs.js`) and the official Web API v3 docs. This is the contract the
-server must satisfy so a (URL-redirected) stock Zotero client syncs against it.
+`storage/zfs.js`), the official Web API v3 docs, and live testing against a real
+Zotero 9 client. This is the contract the server must satisfy so a
+(URL-redirected) stock client syncs against it. The current server implements
+everything below; "out of scope" items remain unimplemented.
 
 Client file references use `syncAPIClient.js` (the request layer), `syncEngine.js`
 (sync flow), `zfs.js` (file storage).
+
+Behaviours confirmed by live testing (each is a hard requirement):
+
+- **Auth is the login-session flow, not credentials.** Zotero 9's "Login" calls
+  `POST /keys/sessions`, opens the returned `loginURL` in a browser, then polls
+  `GET /keys/sessions/<token>` until it reports `status: "completed"` with the
+  API key. It does not use `POST /keys` with a username/password.
+- **Write bodies are gzip-compressed** (`Content-Encoding: gzip`); the server
+  must decode them.
+- **Write `successful` must return the full canonical object** (with `itemType`
+  etc.) — echoing a partial upload makes the client throw "Unknown item type".
+- **Attachment `data` must emit `linkMode` before `filename`.** The client's
+  `fromJSON` processes fields in order and errors ("Link mode must be set before
+  setting attachment path") otherwise; jsonb sorts keys alphabetically, so the
+  server reorders linkMode to the front.
+- **File download is a `302`** carrying `Location` plus `Zotero-File-MD5` and
+  `Zotero-File-Modification-Time`; the client reads those headers and fetches the
+  bytes from `Location` separately (it does not auto-follow the redirect).
+- Attachment uploads exceed common default request-body limits; do not cap them.
+- Client-facing URLs (`loginURL`, the file upload `url`, the download `Location`)
+  must be the public/reverse-proxy address, not the internal bind address.
 
 ## Scope (MVP)
 
@@ -27,15 +50,17 @@ endpoints. MVP accepts one configured key; reject others with 403.
 | Endpoint | Notes |
 |---|---|
 | `GET /keys/current` | Return `{userID, username, displayName, access}` with full access (`access.user = {library:true, notes:true, write:true, files:true}`). Client reads `userID` + `access`. (syncAPIClient.js:53) |
-| `POST /keys` | Credentials→key. Body `{username, password, name, access}`; respond `201` `{key, userID, username, displayName, access}`. MVP may return the single configured key regardless of credentials, or skip if the key is provisioned manually. (syncAPIClient.js:535) |
-| `POST /keys/sessions`, `GET /keys/sessions/<token>` | OAuth-style login session. Optional — only needed if supporting in-app login flow. (syncAPIClient.js:575) |
+| `POST /keys/sessions` | **The login flow Zotero 9 actually uses.** Respond `201` `{sessionToken, loginURL}`. (syncAPIClient.js:575) |
+| `GET /keys/sessions/<token>` | Polled until done; single user, so answer immediately with `200` `{status:"completed", apiKey, userID, username}`. |
+| `POST /keys` | Legacy credentials→key. Not used by Zotero 9; the key is provisioned out of band (a secret file) instead. (syncAPIClient.js:535) |
 
 ## Required headers
 
 **Request (all):** `Zotero-API-Version` (int, e.g. 3), `Zotero-Schema-Version`
 (int), `Zotero-API-Key`. **Write requests also:** `If-Unmodified-Since-Version`,
 `Content-Type: application/json` (or `application/x-www-form-urlencoded` for file
-params).
+params), and `Content-Encoding: gzip` — the JSON body is gzipped and must be
+decoded before parsing.
 
 **Response (server must set):** `Last-Modified-Version` on every data response and
 version-listing response. `Link` (`<url>; rel=next`) + `Total-Results` for
@@ -84,16 +109,18 @@ All writes return `Last-Modified-Version` and use `If-Unmodified-Since-Version`.
 | `DELETE <prefix>/settings?settingKey=k1,k2` | `204` / `412`. (syncAPIClient.js:336) |
 | `POST <prefix>/fulltext` — array `{key, content, indexedChars, totalChars, indexedPages, totalPages}` (≤10 items / 500KB) | `200` result obj / `412`. (syncAPIClient.js:506) |
 
-**Upload-result object** (HTTP 200, parsed at syncEngine.js:1375):
+**Upload-result object** (HTTP 200, parsed at syncEngine.js:1375). Keyed by the
+object's index in the submitted batch; each value is the **full canonical
+object** the client round-trips (a partial echo is rejected):
 ```json
 {
-  "successful": [ { "key": "...", "version": N, "data": { } } ],
-  "unchanged":  [ "key", ... ],
-  "failed":     [ { "key": "...", "code": 400, "message": "..." } ]
+  "successful": { "0": { "key": "...", "version": N, "data": { } } },
+  "success":    {},
+  "unchanged":  {},
+  "failed":     {}
 }
 ```
-`failed` code `<500` = permanent (client drops), `>=500` = retry. New objects
-without a key are assigned a server key and returned in `successful`.
+`failed` code `<500` = permanent (client drops), `>=500` = retry.
 
 ## File sync (ZFS-style, local storage)
 
@@ -115,12 +142,15 @@ Three-step upload, then download. Client code: `zfs.js`.
    keyed by `uploadKey`.
 3. **Registration** — `POST <prefix>/items/<key>/file`,
    form body `upload=<uploadKey>`, same `If-Match`/`If-None-Match`. Respond
-   `204` + `Last-Modified-Version`; commit the file, update attachment
-   `md5`/`mtime`, bump library version. (zfs.js:703)
+   `204` + `Last-Modified-Version`; commit the file and **stamp `md5`/`mtime`
+   into the attachment item's `data`** (the downloading client needs them to
+   reconcile the file), bumping the library version. (zfs.js:703)
 
-**Download** — `GET <prefix>/items/<key>/file`. Return the bytes (200) or a
-`302` to a location; set `ETag`/`Zotero-File-MD5` to the md5,
-`Zotero-File-Modification-Time` to mtime. `404` if absent. (zfs.js:52)
+**Download** — `GET <prefix>/items/<key>/file`. Respond **`302`** (the client
+reads metadata from it without following) with `Location` pointing at a bytes
+endpoint, plus `Zotero-File-MD5`, `Zotero-File-Modification-Time` and
+`Zotero-File-Compressed: No`. The client then GETs `Location` for the bytes.
+`404` if absent. (zfs.js:52, zfs.js:109)
 
 ## Pagination & throttling
 
@@ -145,11 +175,12 @@ Sketch:
 Writes run in a transaction that bumps `library.version` and stamps the affected
 rows, so conditional version checks are atomic.
 
-## Open questions / verify against a live sync
+## Resolved by live testing
 
-- Exact `data` JSON shape per object type (mirror what `format=json` download
-  returns; the client round-trips it).
-- Whether the client requires `Zotero-Write-Token` (idempotency) — not observed
-  in the read pass; confirm during write testing.
-- `mtime` units: file docs say ms; confirm client `zfs.js` sends ms.
-- `POST /keys` necessity vs. provisioning the key out of band.
+- `data` JSON shape: stored opaquely and round-tripped verbatim; only attachment
+  field order matters (linkMode first, see above).
+- `Zotero-Write-Token` is not required — the client never sends it; the
+  `If-Unmodified-Since-Version` → 412 guard is sufficient.
+- `mtime` is in milliseconds.
+- `POST /keys` is unused; the key is provisioned as a secret file and the client
+  obtains it through the login session.
