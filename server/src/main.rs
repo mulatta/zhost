@@ -249,21 +249,48 @@ async fn deleted(Query(params): Query<HashMap<String, String>>) -> Response {
     }
 }
 
-/// Acknowledge full-text content without storing it yet (storage arrives in a
-/// later slice); the client just needs each submitted item marked successful.
-async fn fulltext_write(body: Bytes) -> Response {
-    let items: Vec<Value> = serde_json::from_slice(&body).unwrap_or_default();
-    let version = store::current_version(pool()).await.unwrap_or(0);
-    let mut successful = serde_json::Map::new();
-    for (index, item) in items.iter().enumerate() {
-        let key = item.get("key").and_then(Value::as_str).unwrap_or_default();
-        successful.insert(index.to_string(), json!({ "key": key, "version": version }));
+/// `GET /fulltext?format=versions&since=N` → `{itemKey: version}` for content
+/// changed after `since`, so the client downloads only what it lacks.
+async fn fulltext_versions(Query(params): Query<HashMap<String, String>>) -> Response {
+    let since = params
+        .get("since")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    match store::fulltext_versions(pool(), since).await {
+        Ok(value) => (current_headers().await, Json(value)).into_response(),
+        Err(error) => server_error("fulltext versions", error),
     }
-    (
-        version_headers(version),
-        Json(json!({ "successful": successful, "unchanged": {}, "failed": {} })),
-    )
-        .into_response()
+}
+
+/// `GET /items/<key>/fulltext` → the item's content object, with the row's
+/// version in `Last-Modified-Version` (the client stores it to skip re-fetching).
+async fn fulltext_item(Path((_id, key)): Path<(String, String)>) -> Response {
+    match store::fulltext_item(pool(), &key).await {
+        Ok(Some((version, data))) => (version_headers(version), Json(data)).into_response(),
+        Ok(None) => StatusCode::NOT_FOUND.into_response(),
+        Err(error) => server_error("fulltext item", error),
+    }
+}
+
+/// `POST /fulltext` — store a batch of extracted content, returning the per-index
+/// result map the client reads to mark each item synced (or `412` if stale).
+async fn fulltext_write(headers: HeaderMap, body: Bytes) -> Response {
+    let batch: Vec<Value> = match serde_json::from_slice(&body) {
+        Ok(batch) => batch,
+        Err(error) => {
+            tracing::warn!(%error, "malformed fulltext body");
+            return StatusCode::BAD_REQUEST.into_response();
+        }
+    };
+    match store::write_fulltext(pool(), batch, if_unmodified(&headers)).await {
+        Ok(store::Outcome::Done((version, successful))) => (
+            version_headers(version),
+            Json(json!({ "successful": successful, "unchanged": {}, "failed": {} })),
+        )
+            .into_response(),
+        Ok(store::Outcome::Conflict(current)) => conflict(current),
+        Err(error) => server_error("fulltext write", error),
+    }
 }
 
 fn file_path(item_key: &str) -> std::path::PathBuf {
@@ -491,7 +518,11 @@ fn app() -> Router {
             "/users/{id}/items/top",
             get(|Query(p): Query<HashMap<String, String>>| read("item", p)),
         )
-        .route("/users/{id}/fulltext", get(groups).post(fulltext_write))
+        .route(
+            "/users/{id}/fulltext",
+            get(fulltext_versions).post(fulltext_write),
+        )
+        .route("/users/{id}/items/{key}/fulltext", get(fulltext_item))
         .route(
             "/users/{id}/items/{key}/file",
             get(file_get).post(file_post),

@@ -10,6 +10,13 @@ def http_code(args):
     return machine.succeed(f"curl -s -o /dev/null -w '%{{http_code}}' {args}").strip()
 
 
+def library_version():
+    return machine.succeed(
+        f"curl -sf -D - -o /dev/null '{base}/users/1/items?format=versions&since=0' {auth} "
+        f"| grep -i last-modified-version | tr -d '\\r' | cut -d' ' -f2"
+    ).strip()
+
+
 machine.wait_for_unit("postgresql.service")
 machine.wait_for_unit("zhost.service")
 machine.wait_for_open_port(8189)
@@ -82,6 +89,58 @@ with subtest("an attachment file uploads and downloads"):
         f"| grep -i 'zotero-file-md5: abc'"
     )
     assert machine.succeed(f"curl -sf {base}/files/ATTACH001") == "hello"
+
+with subtest("annotations round-trip as ordinary items"):
+    # Highlights/notes are items (itemType annotation/note), so they sync through
+    # the same opaque object path rather than any dedicated endpoint.
+    machine.succeed(
+        f"curl -sf -X POST {base}/users/1/items {auth} "
+        f"-d '[{{\"key\":\"ANNOT001\",\"itemType\":\"annotation\","
+        f"\"annotationType\":\"highlight\",\"annotationText\":\"marked\","
+        f"\"parentItem\":\"ATTACH001\"}}]' "
+        f"| jq -e '.successful.\"0\".data.annotationText == \"marked\"'"
+    )
+    machine.succeed(
+        f"curl -sf '{base}/users/1/items?itemKey=ANNOT001&format=json' {auth} "
+        f"| jq -e '.[0].data.annotationType == \"highlight\"'"
+    )
+
+with subtest("full-text content uploads, lists versions, and downloads"):
+    version = library_version()
+    machine.succeed(
+        f"curl -sf -X POST {base}/users/1/fulltext {auth} "
+        f"-H 'If-Unmodified-Since-Version: {version}' "
+        f"-d '[{{\"key\":\"ATTACH001\",\"content\":\"hello world\","
+        f"\"indexedChars\":11,\"totalChars\":11,\"indexedPages\":1,\"totalPages\":1}}]' "
+        f"| jq -e '.successful.\"0\".key == \"ATTACH001\"'"
+    )
+    machine.succeed(
+        f"curl -sf '{base}/users/1/fulltext?format=versions&since=0' {auth} | jq -e '.ATTACH001'"
+    )
+    # The per-item version must equal the value in the versions map, else the
+    # client re-downloads content it already holds every sync.
+    item_v = machine.succeed(
+        f"curl -sf -D - -o /dev/null '{base}/users/1/items/ATTACH001/fulltext' {auth} "
+        f"| grep -i last-modified-version | tr -d '\\r' | cut -d' ' -f2"
+    ).strip()
+    list_v = machine.succeed(
+        f"curl -sf '{base}/users/1/fulltext?format=versions&since=0' {auth} | jq -r '.ATTACH001'"
+    ).strip()
+    assert item_v == list_v, f"{item_v} != {list_v}"
+    machine.succeed(
+        f"curl -sf '{base}/users/1/items/ATTACH001/fulltext' {auth} "
+        f"| jq -e '.content == \"hello world\" and .totalPages == 1'"
+    )
+
+with subtest("a stale full-text write is rejected with 412"):
+    assert (
+        http_code(
+            f"-X POST {base}/users/1/fulltext {auth} "
+            f"-H 'If-Unmodified-Since-Version: 0' "
+            f"-d '[{{\"key\":\"ATTACH001\",\"content\":\"x\"}}]'"
+        )
+        == "412"
+    )
 
 with subtest("deletes are recorded in the deletion log"):
     machine.succeed(f"curl -sf -X DELETE '{base}/users/1/items?itemKey=ITEM0001' {auth}")
