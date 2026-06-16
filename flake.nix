@@ -55,6 +55,12 @@
         zotero = prev.callPackage ./pkgs/zotero { inherit (prev) zotero; };
       };
 
+      # programs.zotero — install + configure + (darwin) sign-on-activation.
+      # Consumers must also apply overlays.default so pkgs.zotero is the patched
+      # build the module expects.
+      homeModules.zotero = ./homeModules/zotero.nix;
+      homeModules.default = ./homeModules/zotero.nix;
+
       packages = eachSystem (
         { pkgs, ... }:
         {
