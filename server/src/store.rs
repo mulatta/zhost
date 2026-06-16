@@ -395,7 +395,10 @@ pub async fn write_fulltext(
             .and_then(Value::as_str)
             .unwrap_or_default()
             .to_string();
-        let content = item.get("content").and_then(Value::as_str).unwrap_or_default();
+        let content = item
+            .get("content")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
         let count = |name: &str| item.get(name).and_then(Value::as_i64).unwrap_or(0);
         sqlx::query(
             "insert into fulltext \

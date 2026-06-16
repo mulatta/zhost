@@ -94,7 +94,7 @@ carries its own `version` (the library version at which it last changed).
 | `GET <prefix>/{collections,searches,items}?format=versions&since=<v>` (items also `includeTrashed=1`, optional `?top` via `items/top`) | `200` `{key: version}` or `304`. (syncAPIClient.js:213) |
 | `GET <prefix>/{collections,searches,items}?{objectKey}=k1,k2,...&format=json` | `200` array of `{key, version, data}`. Client batches ≤100 keys/request. (syncAPIClient.js:269) |
 | `GET <prefix>/fulltext?format=versions&since=<v>` | `200` `{itemKey: version}`. (syncAPIClient.js:462) |
-| `GET <prefix>/items/<key>/fulltext` | `200` `{indexedChars, totalChars, indexedPages, totalPages, content}` or `404`. (syncAPIClient.js:484) |
+| `GET <prefix>/items/<key>/fulltext` | `200` `{indexedChars, totalChars, indexedPages, totalPages, content}` or `404`. The `Last-Modified-Version` here **must equal** that item's value in the versions map above (it is the row's own version, not the current library version); otherwise the client re-downloads content it already holds every sync. (syncAPIClient.js:484, syncFullTextEngine.js:91) |
 
 ### Write
 
