@@ -203,6 +203,23 @@ async fn deleted(Query(params): Query<HashMap<String, String>>) -> Response {
     }
 }
 
+/// Acknowledge full-text content without storing it yet (storage arrives in a
+/// later slice); the client just needs each submitted item marked successful.
+async fn fulltext_write(body: Bytes) -> Response {
+    let items: Vec<Value> = serde_json::from_slice(&body).unwrap_or_default();
+    let version = store::current_version(pool()).await.unwrap_or(0);
+    let mut successful = serde_json::Map::new();
+    for (index, item) in items.iter().enumerate() {
+        let key = item.get("key").and_then(Value::as_str).unwrap_or_default();
+        successful.insert(index.to_string(), json!({ "key": key, "version": version }));
+    }
+    (
+        version_headers(version),
+        Json(json!({ "successful": successful, "unchanged": {}, "failed": {} })),
+    )
+        .into_response()
+}
+
 /// Pretend the attachment file is already present so the client skips the
 /// upload; real file storage arrives in a later slice.
 async fn file_authorisation() -> Response {
@@ -317,7 +334,7 @@ fn app() -> Router {
             "/users/{id}/items/top",
             get(|Query(p): Query<HashMap<String, String>>| read("item", p)),
         )
-        .route("/users/{id}/fulltext", get(groups))
+        .route("/users/{id}/fulltext", get(groups).post(fulltext_write))
         .route("/users/{id}/items/{key}/file", post(file_authorisation))
         .route("/users/{id}/deleted", get(deleted))
         .layer(middleware::from_fn(log_and_auth))
