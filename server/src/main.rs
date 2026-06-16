@@ -8,11 +8,11 @@
 mod store;
 
 use std::collections::HashMap;
-use std::sync::OnceLock;
+use std::sync::{LazyLock, Mutex, OnceLock};
 
 use axum::{
     body::{Body, Bytes},
-    extract::{Query, Request},
+    extract::{Form, Path, Query, Request},
     http::{HeaderMap, StatusCode},
     middleware::{self, Next},
     response::{IntoResponse, Response},
@@ -27,10 +27,24 @@ struct Config {
     user_id: u64,
     bind: String,
     database_url: String,
+    storage_dir: String,
 }
 
 static CFG: OnceLock<Config> = OnceLock::new();
 static POOL: OnceLock<PgPool> = OnceLock::new();
+
+/// In-flight file uploads, keyed by the upload key (= attachment item key),
+/// remembered between the authorisation and registration steps.
+static PENDING: LazyLock<Mutex<HashMap<String, PendingUpload>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+#[derive(Clone)]
+struct PendingUpload {
+    md5: String,
+    filename: String,
+    filesize: i64,
+    mtime: i64,
+}
 
 fn cfg() -> &'static Config {
     CFG.get().expect("config initialised in main")
@@ -50,7 +64,10 @@ fn access() -> Value {
 
 fn version_headers(version: i64) -> HeaderMap {
     let mut headers = HeaderMap::new();
-    headers.insert("last-modified-version", version.to_string().parse().unwrap());
+    headers.insert(
+        "last-modified-version",
+        version.to_string().parse().unwrap(),
+    );
     headers
 }
 
@@ -131,7 +148,10 @@ fn server_error(context: &str, error: sqlx::Error) -> Response {
 /// `?<kind>Key=a,b&format=json` returns the full `[{key, version, data}]`.
 async fn read(kind: &str, params: HashMap<String, String>) -> Response {
     let result = if params.get("format").map(String::as_str) == Some("versions") {
-        let since = params.get("since").and_then(|s| s.parse().ok()).unwrap_or(0);
+        let since = params
+            .get("since")
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0);
         store::versions(pool(), kind, since).await
     } else {
         let keys = params
@@ -196,7 +216,10 @@ async fn settings_write(body: Bytes) -> Response {
 }
 
 async fn deleted(Query(params): Query<HashMap<String, String>>) -> Response {
-    let since = params.get("since").and_then(|s| s.parse().ok()).unwrap_or(0);
+    let since = params
+        .get("since")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
     match store::deleted(pool(), since).await {
         Ok(value) => (current_headers().await, Json(value)).into_response(),
         Err(error) => server_error("deleted", error),
@@ -220,10 +243,104 @@ async fn fulltext_write(body: Bytes) -> Response {
         .into_response()
 }
 
-/// Pretend the attachment file is already present so the client skips the
-/// upload; real file storage arrives in a later slice.
-async fn file_authorisation() -> Response {
-    (current_headers().await, Json(json!({ "exists": 1 }))).into_response()
+fn file_path(item_key: &str) -> std::path::PathBuf {
+    std::path::Path::new(&cfg().storage_dir).join(item_key)
+}
+
+/// Attachment file endpoint. The same path serves both POST steps:
+/// authorisation (`md5`/`filename`/`filesize`/`mtime` form) and registration
+/// (`upload` form, after the bytes have been PUT to the upload URL).
+async fn file_post(
+    Path((_id, key)): Path<(String, String)>,
+    Form(form): Form<HashMap<String, String>>,
+) -> Response {
+    if form.contains_key("upload") {
+        let pending = PENDING.lock().unwrap().get(&key).cloned();
+        let Some(upload) = pending else {
+            return (StatusCode::BAD_REQUEST, "no pending upload").into_response();
+        };
+        match store::register_file(
+            pool(),
+            &key,
+            &upload.md5,
+            &upload.filename,
+            upload.filesize,
+            upload.mtime,
+        )
+        .await
+        {
+            Ok(version) => {
+                PENDING.lock().unwrap().remove(&key);
+                (StatusCode::NO_CONTENT, version_headers(version)).into_response()
+            }
+            Err(error) => server_error("register file", error),
+        }
+    } else {
+        let md5 = form.get("md5").cloned().unwrap_or_default();
+        match store::file_exists(pool(), &key, &md5).await {
+            Ok(true) => (current_headers().await, Json(json!({ "exists": 1 }))).into_response(),
+            Ok(false) => {
+                PENDING.lock().unwrap().insert(
+                    key.clone(),
+                    PendingUpload {
+                        md5,
+                        filename: form.get("filename").cloned().unwrap_or_default(),
+                        filesize: form
+                            .get("filesize")
+                            .and_then(|s| s.parse().ok())
+                            .unwrap_or(0),
+                        mtime: form.get("mtime").and_then(|s| s.parse().ok()).unwrap_or(0),
+                    },
+                );
+                // Empty prefix/suffix: the client PUTs the raw file bytes to url.
+                Json(json!({
+                    "url": format!("http://{}/uploads/{}", cfg().bind, key),
+                    "uploadKey": key,
+                    "contentType": "application/octet-stream",
+                    "prefix": "",
+                    "suffix": "",
+                }))
+                .into_response()
+            }
+            Err(error) => server_error("file auth", error),
+        }
+    }
+}
+
+/// Receive the raw attachment bytes (prefix/suffix are empty) and store them.
+async fn upload_put(Path(upload_key): Path<String>, body: Bytes) -> Response {
+    if let Err(error) = tokio::fs::create_dir_all(&cfg().storage_dir).await {
+        tracing::error!(%error, "create storage dir");
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    }
+    match tokio::fs::write(file_path(&upload_key), &body).await {
+        Ok(()) => StatusCode::CREATED.into_response(),
+        Err(error) => {
+            tracing::error!(%error, "store file");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    }
+}
+
+/// Serve attachment bytes with the md5/mtime the client verifies against.
+async fn file_get(Path((_id, key)): Path<(String, String)>) -> Response {
+    let (md5, _filename, mtime) = match store::file_meta(pool(), &key).await {
+        Ok(Some(meta)) => meta,
+        Ok(None) => return StatusCode::NOT_FOUND.into_response(),
+        Err(error) => return server_error("file meta", error),
+    };
+    match tokio::fs::read(file_path(&key)).await {
+        Ok(bytes) => {
+            let mut headers = HeaderMap::new();
+            headers.insert("etag", md5.parse().unwrap());
+            headers.insert(
+                "zotero-file-modification-time",
+                mtime.to_string().parse().unwrap(),
+            );
+            (headers, bytes).into_response()
+        }
+        Err(_) => StatusCode::NOT_FOUND.into_response(),
+    }
 }
 
 // --- middleware -------------------------------------------------------------
@@ -272,13 +389,14 @@ async fn log_and_auth(req: Request, next: Next) -> Response {
         %uri,
         api_version = %header("zotero-api-version"),
         if_unmod = %header("if-unmodified-since-version"),
-        body = %String::from_utf8_lossy(&bytes),
+        body = %String::from_utf8_lossy(&bytes).chars().take(400).collect::<String>(),
         "request"
     );
 
     let path = parts.uri.path();
     let is_bootstrap = (parts.method == axum::http::Method::POST && path == "/keys")
         || path.starts_with("/keys/sessions")
+        || path.starts_with("/uploads")
         || path == "/login";
     if !is_bootstrap {
         let authorised = parts
@@ -335,7 +453,11 @@ fn app() -> Router {
             get(|Query(p): Query<HashMap<String, String>>| read("item", p)),
         )
         .route("/users/{id}/fulltext", get(groups).post(fulltext_write))
-        .route("/users/{id}/items/{key}/file", post(file_authorisation))
+        .route(
+            "/users/{id}/items/{key}/file",
+            get(file_get).post(file_post),
+        )
+        .route("/uploads/{key}", post(upload_put))
         .route("/users/{id}/deleted", get(deleted))
         .layer(middleware::from_fn(log_and_auth))
 }
@@ -358,6 +480,8 @@ async fn main() {
         database_url: std::env::var("ZHOST_DATABASE_URL")
             .or_else(|_| std::env::var("DATABASE_URL"))
             .unwrap_or_else(|_| "postgres://localhost/zhost".into()),
+        storage_dir: std::env::var("ZHOST_STORAGE_DIR")
+            .unwrap_or_else(|_| "/tmp/zhost-storage".into()),
     });
 
     let pool = store::connect(&cfg().database_url)

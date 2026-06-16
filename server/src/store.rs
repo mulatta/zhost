@@ -194,6 +194,68 @@ pub async fn write_settings(pool: &PgPool, body: Value) -> sqlx::Result<i64> {
     Ok(version)
 }
 
+/// Whether an attachment file with this md5 is already registered.
+pub async fn file_exists(pool: &PgPool, item_key: &str, md5: &str) -> sqlx::Result<bool> {
+    let row =
+        sqlx::query("select 1 from file where library_id = $1 and item_key = $2 and md5 = $3")
+            .bind(LIBRARY_ID)
+            .bind(item_key)
+            .bind(md5)
+            .fetch_optional(pool)
+            .await?;
+    Ok(row.is_some())
+}
+
+/// md5, filename, mtime for an attachment file, if registered.
+pub async fn file_meta(
+    pool: &PgPool,
+    item_key: &str,
+) -> sqlx::Result<Option<(String, String, i64)>> {
+    let row = sqlx::query(
+        "select md5, filename, mtime from file where library_id = $1 and item_key = $2",
+    )
+    .bind(LIBRARY_ID)
+    .bind(item_key)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.map(|r| (r.get("md5"), r.get("filename"), r.get("mtime"))))
+}
+
+/// Register an uploaded attachment file, bumping the library version.
+pub async fn register_file(
+    pool: &PgPool,
+    item_key: &str,
+    md5: &str,
+    filename: &str,
+    filesize: i64,
+    mtime: i64,
+) -> sqlx::Result<i64> {
+    let mut tx = pool.begin().await?;
+    let version: i64 =
+        sqlx::query("update library set version = version + 1 where id = $1 returning version")
+            .bind(LIBRARY_ID)
+            .fetch_one(&mut *tx)
+            .await?
+            .get("version");
+    sqlx::query(
+        "insert into file (library_id, item_key, md5, filename, filesize, mtime, version) \
+         values ($1, $2, $3, $4, $5, $6, $7) \
+         on conflict (library_id, item_key) \
+         do update set md5 = $3, filename = $4, filesize = $5, mtime = $6, version = $7",
+    )
+    .bind(LIBRARY_ID)
+    .bind(item_key)
+    .bind(md5)
+    .bind(filename)
+    .bind(filesize)
+    .bind(mtime)
+    .bind(version)
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(version)
+}
+
 /// Deleted object keys after `since`, grouped by kind for the /deleted endpoint.
 pub async fn deleted(pool: &PgPool, since: i64) -> sqlx::Result<Value> {
     let rows = sqlx::query("select kind, key from deletion where library_id = $1 and version > $2")

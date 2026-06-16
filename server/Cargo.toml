@@ -13,7 +13,7 @@ sqlx = { version = "0.8", default-features = false, features = [
   "migrate",
   "macros",
 ] }
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal", "fs"] }
 serde_json = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
