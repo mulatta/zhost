@@ -12,7 +12,7 @@ use std::sync::{LazyLock, Mutex, OnceLock};
 
 use axum::{
     body::{Body, Bytes},
-    extract::{Form, Path, Query, Request},
+    extract::{DefaultBodyLimit, Form, Path, Query, Request},
     http::{HeaderMap, StatusCode},
     middleware::{self, Next},
     response::{IntoResponse, Response},
@@ -322,23 +322,34 @@ async fn upload_put(Path(upload_key): Path<String>, body: Bytes) -> Response {
     }
 }
 
-/// Serve attachment bytes with the md5/mtime the client verifies against.
+/// The client reads md5/mtime from this response's headers (it does not follow
+/// the redirect automatically) and then downloads the bytes from `Location`.
 async fn file_get(Path((_id, key)): Path<(String, String)>) -> Response {
     let (md5, _filename, mtime) = match store::file_meta(pool(), &key).await {
         Ok(Some(meta)) => meta,
         Ok(None) => return StatusCode::NOT_FOUND.into_response(),
         Err(error) => return server_error("file meta", error),
     };
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        "location",
+        format!("http://{}/files/{}", cfg().bind, key)
+            .parse()
+            .unwrap(),
+    );
+    headers.insert(
+        "zotero-file-modification-time",
+        mtime.to_string().parse().unwrap(),
+    );
+    headers.insert("zotero-file-md5", md5.parse().unwrap());
+    headers.insert("zotero-file-compressed", "No".parse().unwrap());
+    (StatusCode::FOUND, headers).into_response()
+}
+
+/// Serve the raw attachment bytes the file_get redirect points at.
+async fn file_download(Path(key): Path<String>) -> Response {
     match tokio::fs::read(file_path(&key)).await {
-        Ok(bytes) => {
-            let mut headers = HeaderMap::new();
-            headers.insert("etag", md5.parse().unwrap());
-            headers.insert(
-                "zotero-file-modification-time",
-                mtime.to_string().parse().unwrap(),
-            );
-            (headers, bytes).into_response()
-        }
+        Ok(bytes) => bytes.into_response(),
         Err(_) => StatusCode::NOT_FOUND.into_response(),
     }
 }
@@ -397,6 +408,7 @@ async fn log_and_auth(req: Request, next: Next) -> Response {
     let is_bootstrap = (parts.method == axum::http::Method::POST && path == "/keys")
         || path.starts_with("/keys/sessions")
         || path.starts_with("/uploads")
+        || path.starts_with("/files")
         || path == "/login";
     if !is_bootstrap {
         let authorised = parts
@@ -458,7 +470,11 @@ fn app() -> Router {
             get(file_get).post(file_post),
         )
         .route("/uploads/{key}", post(upload_put))
+        .route("/files/{key}", get(file_download))
         .route("/users/{id}/deleted", get(deleted))
+        // Attachment uploads exceed the default 2 MiB extractor limit; the
+        // middleware already buffers the whole body, so lift it.
+        .layer(DefaultBodyLimit::disable())
         .layer(middleware::from_fn(log_and_auth))
 }
 

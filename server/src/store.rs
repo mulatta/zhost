@@ -11,6 +11,29 @@ use sqlx::{PgPool, Row};
 /// Single user, single personal library.
 const LIBRARY_ID: i64 = 1;
 
+/// Zotero's attachment `fromJSON` processes fields in object order and requires
+/// `linkMode` before `filename`/`path`. jsonb storage sorts keys alphabetically
+/// (filename < linkMode), so re-emit attachment data with linkMode first. Relies
+/// on serde_json's preserve_order feature.
+fn linkmode_first(data: Value) -> Value {
+    let Value::Object(map) = &data else {
+        return data;
+    };
+    if !map.contains_key("linkMode") {
+        return data;
+    }
+    let mut ordered = Map::new();
+    if let Some(link_mode) = map.get("linkMode") {
+        ordered.insert("linkMode".into(), link_mode.clone());
+    }
+    for (key, value) in map {
+        if key != "linkMode" {
+            ordered.insert(key.clone(), value.clone());
+        }
+    }
+    Value::Object(ordered)
+}
+
 pub async fn connect(url: &str) -> sqlx::Result<PgPool> {
     let pool = PgPool::connect(url).await?;
     sqlx::migrate!("./migrations").run(&pool).await?;
@@ -60,7 +83,7 @@ pub async fn objects(pool: &PgPool, kind: &str, keys: &[String]) -> sqlx::Result
             serde_json::json!({
                 "key": row.get::<String, _>("key"),
                 "version": row.get::<i64, _>("version"),
-                "data": row.get::<Value, _>("data"),
+                "data": linkmode_first(row.get::<Value, _>("data")),
             })
         })
         .collect();
@@ -110,7 +133,7 @@ pub async fn write(pool: &PgPool, kind: &str, batch: Vec<Value>) -> sqlx::Result
             .await?;
         successful.insert(
             index.to_string(),
-            serde_json::json!({ "key": key, "version": version, "data": object }),
+            serde_json::json!({ "key": key, "version": version, "data": linkmode_first(object) }),
         );
     }
     tx.commit().await?;
@@ -250,6 +273,21 @@ pub async fn register_file(
     .bind(filesize)
     .bind(mtime)
     .bind(version)
+    .execute(&mut *tx)
+    .await?;
+    // Real Zotero stamps md5/mtime onto the attachment item's data when the
+    // file is registered; without them the downloading client can't reconcile
+    // the file and rejects the attachment.
+    sqlx::query(
+        "update object set version = $3, \
+         data = data || jsonb_build_object('md5', $4::text, 'mtime', $5::bigint, 'version', $3) \
+         where library_id = $1 and kind = 'item' and key = $2",
+    )
+    .bind(LIBRARY_ID)
+    .bind(item_key)
+    .bind(version)
+    .bind(md5)
+    .bind(mtime)
     .execute(&mut *tx)
     .await?;
     tx.commit().await?;
