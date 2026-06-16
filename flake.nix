@@ -22,7 +22,7 @@
         "aarch64-darwin"
       ];
 
-      lib = nixpkgs.lib;
+      inherit (nixpkgs) lib;
 
       eachSystem =
         f:
@@ -48,6 +48,22 @@
       );
     in
     {
+      # Replaces nixpkgs' zotero with the self-hosted-patched build. linux.nix
+      # bases on prev.zotero, so passing it explicitly avoids infinite recursion.
+      # Consumers inject their server with pkgs.zotero.override { apiUrl = ...; }.
+      overlays.default = _final: prev: {
+        zotero = prev.callPackage ./pkgs/zotero { inherit (prev) zotero; };
+      };
+
+      packages = eachSystem (
+        { pkgs, ... }:
+        {
+          # Default build keeps upstream endpoints; consumers override the URLs.
+          # Useful for `nix build`/eval smoke tests.
+          zotero = pkgs.callPackage ./pkgs/zotero { };
+        }
+      );
+
       checks = eachSystem (
         { system, ... }:
         {
