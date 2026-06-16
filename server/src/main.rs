@@ -148,6 +148,18 @@ fn server_error(context: &str, error: sqlx::Error) -> Response {
     StatusCode::INTERNAL_SERVER_ERROR.into_response()
 }
 
+/// The library version the client expects to still hold; a mismatch is a 412.
+fn if_unmodified(headers: &HeaderMap) -> Option<i64> {
+    headers
+        .get("if-unmodified-since-version")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.parse().ok())
+}
+
+fn conflict(current: i64) -> Response {
+    (StatusCode::PRECONDITION_FAILED, version_headers(current)).into_response()
+}
+
 /// `format=versions&since=N` returns the changed `{key: version}` map; otherwise
 /// `?<kind>Key=a,b&format=json` returns the full `[{key, version, data}]`.
 async fn read(kind: &str, params: HashMap<String, String>) -> Response {
@@ -170,7 +182,7 @@ async fn read(kind: &str, params: HashMap<String, String>) -> Response {
     }
 }
 
-async fn write(kind: &str, body: Bytes) -> Response {
+async fn write(kind: &str, headers: HeaderMap, body: Bytes) -> Response {
     let batch: Vec<Value> = match serde_json::from_slice(&body) {
         Ok(batch) => batch,
         Err(error) => {
@@ -178,8 +190,8 @@ async fn write(kind: &str, body: Bytes) -> Response {
             return StatusCode::BAD_REQUEST.into_response();
         }
     };
-    match store::write(pool(), kind, batch).await {
-        Ok((version, successful)) => (
+    match store::write(pool(), kind, batch, if_unmodified(&headers)).await {
+        Ok(store::Outcome::Done((version, successful))) => (
             version_headers(version),
             Json(json!({
                 "successful": successful,
@@ -189,17 +201,21 @@ async fn write(kind: &str, body: Bytes) -> Response {
             })),
         )
             .into_response(),
+        Ok(store::Outcome::Conflict(current)) => conflict(current),
         Err(error) => server_error("write", error),
     }
 }
 
-async fn delete(kind: &str, params: HashMap<String, String>) -> Response {
+async fn delete(kind: &str, headers: HeaderMap, params: HashMap<String, String>) -> Response {
     let keys = params
         .get(&format!("{kind}Key"))
         .map(|csv| csv.split(',').map(String::from).collect::<Vec<_>>())
         .unwrap_or_default();
-    match store::delete(pool(), kind, &keys).await {
-        Ok(version) => (StatusCode::NO_CONTENT, version_headers(version)).into_response(),
+    match store::delete(pool(), kind, &keys, if_unmodified(&headers)).await {
+        Ok(store::Outcome::Done(version)) => {
+            (StatusCode::NO_CONTENT, version_headers(version)).into_response()
+        }
+        Ok(store::Outcome::Conflict(current)) => conflict(current),
         Err(error) => server_error("delete", error),
     }
 }
@@ -211,10 +227,13 @@ async fn settings_read() -> Response {
     }
 }
 
-async fn settings_write(body: Bytes) -> Response {
+async fn settings_write(headers: HeaderMap, body: Bytes) -> Response {
     let value: Value = serde_json::from_slice(&body).unwrap_or_else(|_| json!({}));
-    match store::write_settings(pool(), value).await {
-        Ok(version) => (StatusCode::NO_CONTENT, version_headers(version)).into_response(),
+    match store::write_settings(pool(), value, if_unmodified(&headers)).await {
+        Ok(store::Outcome::Done(version)) => {
+            (StatusCode::NO_CONTENT, version_headers(version)).into_response()
+        }
+        Ok(store::Outcome::Conflict(current)) => conflict(current),
         Err(error) => server_error("settings write", error),
     }
 }
@@ -440,9 +459,13 @@ fn app() -> Router {
     // kind so the handlers stay generic.
     let objects = |kind: &'static str| {
         get(move |Query(p): Query<HashMap<String, String>>| read(kind, p))
-            .post(move |body: Bytes| write(kind, body))
-            .patch(move |body: Bytes| write(kind, body))
-            .delete(move |Query(p): Query<HashMap<String, String>>| delete(kind, p))
+            .post(move |headers: HeaderMap, body: Bytes| write(kind, headers, body))
+            .patch(move |headers: HeaderMap, body: Bytes| write(kind, headers, body))
+            .delete(
+                move |headers: HeaderMap, Query(p): Query<HashMap<String, String>>| {
+                    delete(kind, headers, p)
+                },
+            )
     };
 
     Router::new()

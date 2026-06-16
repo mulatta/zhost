@@ -34,6 +34,36 @@ fn linkmode_first(data: Value) -> Value {
     Value::Object(ordered)
 }
 
+/// A write either committed at a new version or was rejected because the
+/// client's `If-Unmodified-Since-Version` no longer matches the library.
+pub enum Outcome<T> {
+    Done(T),
+    Conflict(i64),
+}
+
+/// Lock the library row, check the client's expected version, and reserve the
+/// next one. Serializing on the row also prevents concurrent writes from racing.
+async fn guarded_version(
+    conn: &mut sqlx::PgConnection,
+    expected: Option<i64>,
+) -> sqlx::Result<Outcome<i64>> {
+    let current: i64 = sqlx::query("select version from library where id = $1 for update")
+        .bind(LIBRARY_ID)
+        .fetch_one(&mut *conn)
+        .await?
+        .get("version");
+    if matches!(expected, Some(v) if v != current) {
+        return Ok(Outcome::Conflict(current));
+    }
+    let version = current + 1;
+    sqlx::query("update library set version = $2 where id = $1")
+        .bind(LIBRARY_ID)
+        .bind(version)
+        .execute(&mut *conn)
+        .await?;
+    Ok(Outcome::Done(version))
+}
+
 pub async fn connect(url: &str) -> sqlx::Result<PgPool> {
     let pool = PgPool::connect(url).await?;
     sqlx::migrate!("./migrations").run(&pool).await?;
@@ -92,14 +122,17 @@ pub async fn objects(pool: &PgPool, kind: &str, keys: &[String]) -> sqlx::Result
 
 /// Store a batch verbatim, stamping each object with the new library version.
 /// Returns `(new_version, successful_map)` where the map is keyed by batch index.
-pub async fn write(pool: &PgPool, kind: &str, batch: Vec<Value>) -> sqlx::Result<(i64, Value)> {
+pub async fn write(
+    pool: &PgPool,
+    kind: &str,
+    batch: Vec<Value>,
+    expected: Option<i64>,
+) -> sqlx::Result<Outcome<(i64, Value)>> {
     let mut tx = pool.begin().await?;
-    let version: i64 =
-        sqlx::query("update library set version = version + 1 where id = $1 returning version")
-            .bind(LIBRARY_ID)
-            .fetch_one(&mut *tx)
-            .await?
-            .get("version");
+    let version = match guarded_version(&mut tx, expected).await? {
+        Outcome::Done(version) => version,
+        Outcome::Conflict(current) => return Ok(Outcome::Conflict(current)),
+    };
 
     let mut successful = Map::new();
     for (index, mut object) in batch.into_iter().enumerate() {
@@ -137,19 +170,21 @@ pub async fn write(pool: &PgPool, kind: &str, batch: Vec<Value>) -> sqlx::Result
         );
     }
     tx.commit().await?;
-    Ok((version, Value::Object(successful)))
+    Ok(Outcome::Done((version, Value::Object(successful))))
 }
 
-/// Delete objects of `kind`, recording them in the deletion log. Returns the
-/// new library version.
-pub async fn delete(pool: &PgPool, kind: &str, keys: &[String]) -> sqlx::Result<i64> {
+/// Delete objects of `kind`, recording them in the deletion log.
+pub async fn delete(
+    pool: &PgPool,
+    kind: &str,
+    keys: &[String],
+    expected: Option<i64>,
+) -> sqlx::Result<Outcome<i64>> {
     let mut tx = pool.begin().await?;
-    let version: i64 =
-        sqlx::query("update library set version = version + 1 where id = $1 returning version")
-            .bind(LIBRARY_ID)
-            .fetch_one(&mut *tx)
-            .await?
-            .get("version");
+    let version = match guarded_version(&mut tx, expected).await? {
+        Outcome::Done(version) => version,
+        Outcome::Conflict(current) => return Ok(Outcome::Conflict(current)),
+    };
     for key in keys {
         sqlx::query("delete from object where library_id = $1 and kind = $2 and key = $3")
             .bind(LIBRARY_ID)
@@ -169,7 +204,7 @@ pub async fn delete(pool: &PgPool, kind: &str, keys: &[String]) -> sqlx::Result<
         .await?;
     }
     tx.commit().await?;
-    Ok(version)
+    Ok(Outcome::Done(version))
 }
 
 /// All settings as `{key: {value, version}}`.
@@ -189,15 +224,17 @@ pub async fn settings(pool: &PgPool) -> sqlx::Result<Value> {
     Ok(Value::Object(map))
 }
 
-/// Store a `{key: {value}}` settings object. Returns the new library version.
-pub async fn write_settings(pool: &PgPool, body: Value) -> sqlx::Result<i64> {
+/// Store a `{key: {value}}` settings object.
+pub async fn write_settings(
+    pool: &PgPool,
+    body: Value,
+    expected: Option<i64>,
+) -> sqlx::Result<Outcome<i64>> {
     let mut tx = pool.begin().await?;
-    let version: i64 =
-        sqlx::query("update library set version = version + 1 where id = $1 returning version")
-            .bind(LIBRARY_ID)
-            .fetch_one(&mut *tx)
-            .await?
-            .get("version");
+    let version = match guarded_version(&mut tx, expected).await? {
+        Outcome::Done(version) => version,
+        Outcome::Conflict(current) => return Ok(Outcome::Conflict(current)),
+    };
     if let Value::Object(entries) = body {
         for (key, entry) in entries {
             let value = entry.get("value").cloned().unwrap_or(entry);
@@ -214,7 +251,7 @@ pub async fn write_settings(pool: &PgPool, body: Value) -> sqlx::Result<i64> {
         }
     }
     tx.commit().await?;
-    Ok(version)
+    Ok(Outcome::Done(version))
 }
 
 /// Whether an attachment file with this md5 is already registered.
