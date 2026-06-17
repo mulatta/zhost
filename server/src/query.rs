@@ -155,6 +155,13 @@ pub struct ItemQuery {
     pub limit: i64,
     pub start: i64,
     pub include_trashed: bool,
+    /// Convenience-route filters, set by the handler rather than parsed from the
+    /// query string: `top` keeps only top-level items (no `parentItem`),
+    /// `only_trashed` inverts the trash filter to return just trashed items, and
+    /// `collection` keeps items whose `data.collections` contains that key.
+    pub top: bool,
+    pub only_trashed: bool,
+    pub collection: Option<String>,
 }
 
 impl ItemQuery {
@@ -205,6 +212,9 @@ impl ItemQuery {
             limit,
             start,
             include_trashed,
+            top: false,
+            only_trashed: false,
+            collection: None,
         }
     }
 }

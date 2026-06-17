@@ -203,38 +203,40 @@ async fn read(kind: &str, params: HashMap<String, String>) -> Response {
     }
 }
 
-/// `GET /users/<id>/items`. Serves the two sync reads (the `format=versions`
-/// map and the `?itemKey=…` batch) and, when neither is asked for, the
-/// CLI-facing query: filter/search/sort/paginate over the library.
-async fn items_get(Path(id): Path<String>, RawQuery(raw): RawQuery) -> Response {
-    let params = query::Params::parse(raw.as_deref());
-
+/// The two sync reads shared by `/items` and `/items/top`: the `format=versions`
+/// map and the `?itemKey=…` batch. Returns `None` when the request carries
+/// neither, i.e. it is a CLI query rather than a sync read.
+async fn item_sync_read(params: &query::Params) -> Option<Response> {
     if params.get("format") == Some("versions") {
         let since = params
             .get("since")
             .and_then(|s| s.parse().ok())
             .unwrap_or(0);
-        return match store::versions(pool(), "item", since).await {
+        return Some(match store::versions(pool(), "item", since).await {
             Ok(value) => (current_headers().await, Json(value)).into_response(),
             Err(error) => server_error("items versions", error),
-        };
+        });
     }
     if let Some(csv) = params.get("itemKey") {
         let keys: Vec<String> = csv.split(',').map(String::from).collect();
-        return match store::objects(pool(), "item", &keys).await {
+        return Some(match store::objects(pool(), "item", &keys).await {
             Ok(value) => (current_headers().await, Json(value)).into_response(),
             Err(error) => server_error("items batch", error),
-        };
+        });
     }
+    None
+}
 
-    let q = query::ItemQuery::from_params(&params);
-    match store::query_items(pool(), &q).await {
+/// Render an item query as a paged JSON listing: the `[{key, version, data}]`
+/// array plus `Total-Results` and, while more rows remain, a `Link: …;
+/// rel="next"` built against `path` (the public-URL endpoint).
+async fn item_listing(path: &str, raw: Option<&str>, q: &query::ItemQuery) -> Response {
+    match store::query_items(pool(), q).await {
         Ok((items, total)) => {
             let mut headers = current_headers().await;
             headers.insert("total-results", total.to_string().parse().unwrap());
-            // Point the client at the next page until the window covers the rest.
             if q.start + q.limit < total {
-                let link = next_link(&id, raw.as_deref(), q.start + q.limit);
+                let link = next_link(path, raw, q.start + q.limit);
                 headers.insert("link", link.parse().unwrap());
             }
             (headers, Json(Value::Array(items))).into_response()
@@ -245,19 +247,66 @@ async fn items_get(Path(id): Path<String>, RawQuery(raw): RawQuery) -> Response 
 
 /// The `Link: <…>; rel="next"` header for the page after `start`, preserving the
 /// request's other params and pointing at the public (reverse-proxy) URL.
-fn next_link(id: &str, raw: Option<&str>, start: i64) -> String {
+fn next_link(path: &str, raw: Option<&str>, start: i64) -> String {
     let mut pairs: Vec<(String, String)> = raw
         .and_then(|q| serde_urlencoded::from_str(q).ok())
         .unwrap_or_default();
     pairs.retain(|(k, _)| k != "start");
     pairs.push(("start".into(), start.to_string()));
     let qs = serde_urlencoded::to_string(&pairs).unwrap_or_default();
-    format!(
-        "<{}/users/{}/items?{}>; rel=\"next\"",
-        cfg().public_url,
-        id,
-        qs
+    format!("<{}{}?{}>; rel=\"next\"", cfg().public_url, path, qs)
+}
+
+/// `GET /users/<id>/items`: the two sync reads, or the CLI query when neither.
+async fn items_get(Path(id): Path<String>, RawQuery(raw): RawQuery) -> Response {
+    let params = query::Params::parse(raw.as_deref());
+    if let Some(resp) = item_sync_read(&params).await {
+        return resp;
+    }
+    let q = query::ItemQuery::from_params(&params);
+    item_listing(&format!("/users/{id}/items"), raw.as_deref(), &q).await
+}
+
+/// `GET /users/<id>/items/top`: top-level items (no `parentItem`). Still answers
+/// the sync `format=versions`/`itemKey` reads the client may send here.
+async fn items_top(Path(id): Path<String>, RawQuery(raw): RawQuery) -> Response {
+    let params = query::Params::parse(raw.as_deref());
+    if let Some(resp) = item_sync_read(&params).await {
+        return resp;
+    }
+    let mut q = query::ItemQuery::from_params(&params);
+    q.top = true;
+    item_listing(&format!("/users/{id}/items/top"), raw.as_deref(), &q).await
+}
+
+/// `GET /users/<id>/items/trash`: only trashed items (`data.deleted`).
+async fn items_trash(Path(id): Path<String>, RawQuery(raw): RawQuery) -> Response {
+    let mut q = query::ItemQuery::from_params(&query::Params::parse(raw.as_deref()));
+    q.only_trashed = true;
+    item_listing(&format!("/users/{id}/items/trash"), raw.as_deref(), &q).await
+}
+
+/// `GET /users/<id>/collections/<key>/items`: items in the given collection.
+async fn collection_items(
+    Path((id, key)): Path<(String, String)>,
+    RawQuery(raw): RawQuery,
+) -> Response {
+    let mut q = query::ItemQuery::from_params(&query::Params::parse(raw.as_deref()));
+    q.collection = Some(key.clone());
+    item_listing(
+        &format!("/users/{id}/collections/{key}/items"),
+        raw.as_deref(),
+        &q,
     )
+    .await
+}
+
+/// `GET /users/<id>/tags`: distinct tags with item counts.
+async fn tags_get() -> Response {
+    match store::tags(pool()).await {
+        Ok(value) => (current_headers().await, Json(value)).into_response(),
+        Err(error) => server_error("tags", error),
+    }
 }
 
 async fn write(kind: &str, headers: HeaderMap, body: Bytes) -> Response {
@@ -592,6 +641,8 @@ fn app() -> Router {
                 .delete(settings_write),
         )
         .route("/users/{id}/collections", objects("collection"))
+        // CLI listing of a collection's items (query-only; no sync use).
+        .route("/users/{id}/collections/{key}/items", get(collection_items))
         .route("/users/{id}/searches", objects("search"))
         // Items share the write/delete logic but take a dedicated GET that adds
         // the CLI query API alongside the two sync reads.
@@ -606,10 +657,9 @@ fn app() -> Router {
                     },
                 ),
         )
-        .route(
-            "/users/{id}/items/top",
-            get(|Query(p): Query<HashMap<String, String>>| read("item", p)),
-        )
+        .route("/users/{id}/items/top", get(items_top))
+        .route("/users/{id}/items/trash", get(items_trash))
+        .route("/users/{id}/tags", get(tags_get))
         .route(
             "/users/{id}/fulltext",
             get(fulltext_versions).post(fulltext_write),

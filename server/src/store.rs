@@ -140,8 +140,11 @@ pub async fn query_items(pool: &PgPool, q: &ItemQuery) -> sqlx::Result<(Vec<Valu
     );
     sql.push_bind(LIBRARY_ID).push(" and kind = 'item'");
 
-    // Trashed items (data.deleted truthy) are excluded unless asked for.
-    if !q.include_trashed {
+    // Trash handling: /items/trash returns only trashed items; otherwise trashed
+    // items (data.deleted truthy) are excluded unless includeTrashed is set.
+    if q.only_trashed {
+        sql.push(" and coalesce(data->>'deleted', '0') in ('1', 'true')");
+    } else if !q.include_trashed {
         sql.push(" and coalesce(data->>'deleted', '0') not in ('1', 'true')");
     }
 
@@ -197,6 +200,22 @@ pub async fn query_items(pool: &PgPool, q: &ItemQuery) -> sqlx::Result<(Vec<Valu
         .push("))");
     }
 
+    // /items/top: only top-level items (those without a parent).
+    if q.top {
+        sql.push(" and data->>'parentItem' is null");
+    }
+
+    // /collections/<key>/items: items whose data.collections array holds the key.
+    if let Some(key) = &q.collection {
+        sql.push(
+            " and exists (select 1 from \
+             jsonb_array_elements_text(coalesce(data->'collections', '[]'::jsonb)) col \
+             where col = ",
+        )
+        .push_bind(key.clone())
+        .push(")");
+    }
+
     // order_expr/sql() are fixed strings (no user input), so pushing them raw is
     // safe; nulls sort last so items missing the sort field don't lead.
     sql.push(" order by ")
@@ -221,6 +240,32 @@ pub async fn query_items(pool: &PgPool, q: &ItemQuery) -> sqlx::Result<(Vec<Valu
         })
         .collect();
     Ok((items, total))
+}
+
+/// Distinct tags across non-trashed items with their item counts, as
+/// `[{tag, numItems}]` ordered by tag. Backs the CLI-facing `/tags` listing.
+pub async fn tags(pool: &PgPool) -> sqlx::Result<Value> {
+    let rows = sqlx::query(
+        "select t->>'tag' as tag, count(*) as num \
+         from object, jsonb_array_elements(coalesce(data->'tags', '[]'::jsonb)) t \
+         where library_id = $1 and kind = 'item' \
+           and coalesce(data->>'deleted', '0') not in ('1', 'true') \
+         group by t->>'tag' \
+         order by tag",
+    )
+    .bind(LIBRARY_ID)
+    .fetch_all(pool)
+    .await?;
+    let array = rows
+        .into_iter()
+        .map(|row| {
+            serde_json::json!({
+                "tag": row.get::<String, _>("tag"),
+                "numItems": row.get::<i64, _>("num"),
+            })
+        })
+        .collect();
+    Ok(Value::Array(array))
 }
 
 /// Store a batch verbatim, stamping each object with the new library version.

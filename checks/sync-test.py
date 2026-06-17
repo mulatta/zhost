@@ -204,6 +204,39 @@ with subtest("a read-only key can drive the query API"):
         http_code(f"'{base}/users/1/items?q=borrow' {readonly}") == "200"
     )
 
+with subtest("convenience listings: top, trash, collection items and tags"):
+    version = library_version()
+    machine.succeed(
+        f"curl -sf -X POST {base}/users/1/items {auth} "
+        f"-H 'If-Unmodified-Since-Version: {version}' "
+        f'-d \'[{{"key":"TOPITEM1","itemType":"book","title":"Shelf Book",'
+        f'"collections":["COLLXXXX"],"tags":[{{"tag":"shelf"}}]}},'
+        f'{{"key":"CHILDNO1","itemType":"note","note":"child","parentItem":"TOPITEM1"}},'
+        f'{{"key":"TRASHED1","itemType":"book","title":"Gone","deleted":1}}]\' '
+        f"| jq -e .successful"
+    )
+
+    def path_keys(p):
+        return machine.succeed(
+            f"curl -sf '{base}{p}' {auth} | jq -r '[.[].key]|sort|join(\",\")'"
+        ).strip()
+
+    # Top excludes children (have parentItem) and trashed items.
+    top = path_keys("/users/1/items/top")
+    assert "TOPITEM1" in top, top
+    assert "CHILDNO1" not in top, top
+    assert "TRASHED1" not in top, top
+    # Trash returns only trashed items.
+    trash = path_keys("/users/1/items/trash")
+    assert trash == "TRASHED1", trash
+    # Collection membership.
+    assert path_keys("/users/1/collections/COLLXXXX/items") == "TOPITEM1"
+    # Tags lists distinct tags with counts; the trashed item's tag is excluded.
+    machine.succeed(
+        f"curl -sf {base}/users/1/tags {auth} "
+        f"| jq -e '.[] | select(.tag == \"shelf\") | .numItems == 1'"
+    )
+
 with subtest("deletes are recorded in the deletion log"):
     machine.succeed(f"curl -sf -X DELETE '{base}/users/1/items?itemKey=ITEM0001' {auth}")
     machine.succeed(
