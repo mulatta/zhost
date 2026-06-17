@@ -118,10 +118,12 @@ metadata and attachment files, both directions) and by a NixOS VM test
 
 Implemented: the full sync contract — objects, settings, deletions, write
 conflict semantics (`If-Unmodified-Since-Version` → `412`), the three-step file
-upload and download, full-text content storage, and read-only API keys.
-
-Planned: a CLI-facing read/query API (search, filter, sort, pagination,
-full-text search, `/tags`) — see `server/SPEC.md`.
+upload and download, full-text content storage, and read-only API keys — plus
+the CLI-facing read/query API: `GET /items` with search (`q`, and
+`qmode=everything` over stored full-text), `itemType`/`tag` filters, sorting and
+paginated results (`Total-Results` + `Link: …; rel="next"`), and the
+`/items/top`, `/items/trash`, `/collections/<key>/items` and `/tags` listings.
+See `server/SPEC.md` for the full contract.
 
 Out of scope: group libraries, the streaming server, binary-diff uploads, and
 styled bibliography/citation rendering (done downstream from the raw data).

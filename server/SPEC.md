@@ -4,10 +4,10 @@ Derived from the Zotero client sync code (`~/git/zotero/chrome/content/zotero/xp
 `storage/zfs.js`), the official Web API v3 docs, and live testing against a real
 Zotero 9 client. This is the contract the server must satisfy so a
 (URL-redirected) stock client syncs against it. The server implements the entire
-sync contract below; "out of scope" items remain unimplemented. The one
-forward-looking section, "Read/query API (CLI-facing extension)", is explicitly
-marked as planned and built incrementally — it is not part of what the sync
-client needs.
+sync contract below; "out of scope" items remain unimplemented. The
+"Read/query API (CLI-facing extension)" section is also implemented, but is a
+zhost addition beyond the sync subset — it is not part of what the sync client
+needs.
 
 Client file references use `syncAPIClient.js` (the request layer), `syncEngine.js`
 (sync flow), `zfs.js` (file storage).
@@ -186,8 +186,9 @@ but optional to emit.
 Beyond the sync subset above, these read endpoints exist so a token-holding CLI
 or agent can find and fetch items without the Zotero app. They are query-only
 (no styled bibliography/citation rendering, no schema endpoints — those stay
-downstream, e.g. an agent or pandoc working from the raw JSON / CSL-JSON). Built
-incrementally; the access-key model above ships first.
+downstream, e.g. an agent or pandoc working from the raw JSON / CSL-JSON). A
+read-only key (see Auth) is enough to drive all of them, so automation can read
+without write access.
 
 Item listings (`GET /users/<id>/items?format=json`) accept:
 
@@ -201,11 +202,15 @@ Item listings (`GET /users/<id>/items?format=json`) accept:
 | `includeTrashed` | Include trashed items (excluded by default). |
 
 Convenience listings: `GET /users/<id>/items/top` (no `parentItem`),
-`/items/trash` (`data.deleted`), `/tags` (distinct tags with item counts),
-`/collections/<key>/items` (`data.collections` contains the key).
+`/items/trash` (`data.deleted`), `/tags` (distinct tags as `[{tag, numItems}]`,
+trashed items excluded), `/collections/<key>/items` (`data.collections` contains
+the key). The item listings carry the same search/filter/sort/paginate params as
+`/items`; `/items/top` also still answers the sync `format=versions`/`itemKey`
+reads the client may send there.
 
-Full-text search (`qmode=everything`) matches against the `fulltext` table; a
-`pg_trgm` GIN index on `content` keeps substring search cheap.
+Matching is case-insensitive substring (`ILIKE`). Full-text search
+(`qmode=everything`) additionally matches the `fulltext` table; a `pg_trgm` GIN
+index on `content` (migration `0004`) keeps that substring search cheap.
 
 ## Storage backend (PostgreSQL on malt)
 
