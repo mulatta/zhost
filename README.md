@@ -6,6 +6,10 @@ zotero.org or any third-party cloud. A small server reimplements the subset of
 the Zotero Web API v3 that the client needs, and stock Zotero clients are
 pointed at it.
 
+> **Status: in active development (pre-1.0).** The sync contract is implemented
+> and tested, but interfaces, the schema, and the deployment surface may still
+> change without notice. Expect breaking changes.
+
 ## How it works
 
 - **Client redirect, no patching.** Zotero reads its sync endpoint from a hidden
