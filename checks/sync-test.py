@@ -237,6 +237,65 @@ with subtest("convenience listings: top, trash, collection items and tags"):
         f"| jq -e '.[] | select(.tag == \"shelf\") | .numItems == 1'"
     )
 
+with subtest("malformed (non-array) item data does not 500 the query API"):
+    # data is stored opaquely, so an item can carry a scalar where an array is
+    # expected; jsonb_array_elements must not crash the listing/tag endpoints.
+    version = library_version()
+    machine.succeed(
+        f"curl -sf -X POST {base}/users/1/items {auth} "
+        f"-H 'If-Unmodified-Since-Version: {version}' "
+        f'-d \'[{{"key":"MALFORM1","itemType":"book","title":"weird",'
+        f'"creators":"notarray","tags":"x","collections":"y"}}]\' | jq -e .successful'
+    )
+    assert http_code(f"{base}/users/1/tags {auth}") == "200"
+    # q=zzz forces the creators sub-select to run on the malformed row.
+    assert http_code(f"'{base}/users/1/items?q=zzz' {auth}") == "200"
+    assert http_code(f"'{base}/users/1/items?q=zzz&qmode=everything' {auth}") == "200"
+    assert http_code(f"'{base}/users/1/items?tag=zzz' {auth}") == "200"
+    assert http_code(f"{base}/users/1/collections/y/items {auth}") == "200"
+
+with subtest("Total-Results stays correct past the last page"):
+    def total_results(qs):
+        return machine.succeed(
+            f"curl -sf -D - -o /dev/null '{base}/users/1/items?{qs}' {auth} "
+            f"| grep -i total-results | tr -d '\\r' | cut -d' ' -f2"
+        ).strip()
+
+    total = total_results("limit=1")
+    assert int(total) > 0, total
+    # A page past the end still reports the true total, not zero.
+    assert total_results("limit=1&start=100000") == total, total
+
+with subtest("query API: OR filters, descending sort and includeTrashed"):
+    version = library_version()
+    machine.succeed(
+        f"curl -sf -X POST {base}/users/1/items {auth} "
+        f"-H 'If-Unmodified-Since-Version: {version}' "
+        f'-d \'[{{"key":"COVRA001","itemType":"book","title":"Aaa","tags":[{{"tag":"aa"}}]}},'
+        f'{{"key":"COVRB001","itemType":"journalArticle","title":"Bbb","tags":[{{"tag":"bb"}}]}},'
+        f'{{"key":"COVRT001","itemType":"book","title":"Ccc","deleted":1,'
+        f'"tags":[{{"tag":"aa"}}]}}]\' | jq -e .successful'
+    )
+
+    def first(qs):
+        return machine.succeed(
+            f"curl -sf '{base}/users/1/items?{qs}' {auth} | jq -r '.[0].key'"
+        ).strip()
+
+    def kset(qs):
+        return machine.succeed(
+            f"curl -sf '{base}/users/1/items?{qs}' {auth} | jq -r '[.[].key]|sort|join(\",\")'"
+        ).strip()
+
+    # `||` is OR for both tag and itemType.
+    both = kset("tag=aa||bb&itemType=book||journalArticle")
+    assert "COVRA001" in both and "COVRB001" in both, both
+    # Descending title sort: Bbb before Aaa, trashed Ccc excluded by default.
+    assert first("tag=aa||bb&sort=title&direction=desc") == "COVRB001"
+    # includeTrashed surfaces the trashed item (Ccc sorts first descending).
+    assert first("tag=aa&sort=title&direction=desc&includeTrashed=1") == "COVRT001"
+    assert "COVRT001" not in kset("tag=aa")
+
 with subtest("deletes are recorded in the deletion log"):
     machine.succeed(f"curl -sf -X DELETE '{base}/users/1/items?itemKey=ITEM0001' {auth}")
     machine.succeed(

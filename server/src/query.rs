@@ -239,6 +239,10 @@ mod tests {
         assert!(!q.include_trashed);
         assert!(q.tags.is_empty());
         assert_eq!(q.item_type, TypeFilter::default());
+        // Convenience-route filters are off until a handler sets them.
+        assert!(!q.top);
+        assert!(!q.only_trashed);
+        assert!(q.collection.is_none());
     }
 
     #[test]

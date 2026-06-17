@@ -130,15 +130,25 @@ fn escape_like(term: &str) -> String {
         .replace('_', "\\_")
 }
 
-/// Run a CLI-facing item listing: filter, search, sort and page over the stored
-/// items. Returns `([{key, version, data}], total)`, where `total` is the full
-/// match count before paging (a window aggregate, so it survives `limit`).
-pub async fn query_items(pool: &PgPool, q: &ItemQuery) -> sqlx::Result<(Vec<Value>, i64)> {
-    let mut sql: QueryBuilder<Postgres> = QueryBuilder::new(
-        "select key, version, data, count(*) over () as total \
-         from object where library_id = ",
-    );
-    sql.push_bind(LIBRARY_ID).push(" and kind = 'item'");
+/// SQL for `data->'<field>'` but only when it actually holds a JSON array,
+/// else an empty array. `jsonb_array_elements` throws ("cannot extract elements
+/// from a scalar") on a non-array value, and `data` is stored opaquely, so a
+/// malformed item must not be able to 500 the whole query. `field` is always a
+/// fixed literal here, never user input.
+fn json_array(field: &str) -> String {
+    format!(
+        "case when jsonb_typeof(data->'{field}') = 'array' \
+         then data->'{field}' else '[]'::jsonb end"
+    )
+}
+
+/// Append the shared `library_id … and <filters>` predicate for an item query to
+/// `sql` (binding its parameters). Used by both the count and the page query so
+/// the two always filter identically.
+fn push_item_filters(sql: &mut QueryBuilder<Postgres>, q: &ItemQuery) {
+    sql.push("library_id = ")
+        .push_bind(LIBRARY_ID)
+        .push(" and kind = 'item'");
 
     // Trash handling: /items/trash returns only trashed items; otherwise trashed
     // items (data.deleted truthy) are excluded unless includeTrashed is set.
@@ -154,11 +164,9 @@ pub async fn query_items(pool: &PgPool, q: &ItemQuery) -> sqlx::Result<(Vec<Valu
             .push_bind(like.clone())
             .push(" escape '\\' or data->>'date' ilike ")
             .push_bind(like.clone())
-            .push(
-                " escape '\\' or exists (select 1 from \
-                 jsonb_array_elements(coalesce(data->'creators', '[]'::jsonb)) c \
-                 where c->>'lastName' ilike ",
-            )
+            .push(" escape '\\' or exists (select 1 from jsonb_array_elements(")
+            .push(json_array("creators"))
+            .push(") c where c->>'lastName' ilike ")
             .push_bind(like.clone())
             .push(" escape '\\' or c->>'firstName' ilike ")
             .push_bind(like.clone())
@@ -191,13 +199,11 @@ pub async fn query_items(pool: &PgPool, q: &ItemQuery) -> sqlx::Result<(Vec<Valu
 
     // AND across groups, OR within a group: the item must carry a tag from each.
     for group in &q.tags {
-        sql.push(
-            " and exists (select 1 from \
-             jsonb_array_elements(coalesce(data->'tags', '[]'::jsonb)) t \
-             where t->>'tag' = any(",
-        )
-        .push_bind(group.clone())
-        .push("))");
+        sql.push(" and exists (select 1 from jsonb_array_elements(")
+            .push(json_array("tags"))
+            .push(") t where t->>'tag' = any(")
+            .push_bind(group.clone())
+            .push("))");
     }
 
     // /items/top: only top-level items (those without a parent).
@@ -207,15 +213,26 @@ pub async fn query_items(pool: &PgPool, q: &ItemQuery) -> sqlx::Result<(Vec<Valu
 
     // /collections/<key>/items: items whose data.collections array holds the key.
     if let Some(key) = &q.collection {
-        sql.push(
-            " and exists (select 1 from \
-             jsonb_array_elements_text(coalesce(data->'collections', '[]'::jsonb)) col \
-             where col = ",
-        )
-        .push_bind(key.clone())
-        .push(")");
+        sql.push(" and exists (select 1 from jsonb_array_elements_text(")
+            .push(json_array("collections"))
+            .push(") col where col = ")
+            .push_bind(key.clone())
+            .push(")");
     }
+}
 
+/// Run a CLI-facing item listing: filter, search, sort and page over the stored
+/// items. Returns `([{key, version, data}], total)`, where `total` is the full
+/// match count. It is counted separately from the page so it stays correct even
+/// when `start` runs past the end (a window count would vanish with the rows).
+pub async fn query_items(pool: &PgPool, q: &ItemQuery) -> sqlx::Result<(Vec<Value>, i64)> {
+    let mut count: QueryBuilder<Postgres> = QueryBuilder::new("select count(*) from object where ");
+    push_item_filters(&mut count, q);
+    let total: i64 = count.build().fetch_one(pool).await?.get(0);
+
+    let mut sql: QueryBuilder<Postgres> =
+        QueryBuilder::new("select key, version, data from object where ");
+    push_item_filters(&mut sql, q);
     // order_expr/sql() are fixed strings (no user input), so pushing them raw is
     // safe; nulls sort last so items missing the sort field don't lead.
     sql.push(" order by ")
@@ -227,9 +244,10 @@ pub async fn query_items(pool: &PgPool, q: &ItemQuery) -> sqlx::Result<(Vec<Valu
         .push(" offset ")
         .push_bind(q.start);
 
-    let rows = sql.build().fetch_all(pool).await?;
-    let total = rows.first().map(|r| r.get::<i64, _>("total")).unwrap_or(0);
-    let items = rows
+    let items = sql
+        .build()
+        .fetch_all(pool)
+        .await?
         .into_iter()
         .map(|row| {
             serde_json::json!({
@@ -245,9 +263,13 @@ pub async fn query_items(pool: &PgPool, q: &ItemQuery) -> sqlx::Result<(Vec<Valu
 /// Distinct tags across non-trashed items with their item counts, as
 /// `[{tag, numItems}]` ordered by tag. Backs the CLI-facing `/tags` listing.
 pub async fn tags(pool: &PgPool) -> sqlx::Result<Value> {
+    // Guard against a non-array `tags` value (stored opaquely): without the
+    // jsonb_typeof check a single malformed item would 500 the whole listing.
     let rows = sqlx::query(
         "select t->>'tag' as tag, count(*) as num \
-         from object, jsonb_array_elements(coalesce(data->'tags', '[]'::jsonb)) t \
+         from object, jsonb_array_elements( \
+             case when jsonb_typeof(data->'tags') = 'array' \
+                  then data->'tags' else '[]'::jsonb end) t \
          where library_id = $1 and kind = 'item' \
            and coalesce(data->>'deleted', '0') not in ('1', 'true') \
          group by t->>'tag' \
