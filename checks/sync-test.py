@@ -4,6 +4,7 @@ each run boots a VM."""
 
 base = "http://localhost:8189"
 auth = "-H 'Zotero-API-Key: testtoken' -H 'Zotero-API-Version: 3'"
+readonly = "-H 'Zotero-API-Key: readonlytoken' -H 'Zotero-API-Version: 3'"
 
 
 def http_code(args):
@@ -32,6 +33,20 @@ with subtest("login session hands out the configured key"):
 
 with subtest("the api key is required off the bootstrap paths"):
     assert http_code(f"{base}/keys/current -H 'Zotero-API-Version: 3'") == "403"
+
+with subtest("a read-only key reads but cannot write"):
+    assert http_code(f"'{base}/users/1/items?format=versions&since=0' {readonly}") == "200"
+    machine.succeed(f"curl -sf {base}/keys/current {readonly} | jq -e '.access.user.write == false'")
+    machine.succeed(f"curl -sf {base}/keys/current {auth} | jq -e '.access.user.write == true'")
+    assert (
+        http_code(
+            f"-X POST {base}/users/1/items {readonly} "
+            f"-H 'If-Unmodified-Since-Version: 0' "
+            f"-d '[{{\"key\":\"RONLY001\",\"itemType\":\"book\"}}]'"
+        )
+        == "403"
+    )
+    assert http_code(f"-X DELETE '{base}/users/1/items?itemKey=ITEM0001' {readonly}") == "403"
 
 with subtest("an item round-trips through write and read"):
     machine.succeed(

@@ -17,7 +17,13 @@ testPkgs.testers.runNixOSTest {
       enable = true;
       bind = "127.0.0.1:8189";
       publicUrl = "http://localhost:8189";
-      apiKeyFile = testPkgs.writeText "zhost-test-key" "testtoken";
+      keys = {
+        app.file = testPkgs.writeText "zhost-app-key" "testtoken";
+        cli = {
+          file = testPkgs.writeText "zhost-cli-key" "readonlytoken";
+          readOnly = true;
+        };
+      };
     };
 
     environment.systemPackages = [

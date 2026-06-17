@@ -45,7 +45,26 @@ Behaviours confirmed by live testing (each is a hard requirement):
 ## Auth
 
 API key travels in the `Zotero-API-Key` header on every request except the key
-endpoints. MVP accepts one configured key; reject others with 403.
+endpoints. Reject unknown keys with 403.
+
+### Access keys
+
+Keys are provisioned out of band (the server never mints them) and held in
+memory, loaded at boot from secret files — no key material in the store or
+database. Each key carries an access level; the token bytes stay in the secret
+while the level is declared in deployment config:
+
+- **read/write** — full sync access (the Zotero app needs this).
+- **read-only** — every read works, but `POST`/`PATCH`/`DELETE` are rejected
+  with `403`. Intended for the CLI / an agent, so automation can't mutate the
+  library.
+
+`GET /keys/current` reports the requesting key's own access (`access.user.write`
+reflects read-only); the login session (`/keys/sessions`) hands out a read/write
+key, since the app that drives it needs to write. Config: `ZHOST_KEYS` is a
+comma-separated list of `<role>:<path>` entries (`rw`/`ro`); each path is a
+single-line token file. A single `ZHOST_API_KEY_FILE`/`ZHOST_API_KEY` is still
+accepted as one read/write key.
 
 | Endpoint | Notes |
 |---|---|
@@ -158,6 +177,32 @@ Multi-object listings page via `Link: <next>; rel=next` and `Total-Results`;
 client follows `rel=next` until absent (syncAPIClient.js:923). MVP can return all
 results in one page (no `Link`). `Backoff`/`Retry-After` honored by the client
 but optional to emit.
+
+## Read/query API (CLI-facing extension)
+
+Beyond the sync subset above, these read endpoints exist so a token-holding CLI
+or agent can find and fetch items without the Zotero app. They are query-only
+(no styled bibliography/citation rendering, no schema endpoints — those stay
+downstream, e.g. an agent or pandoc working from the raw JSON / CSL-JSON). Built
+incrementally; the access-key model above ships first.
+
+Item listings (`GET /users/<id>/items?format=json`) accept:
+
+| Param | Meaning |
+|---|---|
+| `q` + `qmode` | Search term. `titleCreatorYear` (default) matches title/creators/date; `everything` also matches stored full-text content. |
+| `itemType` | Filter by type (`book`; OR via `a \|\| b`; negate via `-note`). |
+| `tag` | Filter by tag (repeat for AND, `\|\|` for OR). |
+| `sort` + `direction` | `dateModified` (default), `dateAdded`, `title`, `creator`, `date`, `itemType`; `asc`/`desc`. |
+| `limit` + `start` | Page window (default 25, max 100). Response sets `Total-Results` and `Link: …; rel="next"`. |
+| `includeTrashed` | Include trashed items (excluded by default). |
+
+Convenience listings: `GET /users/<id>/items/top` (no `parentItem`),
+`/items/trash` (`data.deleted`), `/tags` (distinct tags with item counts),
+`/collections/<key>/items` (`data.collections` contains the key).
+
+Full-text search (`qmode=everything`) matches against the `fulltext` table; a
+`pg_trgm` GIN index on `content` keeps substring search cheap.
 
 ## Storage backend (PostgreSQL on malt)
 

@@ -22,8 +22,18 @@ use axum::{
 use serde_json::{json, Value};
 use sqlx::PgPool;
 
+/// What a key may do. Reads are always allowed; `write` gates mutations.
+#[derive(Clone, Copy)]
+struct Access {
+    write: bool,
+}
+
 struct Config {
-    key: String,
+    /// Bearer token → access. Provisioned out of band, loaded from secret files
+    /// at boot; never minted by the server or stored in the database.
+    keys: HashMap<String, Access>,
+    /// A read/write token handed to the app through the login session.
+    login_key: String,
     user_id: u64,
     bind: String,
     /// Client-facing base URL (e.g. the reverse-proxy address). Used for the
@@ -58,12 +68,21 @@ fn pool() -> &'static PgPool {
     POOL.get().expect("pool initialised in main")
 }
 
-/// Full access for the single configured user; no groups.
-fn access() -> Value {
+/// Access descriptor for the single configured user; no groups. `write` reflects
+/// the requesting key, so a read-only key reports `write: false`.
+fn access(write: bool) -> Value {
     json!({
-        "user": { "library": true, "files": true, "notes": true, "write": true },
+        "user": { "library": true, "files": true, "notes": true, "write": write },
         "groups": {}
     })
+}
+
+/// The access the request's key carries, if it presents a known one.
+fn key_access(headers: &HeaderMap) -> Option<Access> {
+    headers
+        .get("zotero-api-key")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|token| cfg().keys.get(token).copied())
 }
 
 fn version_headers(version: i64) -> HeaderMap {
@@ -85,22 +104,23 @@ async fn create_key() -> Response {
     (
         StatusCode::CREATED,
         Json(json!({
-            "key": cfg().key,
+            "key": cfg().login_key,
             "userID": cfg().user_id,
             "username": "zhost",
             "displayName": "zhost",
-            "access": access(),
+            "access": access(true),
         })),
     )
         .into_response()
 }
 
-async fn key_current() -> Response {
+async fn key_current(headers: HeaderMap) -> Response {
+    let write = key_access(&headers).is_some_and(|a| a.write);
     Json(json!({
         "userID": cfg().user_id,
         "username": "zhost",
         "displayName": "zhost",
-        "access": access(),
+        "access": access(write),
     }))
     .into_response()
 }
@@ -122,7 +142,7 @@ async fn create_session() -> Response {
 async fn check_session() -> Response {
     Json(json!({
         "status": "completed",
-        "apiKey": cfg().key,
+        "apiKey": cfg().login_key,
         "userID": cfg().user_id,
         "username": "zhost",
     }))
@@ -461,13 +481,15 @@ async fn log_and_auth(req: Request, next: Next) -> Response {
         || path.starts_with("/files")
         || path == "/login";
     if !is_bootstrap {
-        let authorised = parts
-            .headers
-            .get("zotero-api-key")
-            .and_then(|v| v.to_str().ok())
-            == Some(cfg().key.as_str());
-        if !authorised {
+        let Some(access) = key_access(&parts.headers) else {
             return (StatusCode::FORBIDDEN, "invalid API key").into_response();
+        };
+        let mutating = matches!(
+            parts.method,
+            axum::http::Method::POST | axum::http::Method::PATCH | axum::http::Method::DELETE
+        );
+        if mutating && !access.write {
+            return (StatusCode::FORBIDDEN, "read-only API key").into_response();
         }
     }
 
@@ -536,6 +558,50 @@ fn app() -> Router {
         .layer(middleware::from_fn(log_and_auth))
 }
 
+/// Build the token→access map from secret files. `ZHOST_KEYS` is a
+/// comma-separated list of `<role>:<path>` entries (`rw`/`ro`), each path a
+/// single-line token (a sops-nix secret exposed via systemd LoadCredential).
+/// Falls back to a single read/write key from `ZHOST_API_KEY_FILE` /
+/// `ZHOST_API_KEY` for simple deployments. Returns the map and a read/write
+/// token to hand the app through the login session. Prefer files over the env,
+/// which is visible in /proc.
+fn load_keys() -> (HashMap<String, Access>, String) {
+    let read_token = |path: &str| {
+        std::fs::read_to_string(path)
+            .unwrap_or_else(|e| panic!("read key file {path}: {e}"))
+            .trim()
+            .to_string()
+    };
+    let mut keys = HashMap::new();
+    let mut login_key = None;
+
+    if let Ok(manifest) = std::env::var("ZHOST_KEYS") {
+        for entry in manifest.split(',').filter(|s| !s.is_empty()) {
+            let (role, path) = entry
+                .split_once(':')
+                .unwrap_or_else(|| panic!("ZHOST_KEYS entry not <role>:<path>: {entry}"));
+            let write = role == "rw";
+            let token = read_token(path);
+            if write && login_key.is_none() {
+                login_key = Some(token.clone());
+            }
+            keys.insert(token, Access { write });
+        }
+    } else {
+        let token = match std::env::var("ZHOST_API_KEY_FILE") {
+            Ok(path) => read_token(&path),
+            Err(_) => std::env::var("ZHOST_API_KEY").unwrap_or_else(|_| "zhost-dev-key".into()),
+        };
+        login_key = Some(token.clone());
+        keys.insert(token, Access { write: true });
+    }
+
+    (
+        keys,
+        login_key.expect("at least one read/write key configured"),
+    )
+}
+
 #[tokio::main]
 async fn main() {
     tracing_subscriber::fmt()
@@ -544,18 +610,11 @@ async fn main() {
         )
         .init();
 
-    // The key is a single-line bearer token. Prefer a file (sops-nix /
-    // systemd LoadCredential) over the env, which is visible in /proc.
-    let key = match std::env::var("ZHOST_API_KEY_FILE") {
-        Ok(path) => std::fs::read_to_string(&path)
-            .expect("read ZHOST_API_KEY_FILE")
-            .trim()
-            .to_string(),
-        Err(_) => std::env::var("ZHOST_API_KEY").unwrap_or_else(|_| "zhost-dev-key".into()),
-    };
+    let (keys, login_key) = load_keys();
     let bind = std::env::var("ZHOST_BIND").unwrap_or_else(|_| "127.0.0.1:8189".into());
     let _ = CFG.set(Config {
-        key,
+        keys,
+        login_key,
         user_id: std::env::var("ZHOST_USER_ID")
             .ok()
             .and_then(|v| v.parse().ok())
