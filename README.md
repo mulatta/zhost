@@ -137,5 +137,9 @@ ZHOST_DATABASE_URL='postgres:///zhost?host=/run/postgresql' \
 ```
 
 Configuration is via environment variables: `ZHOST_BIND`, `ZHOST_PUBLIC_URL`,
-`ZHOST_DATABASE_URL`, `ZHOST_STORAGE_DIR`, and `ZHOST_API_KEY_FILE` (or
-`ZHOST_API_KEY` for local development).
+`ZHOST_DATABASE_URL`, `ZHOST_STORAGE_DIR`, and `ZHOST_KEYS` (or
+`ZHOST_API_KEY_FILE` / `ZHOST_API_KEY` for a single key in local development).
+
+## License
+
+[MIT](LICENSE).

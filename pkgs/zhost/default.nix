@@ -13,6 +13,7 @@ rustPlatform.buildRustPackage {
   meta = {
     description = "Self-hosted Zotero Web API v3 sync server";
     mainProgram = "zhost";
+    license = lib.licenses.mit;
     platforms = lib.platforms.unix;
     maintainers = [ lib.maintainers.mulatta ];
   };
