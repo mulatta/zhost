@@ -16,18 +16,22 @@ pointed at it.
   `(kind, key)`; a single library version counter is bumped per write so the
   client's `since` reads and `If-Unmodified-Since-Version` writes stay coherent.
   Attachment bytes are stored on the filesystem.
-- **Auth.** Single user, single library. The client obtains the configured API
+- **Auth.** Single user, single library. The client obtains a read/write API
   token through Zotero's browser-login session flow; the token is a bearer
-  string checked on every request.
+  string checked on every request. Multiple tokens can be configured, each
+  read/write or read-only — handy for giving a CLI or agent read-only access
+  while the app keeps write access.
 
 The full request contract is documented in [`server/SPEC.md`](server/SPEC.md).
+The same endpoints serve any token-holding client, so a CLI can read items,
+files and full-text directly over HTTP without the Zotero app.
 
 ## Components (flake outputs)
 
 | Output | Purpose |
 | --- | --- |
 | `packages.zhost` | the sync server binary |
-| `nixosModules.zhost` | systemd service + local postgres + credential-loaded key |
+| `nixosModules.zhost` | systemd service + local postgres + credential-loaded keys |
 | `homeModules.zotero` | `programs.zotero`: stock client configured at the server |
 | `overlays.default` | `pkgs.zotero` patched to point at a self-hosted server |
 
@@ -52,18 +56,30 @@ Store it with sops-nix (or any secret manager); the server reads it from a file.
 imports = [ inputs.zhost.nixosModules.zhost ];
 nixpkgs.overlays = [ inputs.zhost.overlays.default ];
 
-sops.secrets."zhost/api-key".owner = "zhost";
+sops.secrets."zhost/app-key".owner = "zhost";
+sops.secrets."zhost/cli-key".owner = "zhost";
 
 services.zhost = {
   enable = true;
   bind = "127.0.0.1:8189";
   publicUrl = "https://zotero.malt.wg";   # reverse-proxy address, no trailing slash
-  apiKeyFile = config.sops.secrets."zhost/api-key".path;
   storageDir = "/var/lib/zhost/storage";  # encrypt at the host/FS layer
+  keys = {
+    # The Zotero app needs write access.
+    app.file = config.sops.secrets."zhost/app-key".path;
+    # A CLI / agent that should only read.
+    cli = {
+      file = config.sops.secrets."zhost/cli-key".path;
+      readOnly = true;
+    };
+  };
 };
 
 # Reverse proxy on the wg interface (TLS via your CA) -> http://127.0.0.1:8189
 ```
+
+For a single read/write key, `apiKeyFile = config.sops.secrets."zhost/api-key".path;`
+is shorthand for one `keys` entry.
 
 **Client (home-manager):**
 
@@ -92,13 +108,19 @@ Then sign in once per device via Zotero's Sync preferences.
 
 ## Status
 
-Validated end-to-end against a real Zotero 9 client: cross-machine sync of
-metadata and attachment files, both directions.
+Validated end-to-end against a real Zotero 9 client (cross-machine sync of
+metadata and attachment files, both directions) and by a NixOS VM test
+(`checks/nixos-sync`) exercising the API and the module on Linux.
 
-Pending:
-- write conflict semantics (`If-Unmodified-Since-Version` → `412`);
-- full-text content is acknowledged but not yet stored;
-- group libraries, the streaming server, and binary-diff uploads are out of scope.
+Implemented: the full sync contract — objects, settings, deletions, write
+conflict semantics (`If-Unmodified-Since-Version` → `412`), the three-step file
+upload and download, full-text content storage, and read-only API keys.
+
+Planned: a CLI-facing read/query API (search, filter, sort, pagination,
+full-text search, `/tags`) — see `server/SPEC.md`.
+
+Out of scope: group libraries, the streaming server, binary-diff uploads, and
+styled bibliography/citation rendering (done downstream from the raw data).
 
 ## Development
 

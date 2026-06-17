@@ -3,8 +3,11 @@
 Derived from the Zotero client sync code (`~/git/zotero/chrome/content/zotero/xpcom/sync/`,
 `storage/zfs.js`), the official Web API v3 docs, and live testing against a real
 Zotero 9 client. This is the contract the server must satisfy so a
-(URL-redirected) stock client syncs against it. The current server implements
-everything below; "out of scope" items remain unimplemented.
+(URL-redirected) stock client syncs against it. The server implements the entire
+sync contract below; "out of scope" items remain unimplemented. The one
+forward-looking section, "Read/query API (CLI-facing extension)", is explicitly
+marked as planned and built incrementally — it is not part of what the sync
+client needs.
 
 Client file references use `syncAPIClient.js` (the request layer), `syncEngine.js`
 (sync flow), `zfs.js` (file storage).
@@ -206,16 +209,20 @@ Full-text search (`qmode=everything`) matches against the `fulltext` table; a
 
 ## Storage backend (PostgreSQL on malt)
 
-Sketch:
+Tables (see `migrations/`):
 - `library(id, version)` — the monotonic counter.
-- `object(library_id, type, key, version, data jsonb, deleted bool)` — items,
-  collections, searches; `version`-indexed for `since` queries.
+- `object(library_id, kind, key, version, data jsonb)` — items, collections,
+  searches; `version`-indexed for `since` queries. Trashed state lives in
+  `data.deleted`, not a column.
 - `setting(library_id, key, value jsonb, version)`.
 - `fulltext(library_id, item_key, content, indexed_chars, total_chars, indexed_pages, total_pages, version)`.
-- `deletion(library_id, type, key, version)` — the delete log for `/deleted`.
-- `file(library_id, item_key, md5, filename, filesize, mtime, blob_path, version)`.
-- `upload(upload_key, library_id, item_key, tmp_path, md5, ...)` — pending uploads.
-- `api_key(key, user_id, access)` — MVP one row.
+- `deletion(library_id, kind, key, version)` — the delete log for `/deleted`.
+- `file(library_id, item_key, md5, filename, filesize, mtime, version)` — the
+  bytes live on the filesystem (one file per item key under `storageDir`).
+
+Not in the database: **API keys** are held in memory, loaded from secret files
+at boot (see Auth → Access keys). **Pending uploads** (between the file
+authorisation and registration steps) are held in memory keyed by upload key.
 
 Writes run in a transaction that bumps `library.version` and stamps the affected
 rows, so conditional version checks are atomic.
