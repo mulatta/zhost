@@ -6,7 +6,9 @@
 //! `If-Unmodified-Since-Version` writes stay coherent.
 
 use serde_json::{Map, Value};
-use sqlx::{PgPool, Row};
+use sqlx::{PgPool, Postgres, QueryBuilder, Row};
+
+use crate::query::{ItemQuery, QMode};
 
 /// Single user, single personal library.
 const LIBRARY_ID: i64 = 1;
@@ -118,6 +120,107 @@ pub async fn objects(pool: &PgPool, kind: &str, keys: &[String]) -> sqlx::Result
         })
         .collect();
     Ok(Value::Array(array))
+}
+
+/// Escape LIKE/ILIKE wildcards so a search term matches literally; the `escape
+/// '\'` clause in the query below makes `\` the escape character.
+fn escape_like(term: &str) -> String {
+    term.replace('\\', "\\\\")
+        .replace('%', "\\%")
+        .replace('_', "\\_")
+}
+
+/// Run a CLI-facing item listing: filter, search, sort and page over the stored
+/// items. Returns `([{key, version, data}], total)`, where `total` is the full
+/// match count before paging (a window aggregate, so it survives `limit`).
+pub async fn query_items(pool: &PgPool, q: &ItemQuery) -> sqlx::Result<(Vec<Value>, i64)> {
+    let mut sql: QueryBuilder<Postgres> = QueryBuilder::new(
+        "select key, version, data, count(*) over () as total \
+         from object where library_id = ",
+    );
+    sql.push_bind(LIBRARY_ID).push(" and kind = 'item'");
+
+    // Trashed items (data.deleted truthy) are excluded unless asked for.
+    if !q.include_trashed {
+        sql.push(" and coalesce(data->>'deleted', '0') not in ('1', 'true')");
+    }
+
+    if let Some(term) = &q.q {
+        let like = format!("%{}%", escape_like(term));
+        sql.push(" and (data->>'title' ilike ")
+            .push_bind(like.clone())
+            .push(" escape '\\' or data->>'date' ilike ")
+            .push_bind(like.clone())
+            .push(
+                " escape '\\' or exists (select 1 from \
+                 jsonb_array_elements(coalesce(data->'creators', '[]'::jsonb)) c \
+                 where c->>'lastName' ilike ",
+            )
+            .push_bind(like.clone())
+            .push(" escape '\\' or c->>'firstName' ilike ")
+            .push_bind(like.clone())
+            .push(" escape '\\' or c->>'name' ilike ")
+            .push_bind(like.clone())
+            .push(" escape '\\')");
+        // `everything` also searches stored full-text content (trgm-indexed).
+        if q.qmode == QMode::Everything {
+            sql.push(
+                " or exists (select 1 from fulltext f \
+                 where f.library_id = object.library_id and f.item_key = object.key \
+                 and f.content ilike ",
+            )
+            .push_bind(like.clone())
+            .push(" escape '\\')");
+        }
+        sql.push(")");
+    }
+
+    if !q.item_type.include.is_empty() {
+        sql.push(" and data->>'itemType' = any(")
+            .push_bind(q.item_type.include.clone())
+            .push(")");
+    }
+    if !q.item_type.exclude.is_empty() {
+        sql.push(" and data->>'itemType' <> all(")
+            .push_bind(q.item_type.exclude.clone())
+            .push(")");
+    }
+
+    // AND across groups, OR within a group: the item must carry a tag from each.
+    for group in &q.tags {
+        sql.push(
+            " and exists (select 1 from \
+             jsonb_array_elements(coalesce(data->'tags', '[]'::jsonb)) t \
+             where t->>'tag' = any(",
+        )
+        .push_bind(group.clone())
+        .push("))");
+    }
+
+    // order_expr/sql() are fixed strings (no user input), so pushing them raw is
+    // safe; nulls sort last so items missing the sort field don't lead.
+    sql.push(" order by ")
+        .push(q.sort.order_expr())
+        .push(" ")
+        .push(q.direction.sql())
+        .push(" nulls last, key asc limit ")
+        .push_bind(q.limit)
+        .push(" offset ")
+        .push_bind(q.start);
+
+    let rows = sql.build().fetch_all(pool).await?;
+    let total = rows.first().map(|r| r.get::<i64, _>("total")).unwrap_or(0);
+    let items = rows
+        .into_iter()
+        .map(|row| {
+            serde_json::json!({
+                "key": row.get::<String, _>("key"),
+                "version": row.get::<i64, _>("version"),
+                "data": linkmode_first(row.get::<Value, _>("data")),
+            })
+        })
+        .collect();
+    Ok((items, total))
 }
 
 /// Store a batch verbatim, stamping each object with the new library version.

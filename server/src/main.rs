@@ -5,6 +5,7 @@
 //! and `If-Unmodified-Since-Version` writes stay coherent. See SPEC.md for the
 //! protocol contract.
 
+mod query;
 mod store;
 
 use std::collections::HashMap;
@@ -12,7 +13,7 @@ use std::sync::{LazyLock, Mutex, OnceLock};
 
 use axum::{
     body::{Body, Bytes},
-    extract::{DefaultBodyLimit, Form, Path, Query, Request},
+    extract::{DefaultBodyLimit, Form, Path, Query, RawQuery, Request},
     http::{HeaderMap, StatusCode},
     middleware::{self, Next},
     response::{IntoResponse, Response},
@@ -200,6 +201,63 @@ async fn read(kind: &str, params: HashMap<String, String>) -> Response {
         Ok(value) => (current_headers().await, Json(value)).into_response(),
         Err(error) => server_error("read", error),
     }
+}
+
+/// `GET /users/<id>/items`. Serves the two sync reads (the `format=versions`
+/// map and the `?itemKey=…` batch) and, when neither is asked for, the
+/// CLI-facing query: filter/search/sort/paginate over the library.
+async fn items_get(Path(id): Path<String>, RawQuery(raw): RawQuery) -> Response {
+    let params = query::Params::parse(raw.as_deref());
+
+    if params.get("format") == Some("versions") {
+        let since = params
+            .get("since")
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0);
+        return match store::versions(pool(), "item", since).await {
+            Ok(value) => (current_headers().await, Json(value)).into_response(),
+            Err(error) => server_error("items versions", error),
+        };
+    }
+    if let Some(csv) = params.get("itemKey") {
+        let keys: Vec<String> = csv.split(',').map(String::from).collect();
+        return match store::objects(pool(), "item", &keys).await {
+            Ok(value) => (current_headers().await, Json(value)).into_response(),
+            Err(error) => server_error("items batch", error),
+        };
+    }
+
+    let q = query::ItemQuery::from_params(&params);
+    match store::query_items(pool(), &q).await {
+        Ok((items, total)) => {
+            let mut headers = current_headers().await;
+            headers.insert("total-results", total.to_string().parse().unwrap());
+            // Point the client at the next page until the window covers the rest.
+            if q.start + q.limit < total {
+                let link = next_link(&id, raw.as_deref(), q.start + q.limit);
+                headers.insert("link", link.parse().unwrap());
+            }
+            (headers, Json(Value::Array(items))).into_response()
+        }
+        Err(error) => server_error("items query", error),
+    }
+}
+
+/// The `Link: <…>; rel="next"` header for the page after `start`, preserving the
+/// request's other params and pointing at the public (reverse-proxy) URL.
+fn next_link(id: &str, raw: Option<&str>, start: i64) -> String {
+    let mut pairs: Vec<(String, String)> = raw
+        .and_then(|q| serde_urlencoded::from_str(q).ok())
+        .unwrap_or_default();
+    pairs.retain(|(k, _)| k != "start");
+    pairs.push(("start".into(), start.to_string()));
+    let qs = serde_urlencoded::to_string(&pairs).unwrap_or_default();
+    format!(
+        "<{}/users/{}/items?{}>; rel=\"next\"",
+        cfg().public_url,
+        id,
+        qs
+    )
 }
 
 async fn write(kind: &str, headers: HeaderMap, body: Bytes) -> Response {
@@ -535,7 +593,19 @@ fn app() -> Router {
         )
         .route("/users/{id}/collections", objects("collection"))
         .route("/users/{id}/searches", objects("search"))
-        .route("/users/{id}/items", objects("item"))
+        // Items share the write/delete logic but take a dedicated GET that adds
+        // the CLI query API alongside the two sync reads.
+        .route(
+            "/users/{id}/items",
+            get(items_get)
+                .post(move |headers: HeaderMap, body: Bytes| write("item", headers, body))
+                .patch(move |headers: HeaderMap, body: Bytes| write("item", headers, body))
+                .delete(
+                    move |headers: HeaderMap, Query(p): Query<HashMap<String, String>>| {
+                        delete("item", headers, p)
+                    },
+                ),
+        )
         .route(
             "/users/{id}/items/top",
             get(|Query(p): Query<HashMap<String, String>>| read("item", p)),

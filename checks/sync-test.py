@@ -157,6 +157,53 @@ with subtest("a stale full-text write is rejected with 412"):
         == "412"
     )
 
+with subtest("the query API filters, searches, sorts and paginates items"):
+    # Seed a couple of distinct items to query over.
+    version = library_version()
+    machine.succeed(
+        f"curl -sf -X POST {base}/users/1/items {auth} "
+        f"-H 'If-Unmodified-Since-Version: {version}' "
+        f'-d \'[{{"key":"QBOOK001","itemType":"book","title":"Borrow Checker",'
+        f'"creators":[{{"lastName":"Klabnik","firstName":"Steve"}}],'
+        f'"tags":[{{"tag":"rustlang"}},{{"tag":"systems"}}]}},'
+        f'{{"key":"QART0001","itemType":"journalArticle","title":"Unrelated",'
+        f'"tags":[{{"tag":"rustlang"}}]}}]\' | jq -e .successful'
+    )
+
+    def keys(qs):
+        return machine.succeed(
+            f"curl -sf '{base}/users/1/items?{qs}' {auth} | jq -r '[.[].key]|sort|join(\",\")'"
+        ).strip()
+
+    # Title and creator search (titleCreatorYear, the default qmode).
+    assert keys("q=borrow") == "QBOOK001", keys("q=borrow")
+    assert keys("q=klabnik") == "QBOOK001", keys("q=klabnik")
+    # Type filter, including negation.
+    assert "QBOOK001" in keys("itemType=book")
+    assert "QART0001" not in keys("itemType=book")
+    assert "QART0001" in keys("itemType=-book")
+    # Tags: repeated key is AND, only the book carries both.
+    assert keys("tag=rustlang&tag=systems") == "QBOOK001"
+    assert keys("tag=rustlang") == "QART0001,QBOOK001"
+    # Full-text only matches under qmode=everything (ATTACH001 holds "hello world").
+    assert keys("q=world") == ""
+    assert keys("q=world&qmode=everything") == "ATTACH001"
+
+with subtest("the query API reports Total-Results and a next-page Link"):
+    # Header names come back lower-cased over HTTP/1.1, so match case-insensitively.
+    headers = machine.succeed(
+        f"curl -sf -D - -o /dev/null '{base}/users/1/items?limit=1&sort=title&direction=asc' {auth}"
+    ).lower()
+    assert "total-results:" in headers, headers
+    assert 'rel="next"' in headers, headers
+    # The Link points at the public URL, not the internal bind address.
+    assert "localhost:8189" in headers, headers
+
+with subtest("a read-only key can drive the query API"):
+    assert (
+        http_code(f"'{base}/users/1/items?q=borrow' {readonly}") == "200"
+    )
+
 with subtest("deletes are recorded in the deletion log"):
     machine.succeed(f"curl -sf -X DELETE '{base}/users/1/items?itemKey=ITEM0001' {auth}")
     machine.succeed(
