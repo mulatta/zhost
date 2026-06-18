@@ -422,6 +422,27 @@ async fn settings_write(headers: HeaderMap, body: Bytes) -> Response {
     }
 }
 
+/// `DELETE /settings?settingKey=k1,k2` — remove the named settings under the
+/// version guard and record them in the deletion log. (Reusing settings_write
+/// here was a no-op: a DELETE has no body, so it deleted nothing yet returned
+/// 204 and the setting persisted.)
+async fn settings_delete(
+    headers: HeaderMap,
+    Query(params): Query<HashMap<String, String>>,
+) -> Response {
+    let keys = params
+        .get("settingKey")
+        .map(|csv| csv.split(',').map(String::from).collect::<Vec<_>>())
+        .unwrap_or_default();
+    match store::delete_settings(pool(), &keys, if_unmodified(&headers)).await {
+        Ok(store::Outcome::Done(version)) => {
+            (StatusCode::NO_CONTENT, version_headers(version)).into_response()
+        }
+        Ok(store::Outcome::Conflict(current)) => conflict(current),
+        Err(error) => server_error("settings delete", error),
+    }
+}
+
 async fn deleted(Query(params): Query<HashMap<String, String>>) -> Response {
     let since = params
         .get("since")
@@ -695,7 +716,7 @@ fn app() -> Router {
             "/users/{id}/settings",
             get(settings_read)
                 .post(settings_write)
-                .delete(settings_write),
+                .delete(settings_delete),
         )
         .route("/users/{id}/collections", objects("collection"))
         // CLI listing of a collection's items, plus the top-level variant the

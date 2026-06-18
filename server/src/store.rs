@@ -433,6 +433,38 @@ pub async fn write_settings(
     Ok(Outcome::Done(version))
 }
 
+/// Delete the named settings, recording each in the deletion log so `/deleted`
+/// can propagate the removal. Returns the new library version or a conflict.
+pub async fn delete_settings(
+    pool: &PgPool,
+    keys: &[String],
+    expected: Option<i64>,
+) -> sqlx::Result<Outcome<i64>> {
+    let mut tx = pool.begin().await?;
+    let version = match guarded_version(&mut tx, expected).await? {
+        Outcome::Done(version) => version,
+        Outcome::Conflict(current) => return Ok(Outcome::Conflict(current)),
+    };
+    for key in keys {
+        sqlx::query("delete from setting where library_id = $1 and key = $2")
+            .bind(LIBRARY_ID)
+            .bind(key)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query(
+            "insert into deletion (library_id, kind, key, version) values ($1, 'setting', $2, $3) \
+             on conflict (library_id, kind, key) do update set version = $3",
+        )
+        .bind(LIBRARY_ID)
+        .bind(key)
+        .bind(version)
+        .execute(&mut *tx)
+        .await?;
+    }
+    tx.commit().await?;
+    Ok(Outcome::Done(version))
+}
+
 /// Whether an attachment file with this md5 is already registered.
 pub async fn file_exists(pool: &PgPool, item_key: &str, md5: &str) -> sqlx::Result<bool> {
     let row =
@@ -611,14 +643,16 @@ pub async fn deleted(pool: &PgPool, since: i64) -> sqlx::Result<Value> {
         .bind(since)
         .fetch_all(pool)
         .await?;
-    let (mut collections, mut searches, mut items, mut tags) =
-        (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+    let (mut collections, mut searches, mut items, mut settings, mut tags) =
+        (Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new());
     for row in rows {
         let key: String = row.get("key");
         match row.get::<String, _>("kind").as_str() {
             "collection" => collections.push(Value::from(key)),
             "search" => searches.push(Value::from(key)),
-            "tag" => tags.push(Value::from(key)),
+            "setting" => settings.push(Value::from(key)),
+            // Tag deletions are objects ({tag, type}); type is unknown here, so 0.
+            "tag" => tags.push(serde_json::json!({ "tag": key, "type": 0 })),
             _ => items.push(Value::from(key)),
         }
     }
@@ -626,6 +660,7 @@ pub async fn deleted(pool: &PgPool, since: i64) -> sqlx::Result<Value> {
         "collections": collections,
         "searches": searches,
         "items": items,
+        "settings": settings,
         "tags": tags,
     }))
 }
