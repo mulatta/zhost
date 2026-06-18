@@ -24,6 +24,9 @@ testPkgs.testers.runNixOSTest {
           readOnly = true;
         };
       };
+      # Only this SSO identity (as forwarded by the front proxy) may authorize a
+      # login; the test simulates the proxy by sending the header directly.
+      loginAuthorizedUser = "owner@mulatta.io";
       # Attachment bytes go to the local RustFS standing in for S3/R2.
       s3 = {
         endpoint = "http://127.0.0.1:9000";

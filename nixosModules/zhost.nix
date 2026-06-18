@@ -61,6 +61,18 @@ in
       description = "PostgreSQL connection URL (defaults to the local peer socket).";
     };
 
+    loginAuthorizedUser = lib.mkOption {
+      type = lib.types.nullOr lib.types.str;
+      default = null;
+      example = "me@example.org";
+      description = ''
+        If set, `POST /login` only authorizes a session when the front SSO proxy
+        forwards a matching `X-Auth-Request-Email`/`-User` (e.g. the kanidm user
+        allowed to enroll). Leave null on a private network, where reachability
+        is the gate.
+      '';
+    };
+
     s3 = lib.mkOption {
       description = "S3-compatible object storage for attachment bytes (e.g. Cloudflare R2).";
       type = lib.types.submodule {
@@ -206,6 +218,9 @@ in
         ZHOST_S3_SECRET_KEY_FILE = "%d/s3-secret-key";
         ZHOST_KEYS = keyManifest;
         RUST_LOG = "info";
+      }
+      // lib.optionalAttrs (cfg.loginAuthorizedUser != null) {
+        ZHOST_LOGIN_AUTHORIZED_USER = cfg.loginAuthorizedUser;
       };
 
       serviceConfig = {

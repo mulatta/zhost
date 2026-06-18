@@ -88,8 +88,11 @@ The Zotero client opens `loginURL` in the user's browser, so `/login` is placed
 behind an SSO gate (oauth2-proxy → an identity provider): the key is released only
 once an authenticated human clicks Approve. The server binds to localhost and is
 exposed only through that proxy, so `/login` cannot be reached unauthenticated.
-(On a private network — WireGuard/ZeroTier — the network itself is the gate and
-the SSO step can be dropped.)
+When `login_authorized_user` is set, `POST /login` additionally requires the proxy
+to forward a matching identity (`X-Auth-Request-Email`/`-User`), tying the approval
+to a proven identity (defence-in-depth against a misconfigured/bypassed proxy).
+(On a private network — WireGuard/ZeroTier — the network itself is the gate, and
+the SSO step and this check can be dropped.)
 
 | Endpoint | Notes |
 |---|---|
