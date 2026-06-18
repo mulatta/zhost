@@ -307,13 +307,17 @@ pub async fn tags(pool: &PgPool) -> sqlx::Result<Value> {
     Ok(Value::Array(array))
 }
 
-/// Store a batch verbatim, stamping each object with the new library version.
+/// Store a batch, stamping each object with the new library version. With
+/// `merge` (a `PATCH`), each object's top-level fields are overlaid onto the
+/// existing stored object (Zotero partial-update semantics: provided fields win,
+/// omitted fields are kept); without it (a `POST`) the object replaces the row.
 /// Returns `(new_version, successful_map)` where the map is keyed by batch index.
 pub async fn write(
     pool: &PgPool,
     kind: &str,
     batch: Vec<Value>,
     expected: Option<i64>,
+    merge: bool,
 ) -> sqlx::Result<Outcome<(i64, Value)>> {
     if batch.is_empty() {
         return Ok(match no_change(pool, expected).await? {
@@ -328,12 +332,36 @@ pub async fn write(
     };
 
     let mut successful = Map::new();
-    for (index, mut object) in batch.into_iter().enumerate() {
-        let key = object
+    for (index, provided) in batch.into_iter().enumerate() {
+        let key = provided
             .get("key")
             .and_then(Value::as_str)
             .map(String::from)
             .unwrap_or_else(|| format!("ZH{index:06}"));
+        // For a merge, start from the existing object (read in this txn so the
+        // version guard serialises it) and overlay the provided top-level fields.
+        let mut object = if merge {
+            let existing = sqlx::query(
+                "select data from object where library_id = $1 and kind = $2 and key = $3",
+            )
+            .bind(LIBRARY_ID)
+            .bind(kind)
+            .bind(&key)
+            .fetch_optional(&mut *tx)
+            .await?
+            .map(|row| row.get::<Value, _>("data"));
+            match (existing, &provided) {
+                (Some(Value::Object(mut base)), Value::Object(fields)) => {
+                    for (k, v) in fields {
+                        base.insert(k.clone(), v.clone());
+                    }
+                    Value::Object(base)
+                }
+                _ => provided,
+            }
+        } else {
+            provided
+        };
         if let Value::Object(fields) = &mut object {
             fields.insert("key".into(), Value::from(key.clone()));
             fields.insert("version".into(), Value::from(version));

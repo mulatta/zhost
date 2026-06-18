@@ -605,6 +605,25 @@ with subtest("PATCH updates items and is gated by the read-only key"):
         == "403"
     )
 
+with subtest("PATCH merges: a partial update keeps unspecified fields"):
+    machine.succeed(
+        f"curl -sf -X POST {base}/users/1/items {auth} "
+        f"-H 'If-Unmodified-Since-Version: {library_version()}' "
+        f'-d \'[{{"key":"MERGEIT2","itemType":"book","title":"orig","tags":[{{"tag":"keep"}}]}}]\' '
+        f"| jq -e .successful"
+    )
+    # PATCH only the title; itemType and tags must survive (a POST would drop them).
+    machine.succeed(
+        f"curl -sf -X PATCH {base}/users/1/items {auth} "
+        f"-H 'If-Unmodified-Since-Version: {library_version()}' "
+        f'-d \'[{{"key":"MERGEIT2","title":"new"}}]\''
+    )
+    machine.succeed(
+        f"curl -sf '{base}/users/1/items?itemKey=MERGEIT2&format=json' {auth} "
+        f"| jq -e '.[0].data.title==\"new\" and .[0].data.itemType==\"book\" "
+        f"and .[0].data.tags[0].tag==\"keep\"'"
+    )
+
 with subtest("deletes are recorded in the deletion log"):
     machine.succeed(
         f"curl -sf -X DELETE '{base}/users/1/items?itemKey=ITEM0001' {auth} "
