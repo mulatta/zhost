@@ -184,20 +184,14 @@ fn push_item_filters(sql: &mut QueryBuilder<Postgres>, q: &ItemQuery) {
 
     if let Some(term) = &q.q {
         let like = format!("%{}%", escape_like(term));
-        sql.push(" and (data->>'title' ilike ")
+        // titleCreatorYear matches title, date and creator names through the
+        // indexed zhost_item_text(data) expression (migration 0005), so the
+        // default search is trigram-index-backed rather than a sequential scan.
+        sql.push(" and (zhost_item_text(data) ilike ")
             .push_bind(like.clone())
-            .push(" escape '\\' or data->>'date' ilike ")
-            .push_bind(like.clone())
-            .push(" escape '\\' or exists (select 1 from jsonb_array_elements(")
-            .push(json_array("creators"))
-            .push(") c where c->>'lastName' ilike ")
-            .push_bind(like.clone())
-            .push(" escape '\\' or c->>'firstName' ilike ")
-            .push_bind(like.clone())
-            .push(" escape '\\' or c->>'name' ilike ")
-            .push_bind(like.clone())
-            .push(" escape '\\')");
+            .push(" escape '\\'");
         // `everything` also searches stored full-text content (trgm-indexed).
+        // This OR spans the fulltext table, so that mode cannot use the index.
         if q.qmode == QMode::Everything {
             sql.push(
                 " or exists (select 1 from fulltext f \

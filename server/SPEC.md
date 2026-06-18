@@ -210,9 +210,13 @@ the key). The item listings carry the same search/filter/sort/paginate params as
 `/items`; `/items/top` also still answers the sync `format=versions`/`itemKey`
 reads the client may send there.
 
-Matching is case-insensitive substring (`ILIKE`). Full-text search
-(`qmode=everything`) additionally matches the `fulltext` table; a `pg_trgm` GIN
-index on `content` (migration `0004`) keeps that substring search cheap.
+Matching is case-insensitive substring (`ILIKE`). The default `titleCreatorYear`
+search runs against an immutable `zhost_item_text(data)` expression (title, date
+and creator names) carrying a `pg_trgm` GIN index (migration `0005`), so it is
+index-backed rather than a sequential scan. Full-text search (`qmode=everything`)
+additionally matches the `fulltext` table — also `pg_trgm`-indexed on `content`
+(migration `0004`); because that mode ORs across the `fulltext` table it falls
+back to a scan of the candidate items.
 
 ## Storage backend (PostgreSQL on malt)
 
