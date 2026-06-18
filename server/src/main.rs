@@ -576,7 +576,9 @@ async fn tags_get() -> Response {
     }
 }
 
-async fn write(kind: &str, headers: HeaderMap, body: Bytes) -> Response {
+/// `merge` distinguishes a `PATCH` (partial update, merge into the stored object)
+/// from a `POST` (full replace).
+async fn write(kind: &str, headers: HeaderMap, body: Bytes, merge: bool) -> Response {
     let batch: Vec<Value> = match serde_json::from_slice(&body) {
         Ok(batch) => batch,
         Err(error) => {
@@ -588,7 +590,7 @@ async fn write(kind: &str, headers: HeaderMap, body: Bytes) -> Response {
         Ok(v) => v,
         Err(resp) => return resp,
     };
-    match store::write(pool(), kind, batch, Some(expected)).await {
+    match store::write(pool(), kind, batch, Some(expected), merge).await {
         Ok(store::Outcome::Done((version, successful))) => (
             version_headers(version),
             Json(json!({
@@ -1006,8 +1008,8 @@ fn app() -> Router {
     // kind so the handlers stay generic.
     let objects = |kind: &'static str| {
         get(move |Query(p): Query<HashMap<String, String>>| read(kind, p))
-            .post(move |headers: HeaderMap, body: Bytes| write(kind, headers, body))
-            .patch(move |headers: HeaderMap, body: Bytes| write(kind, headers, body))
+            .post(move |headers: HeaderMap, body: Bytes| write(kind, headers, body, false))
+            .patch(move |headers: HeaderMap, body: Bytes| write(kind, headers, body, true))
             .delete(
                 move |headers: HeaderMap, Query(p): Query<HashMap<String, String>>| {
                     delete(kind, headers, p)
@@ -1044,8 +1046,8 @@ fn app() -> Router {
         .route(
             "/users/{id}/items",
             get(items_get)
-                .post(move |headers: HeaderMap, body: Bytes| write("item", headers, body))
-                .patch(move |headers: HeaderMap, body: Bytes| write("item", headers, body))
+                .post(move |headers: HeaderMap, body: Bytes| write("item", headers, body, false))
+                .patch(move |headers: HeaderMap, body: Bytes| write("item", headers, body, true))
                 .delete(
                     move |headers: HeaderMap, Query(p): Query<HashMap<String, String>>| {
                         delete("item", headers, p)

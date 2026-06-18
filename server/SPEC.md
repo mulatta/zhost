@@ -152,7 +152,7 @@ All writes return `Last-Modified-Version` and use `If-Unmodified-Since-Version`.
 | Request | Response |
 |---|---|
 | `POST <prefix>/{collections,searches,items}` — body: JSON array (client batches ≤10, API allows ≤50) | `200` upload-result object (below) or `412`. (syncAPIClient.js:393) |
-| `PATCH <prefix>/{...}` | Same as POST (updates). |
+| `PATCH <prefix>/{...}` | Partial update: the provided top-level fields are merged into the stored object (omitted fields kept); a provided field replaces its value. (`POST` replaces the whole object.) |
 | `DELETE <prefix>/{collections,searches,items}?{objectKey}=k1,k2,...` (client batches ≤25); tags via `?tags=t1\|\|t2` | `204` or `412`. (syncAPIClient.js:430) |
 | `POST <prefix>/settings` — body `{key: {value}}` (≤250/batch) | `200` result obj / `204` / `412`. (syncAPIClient.js:359) |
 | `DELETE <prefix>/settings?settingKey=k1,k2` | `204` / `412`. (syncAPIClient.js:336) |
