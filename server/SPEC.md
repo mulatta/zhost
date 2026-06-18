@@ -40,7 +40,9 @@ Behaviours confirmed by live testing (each is a hard requirement):
   client syncs only the personal library.
 - **No S3.** File storage is local on the server host; the upload-authorization
   response points `url` at the server's own upload endpoint.
-- **Out of scope:** group libraries, binary-diff file upload (`PATCH .../file`),
+- **Out of scope:** group libraries, binary-diff file upload (`PATCH .../file` —
+  an API-only capability the desktop client's `storage/zfs.js` never implements;
+  it always uploads the full file, so the server never sees a partial upload),
   the streaming/websocket server (client falls back to polling), and `/schema`
   (the client uses its bundled `resource://zotero/schema/global/schema.json` and
   updates it from repo.zotero.org, not from the sync API).
