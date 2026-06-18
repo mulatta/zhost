@@ -80,6 +80,18 @@ fn upload_token() -> Option<String> {
     Some(buf.iter().map(|b| format!("{b:02x}")).collect())
 }
 
+/// Maximum buffered request body. Attachments can be large; everything else is
+/// tiny. A finite cap bounds per-request memory so one device can't OOM the host
+/// (the body is fully buffered by the auth middleware before handlers run).
+const MAX_BODY: usize = 256 * 1024 * 1024;
+
+/// Object/file keys become on-disk path components, so reject anything that
+/// isn't a plain alphanumeric token (no `/`, `.`, `..`) before it touches the
+/// filesystem. Zotero keys are 8 alphanumeric chars; allow a little slack.
+fn valid_key(key: &str) -> bool {
+    !key.is_empty() && key.len() <= 32 && key.bytes().all(|b| b.is_ascii_alphanumeric())
+}
+
 fn cfg() -> &'static Config {
     CFG.get().expect("config initialised in main")
 }
@@ -566,6 +578,9 @@ async fn file_post(
     headers: HeaderMap,
     Form(form): Form<HashMap<String, String>>,
 ) -> Response {
+    if !valid_key(&key) {
+        return (StatusCode::BAD_REQUEST, "invalid item key").into_response();
+    }
     // Registration step: the client posts upload=<token> after PUTting the bytes.
     if let Some(token) = form.get("upload") {
         let pending = PENDING.lock().unwrap().get(token).cloned();
@@ -738,6 +753,9 @@ async fn file_get(Path((_id, key)): Path<(String, String)>) -> Response {
 
 /// Serve the raw attachment bytes the file_get redirect points at.
 async fn file_download(Path(key): Path<String>) -> Response {
+    if !valid_key(&key) {
+        return StatusCode::NOT_FOUND.into_response();
+    }
     match tokio::fs::read(file_path(&key)).await {
         Ok(bytes) => bytes.into_response(),
         Err(_) => StatusCode::NOT_FOUND.into_response(),
@@ -750,9 +768,10 @@ async fn file_download(Path(key): Path<String>) -> Response {
 /// configured key except the bootstrap (key/session creation, login) endpoints.
 async fn log_and_auth(req: Request, next: Next) -> Response {
     let (mut parts, body) = req.into_parts();
-    let raw = axum::body::to_bytes(body, usize::MAX)
-        .await
-        .unwrap_or_else(|_| Bytes::new());
+    let raw = match axum::body::to_bytes(body, MAX_BODY).await {
+        Ok(raw) => raw,
+        Err(_) => return (StatusCode::PAYLOAD_TOO_LARGE, "request body too large").into_response(),
+    };
 
     let gzipped = parts
         .headers
@@ -761,7 +780,9 @@ async fn log_and_auth(req: Request, next: Next) -> Response {
         .is_some_and(|e| e.contains("gzip"));
     let bytes = if gzipped {
         use std::io::Read;
-        let mut decoder = flate2::read::GzDecoder::new(&raw[..]);
+        // Cap the decompressed size too, so a small gzip can't expand without
+        // bound (a malformed/over-large body then fails to parse downstream).
+        let mut decoder = flate2::read::GzDecoder::new(&raw[..]).take(MAX_BODY as u64);
         let mut out = Vec::new();
         match decoder.read_to_end(&mut out) {
             Ok(_) => {
@@ -890,9 +911,9 @@ fn app() -> Router {
         .route("/uploads/{key}", post(upload_put))
         .route("/files/{key}", get(file_download))
         .route("/users/{id}/deleted", get(deleted))
-        // Attachment uploads exceed the default 2 MiB extractor limit; the
-        // middleware already buffers the whole body, so lift it.
-        .layer(DefaultBodyLimit::disable())
+        // Attachment uploads exceed the default 2 MiB extractor limit; raise it
+        // to MAX_BODY (the middleware enforces the same bound while buffering).
+        .layer(DefaultBodyLimit::max(MAX_BODY))
         .layer(middleware::from_fn(log_and_auth))
 }
 

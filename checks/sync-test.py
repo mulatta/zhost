@@ -161,6 +161,18 @@ with subtest("registering bytes that do not match the declared md5 is rejected")
         == "400"
     )
 
+with subtest("non-alphanumeric keys are rejected from file endpoints"):
+    # Keys become on-disk path components, so a key with '.'/'/' (path traversal)
+    # must be refused before it reaches the filesystem.
+    assert http_code(f"{base}/files/bad..key") == "404"
+    assert (
+        http_code(
+            f"-X POST {base}/users/1/items/bad..key/file {auth} "
+            f"-H 'If-None-Match: *' -d 'md5=x&filename=t&filesize=1&mtime=1'"
+        )
+        == "400"
+    )
+
 with subtest("annotations round-trip as ordinary items"):
     # Highlights/notes are items (itemType annotation/note), so they sync through
     # the same opaque object path rather than any dedicated endpoint.
