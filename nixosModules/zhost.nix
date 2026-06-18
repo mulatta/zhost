@@ -61,10 +61,49 @@ in
       description = "PostgreSQL connection URL (defaults to the local peer socket).";
     };
 
-    storageDir = lib.mkOption {
-      type = lib.types.str;
-      default = "/var/lib/zhost/storage";
-      description = "Directory for attachment file bytes. Encrypt at the host/FS layer.";
+    s3 = lib.mkOption {
+      description = "S3-compatible object storage for attachment bytes (e.g. Cloudflare R2).";
+      type = lib.types.submodule {
+        options = {
+          endpoint = lib.mkOption {
+            type = lib.types.str;
+            example = "https://<account>.r2.cloudflarestorage.com";
+            description = "S3 endpoint URL.";
+          };
+          region = lib.mkOption {
+            type = lib.types.str;
+            default = "auto";
+            description = "S3 region (R2 ignores it).";
+          };
+          bucket = lib.mkOption {
+            type = lib.types.str;
+            default = "zotero";
+            description = "Bucket holding the attachment objects.";
+          };
+          accessKeyFile = lib.mkOption {
+            type = lib.types.path;
+            description = "File with the S3 access key ID (a secret), loaded as a credential.";
+          };
+          secretKeyFile = lib.mkOption {
+            type = lib.types.path;
+            description = "File with the S3 secret access key (a secret), loaded as a credential.";
+          };
+          pathStyle = lib.mkOption {
+            type = lib.types.bool;
+            default = true;
+            description = "Path-style addressing (required by RustFS/MinIO; R2 accepts it).";
+          };
+          presignTtl = lib.mkOption {
+            type = lib.types.ints.positive;
+            default = 120;
+            description = ''
+              Lifetime (seconds) of a pre-signed download URL. Kept short: the
+              client follows the redirect immediately, and the URL is an
+              unauthenticated capability.
+            '';
+          };
+        };
+      };
     };
 
     keys = lib.mkOption {
@@ -147,11 +186,6 @@ in
     };
     users.groups.${cfg.user} = { };
 
-    # ReadWritePaths below requires the storage directory to already exist.
-    systemd.tmpfiles.rules = [
-      "d ${cfg.storageDir} 0750 ${cfg.user} ${cfg.user} -"
-    ];
-
     systemd.services.zhost = {
       description = "Self-hosted Zotero sync server";
       wantedBy = [ "multi-user.target" ];
@@ -162,8 +196,14 @@ in
         ZHOST_BIND = cfg.bind;
         ZHOST_PUBLIC_URL = cfg.publicUrl;
         ZHOST_DATABASE_URL = cfg.database;
-        ZHOST_STORAGE_DIR = cfg.storageDir;
+        ZHOST_S3_ENDPOINT = cfg.s3.endpoint;
+        ZHOST_S3_REGION = cfg.s3.region;
+        ZHOST_S3_BUCKET = cfg.s3.bucket;
+        ZHOST_S3_PATH_STYLE = lib.boolToString cfg.s3.pathStyle;
+        ZHOST_S3_PRESIGN_TTL = toString cfg.s3.presignTtl;
         # %d expands to the systemd credentials directory at runtime.
+        ZHOST_S3_ACCESS_KEY_FILE = "%d/s3-access-key";
+        ZHOST_S3_SECRET_KEY_FILE = "%d/s3-secret-key";
         ZHOST_KEYS = keyManifest;
         RUST_LOG = "info";
       };
@@ -172,10 +212,14 @@ in
         ExecStart = lib.getExe cfg.package;
         User = cfg.user;
         Group = cfg.user;
-        LoadCredential = lib.mapAttrsToList (name: k: "${credName name}:${k.file}") allKeys;
+        LoadCredential = (lib.mapAttrsToList (name: k: "${credName name}:${k.file}") allKeys) ++ [
+          "s3-access-key:${cfg.s3.accessKeyFile}"
+          "s3-secret-key:${cfg.s3.secretKeyFile}"
+        ];
         Restart = "on-failure";
 
-        # Hardening: the service only needs its state dir and the PG socket.
+        # Hardening: the service keeps no local state — it needs only the PG
+        # socket and outbound network (to the object store).
         ProtectSystem = "strict";
         ProtectHome = true;
         PrivateTmp = true;
@@ -186,7 +230,6 @@ in
           "AF_INET6"
           "AF_UNIX"
         ];
-        ReadWritePaths = [ cfg.storageDir ];
       };
     };
   };

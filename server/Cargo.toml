@@ -21,5 +21,10 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal
 serde_json = { version = "1", features = ["preserve_order"] }
 # Parse multi-valued query strings: the CLI `tag` filter repeats the key for AND.
 serde_urlencoded = "0.7"
+# S3-compatible object storage for attachment bytes (Cloudflare R2 in
+# production, RustFS in the integration test). rustls to avoid an OpenSSL build.
+rust-s3 = { version = "0.35", default-features = false, features = [
+  "tokio-rustls-tls",
+] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

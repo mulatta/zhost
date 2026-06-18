@@ -19,8 +19,14 @@ def library_version():
 
 
 machine.wait_for_unit("postgresql.service")
+machine.wait_for_unit("rustfs.service")
+machine.wait_for_open_port(9000)
 machine.wait_for_unit("zhost.service")
 machine.wait_for_open_port(8189)
+
+# Create the attachment bucket in the S3 store before any upload.
+machine.succeed("mc alias set s3 http://localhost:9000 rustfsadmin rustfsadmin")
+machine.succeed("mc mb s3/zotero")
 
 with subtest("the module deploys a working service backed by postgres"):
     assert http_code(f"{base}/keys/current {auth}") == "200"
@@ -105,8 +111,8 @@ with subtest("attachment data is emitted with linkMode first"):
     ).strip()
     assert first_key == "linkMode", first_key
 
-with subtest("an attachment file uploads and downloads"):
-    # md5 of "hello"; the server now verifies the uploaded bytes against it.
+with subtest("an attachment file uploads to S3 and downloads via a presigned URL"):
+    # md5 of "hello"; the upload endpoint verifies the bytes against it.
     md5 = "5d41402abc4b2a76b9719d911017c592"
     # Authorization returns an unguessable upload token (not the item key).
     token = machine.succeed(
@@ -116,26 +122,25 @@ with subtest("an attachment file uploads and downloads"):
         f"| jq -r .uploadKey"
     ).strip()
     assert token and token != "ATTACH001", token
-    # The bytes are PUT to the token URL; registration commits via the token.
+    # Bytes are POSTed to the token URL (zhost verifies them and PUTs to S3);
+    # registration then commits via the token.
     machine.succeed(f"printf hello | curl -sf -X POST {base}/uploads/{token} --data-binary @-")
     machine.succeed(
         f"curl -sf -X POST {base}/users/1/items/ATTACH001/file {auth} "
         f"-H 'If-None-Match: *' -d 'upload={token}'"
     )
     assert http_code(f"{base}/users/1/items/ATTACH001/file {auth}") == "302"
-    # The 302 carries the md5/mtime headers and a Location whose path is a
-    # capability token (not the item key); follow it to fetch the bytes with no
-    # API key, the way the stock client downloads from a presigned URL.
+    # The 302 carries the md5/mtime headers and a Location that is a pre-signed
+    # GET URL pointing straight at the S3 store; follow it (no API key) to read
+    # the bytes, the way the stock client downloads from a presigned URL.
     location = machine.succeed(
         f"curl -sf -D /tmp/dlhdr -o /dev/null {base}/users/1/items/ATTACH001/file {auth} "
         f"&& grep -i '^location:' /tmp/dlhdr | tr -d '\\r' | awk '{{print $2}}'"
     ).strip()
     machine.succeed(f"grep -iq 'zotero-file-md5: {md5}' /tmp/dlhdr")
-    dl_token = location.rsplit("/", 1)[-1]
-    assert dl_token and dl_token != "ATTACH001", location
-    assert machine.succeed(f"curl -sf {base}/files/{dl_token}") == "hello"
-    # The raw item key is no longer a download path — only a minted token works.
-    assert http_code(f"{base}/files/ATTACH001") == "404"
+    # The redirect targets the object store directly, not this server.
+    assert ":9000" in location and "8189" not in location, location
+    assert machine.succeed(f"curl -sf '{location}'").strip() == "hello"
 
 with subtest("re-authorizing the same file returns exists:1 (dedup)"):
     machine.succeed(
@@ -154,25 +159,39 @@ with subtest("a file authorization without a precondition header is 428"):
         == "428"
     )
 
-with subtest("registering bytes that do not match the declared md5 is rejected"):
+with subtest("uploading bytes that do not match the declared md5 is rejected"):
+    # Verification happens at the upload step now (the bytes go straight to S3),
+    # so a mismatch is refused there rather than at registration.
     bad = machine.succeed(
         f"curl -sf -X POST {base}/users/1/items/BADHASH01/file {auth} "
         f"-H 'If-None-Match: *' -d 'md5=00000000000000000000000000000000&filename=b&filesize=5&mtime=1' "
         f"| jq -r .uploadKey"
     ).strip()
-    machine.succeed(f"printf hello | curl -sf -X POST {base}/uploads/{bad} --data-binary @-")
+    code = machine.succeed(
+        f"printf hello | curl -s -o /dev/null -w '%{{http_code}}' "
+        f"-X POST {base}/uploads/{bad} --data-binary @-"
+    ).strip()
+    assert code == "400", code
+
+with subtest("registering without a prior upload is rejected"):
+    # Authorize but never PUT the bytes, then try to register: the object was
+    # never stored, so registration must refuse rather than commit metadata.
+    tok = machine.succeed(
+        f"curl -sf -X POST {base}/users/1/items/NOUPLOAD/file {auth} "
+        f"-H 'If-None-Match: *' -d 'md5=5d41402abc4b2a76b9719d911017c592&filename=n&filesize=5&mtime=1' "
+        f"| jq -r .uploadKey"
+    ).strip()
     assert (
         http_code(
-            f"-X POST {base}/users/1/items/BADHASH01/file {auth} "
-            f"-H 'If-None-Match: *' -d 'upload={bad}'"
+            f"-X POST {base}/users/1/items/NOUPLOAD/file {auth} "
+            f"-H 'If-None-Match: *' -d 'upload={tok}'"
         )
         == "400"
     )
 
-with subtest("non-alphanumeric keys are rejected from file endpoints"):
-    # The upload key becomes an on-disk path component, so a key with '.'/'/'
-    # (path traversal) must be refused before it reaches the filesystem.
-    # (Downloads no longer take a key — only a minted token resolves to one.)
+with subtest("non-alphanumeric keys are rejected from the file endpoint"):
+    # The item key becomes an object key in the bucket and a path component in
+    # URLs, so a key with '.'/'/' (path traversal) must be refused.
     assert (
         http_code(
             f"-X POST {base}/users/1/items/bad..key/file {auth} "
@@ -180,8 +199,6 @@ with subtest("non-alphanumeric keys are rejected from file endpoints"):
         )
         == "400"
     )
-    # An unknown download token serves nothing.
-    assert http_code(f"{base}/files/bad..key") == "404"
 
 with subtest("annotations round-trip as ordinary items"):
     # Highlights/notes are items (itemType annotation/note), so they sync through
