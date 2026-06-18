@@ -130,6 +130,20 @@ async fn current_headers() -> HeaderMap {
     version_headers(store::current_version(pool()).await.unwrap_or(0))
 }
 
+/// A since/versions read can answer `304 Not Modified` when the client already
+/// holds everything up to the current library version (nothing has a version
+/// greater than `since`). `since == 0` is the initial pull, so never 304 it.
+async fn not_modified(since: i64) -> bool {
+    since > 0 && since >= store::current_version(pool()).await.unwrap_or(0)
+}
+
+/// Build a header value from stored/derived text without panicking on a stray
+/// byte (e.g. a malformed md5); an invalid value is dropped rather than 500ing.
+fn header_value(text: &str) -> axum::http::HeaderValue {
+    text.parse()
+        .unwrap_or_else(|_| axum::http::HeaderValue::from_static(""))
+}
+
 // --- authentication & login session ---------------------------------------
 
 async fn create_key() -> Response {
@@ -237,6 +251,9 @@ async fn read(kind: &str, params: HashMap<String, String>) -> Response {
             .get("since")
             .and_then(|s| s.parse().ok())
             .unwrap_or(0);
+        if not_modified(since).await {
+            return (StatusCode::NOT_MODIFIED, current_headers().await).into_response();
+        }
         store::versions(pool(), kind, since).await
     } else {
         let keys = params
@@ -261,6 +278,9 @@ async fn item_sync_read(params: &query::Params, top: bool) -> Option<Response> {
             .get("since")
             .and_then(|s| s.parse().ok())
             .unwrap_or(0);
+        if not_modified(since).await {
+            return Some((StatusCode::NOT_MODIFIED, current_headers().await).into_response());
+        }
         let result = if top {
             store::top_versions(pool(), since).await
         } else {
@@ -460,7 +480,14 @@ async fn delete(kind: &str, headers: HeaderMap, params: HashMap<String, String>)
     }
 }
 
-async fn settings_read() -> Response {
+async fn settings_read(Query(params): Query<HashMap<String, String>>) -> Response {
+    let since = params
+        .get("since")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    if not_modified(since).await {
+        return (StatusCode::NOT_MODIFIED, current_headers().await).into_response();
+    }
     match store::settings(pool()).await {
         Ok(value) => (current_headers().await, Json(value)).into_response(),
         Err(error) => server_error("settings", error),
@@ -525,6 +552,9 @@ async fn fulltext_versions(Query(params): Query<HashMap<String, String>>) -> Res
         .get("since")
         .and_then(|s| s.parse().ok())
         .unwrap_or(0);
+    if not_modified(since).await {
+        return (StatusCode::NOT_MODIFIED, current_headers().await).into_response();
+    }
     match store::fulltext_versions(pool(), since).await {
         Ok(value) => (current_headers().await, Json(value)).into_response(),
         Err(error) => server_error("fulltext versions", error),
@@ -738,16 +768,14 @@ async fn file_get(Path((_id, key)): Path<(String, String)>) -> Response {
     let mut headers = HeaderMap::new();
     headers.insert(
         "location",
-        format!("{}/files/{}", cfg().public_url, key)
-            .parse()
-            .unwrap(),
+        header_value(&format!("{}/files/{}", cfg().public_url, key)),
     );
     headers.insert(
         "zotero-file-modification-time",
-        mtime.to_string().parse().unwrap(),
+        header_value(&mtime.to_string()),
     );
-    headers.insert("zotero-file-md5", md5.parse().unwrap());
-    headers.insert("zotero-file-compressed", "No".parse().unwrap());
+    headers.insert("zotero-file-md5", header_value(&md5));
+    headers.insert("zotero-file-compressed", header_value("No"));
     (StatusCode::FOUND, headers).into_response()
 }
 

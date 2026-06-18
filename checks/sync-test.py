@@ -437,6 +437,14 @@ with subtest("collection top items are served as a plain-text key list"):
     assert "content-type: text/plain" in headers, headers
     assert "last-modified-version:" in headers, headers
 
+with subtest("a since read returns 304 Not Modified when nothing is newer"):
+    v = library_version()
+    assert http_code(f"'{base}/users/1/items?format=versions&since={v}' {auth}") == "304"
+    assert http_code(f"'{base}/users/1/fulltext?format=versions&since={v}' {auth}") == "304"
+    assert http_code(f"'{base}/users/1/settings?since={v}' {auth}") == "304"
+    # The initial pull (since=0) is never 304.
+    assert http_code(f"'{base}/users/1/items?format=versions&since=0' {auth}") == "200"
+
 with subtest("deletes are recorded in the deletion log"):
     machine.succeed(f"curl -sf -X DELETE '{base}/users/1/items?itemKey=ITEM0001' {auth}")
     machine.succeed(
