@@ -346,6 +346,19 @@ with subtest("malformed (non-array) item data does not 500 the query API"):
     assert http_code(f"'{base}/users/1/items?q=zzz&qmode=everything' {auth}") == "200"
     assert http_code(f"'{base}/users/1/items?tag=zzz' {auth}") == "200"
     assert http_code(f"{base}/users/1/collections/y/items {auth}") == "200"
+    # A tags array whose elements aren't {tag:...} objects must not put a NULL
+    # into tag_names and crash /tags (migration 0007 filters them).
+    version = library_version()
+    machine.succeed(
+        f"curl -sf -X POST {base}/users/1/items {auth} "
+        f"-H 'If-Unmodified-Since-Version: {version}' "
+        f'-d \'[{{"key":"BADTAGS1","itemType":"book","title":"bt",'
+        f'"tags":[{{"tag":"good"}},123,"junk"]}}]\' | jq -e .successful'
+    )
+    machine.succeed(
+        f"curl -sf {base}/users/1/tags {auth} "
+        f"| jq -e '.[] | select(.tag == \"good\") | .numItems == 1'"
+    )
 
 with subtest("Total-Results stays correct past the last page"):
     def total_results(qs):
