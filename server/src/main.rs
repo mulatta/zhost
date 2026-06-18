@@ -44,6 +44,10 @@ struct Config {
     public_url: String,
     database_url: String,
     s3: s3::Config,
+    /// If set, `POST /login` requires the front proxy to forward a matching
+    /// authenticated identity (`X-Auth-Request-Email`/`-User`). Unset on a
+    /// private network, where reachability is the gate.
+    login_authorized_user: Option<String>,
 }
 
 static CFG: OnceLock<Config> = OnceLock::new();
@@ -295,6 +299,19 @@ async fn login_authorize(
     if let Some(origin) = headers.get("origin").and_then(|v| v.to_str().ok()) {
         if origin.trim_end_matches('/') != cfg().public_url.trim_end_matches('/') {
             return (StatusCode::FORBIDDEN, "bad origin").into_response();
+        }
+    }
+    // When an authorized user is configured, the front SSO proxy must forward a
+    // matching identity (oauth2-proxy `--set-xauthrequest`). This ties the
+    // approval to a proven identity and guards against a misconfigured/bypassed
+    // proxy; unset (a private network) means the network is the gate.
+    if let Some(want) = &cfg().login_authorized_user {
+        let identity = headers
+            .get("x-auth-request-email")
+            .or_else(|| headers.get("x-auth-request-user"))
+            .and_then(|v| v.to_str().ok());
+        if !identity.is_some_and(|got| got.eq_ignore_ascii_case(want)) {
+            return (StatusCode::FORBIDDEN, "not an authorized user").into_response();
         }
     }
     let Some(token) = form.get("session") else {
@@ -1159,6 +1176,9 @@ async fn main() {
             .or_else(|_| std::env::var("DATABASE_URL"))
             .unwrap_or_else(|_| "postgres://localhost/zhost".into()),
         s3: load_s3(),
+        login_authorized_user: std::env::var("ZHOST_LOGIN_AUTHORIZED_USER")
+            .ok()
+            .filter(|s| !s.is_empty()),
     });
 
     let pool = store::connect(&cfg().database_url)

@@ -31,6 +31,10 @@ machine.succeed("mc mb s3/zotero")
 with subtest("the module deploys a working service backed by postgres"):
     assert http_code(f"{base}/keys/current {auth}") == "200"
 
+# The front SSO proxy (oauth2-proxy/kanidm) forwards this header; loginAuthorizedUser
+# is set to it, so the consent POST must carry it to authorize.
+sso = "-H 'X-Auth-Request-Email: owner@mulatta.io'"
+
 with subtest("login session hands out the key only after authorization"):
     machine.succeed(f"curl -sf -X POST {base}/keys/sessions -d '{{}}' > /tmp/sess")
     token = machine.succeed("jq -r .sessionToken /tmp/sess").strip()
@@ -41,13 +45,20 @@ with subtest("login session hands out the key only after authorization"):
     machine.succeed(f"curl -sf '{login_url}' | grep -qi 'Authorize'")
     machine.succeed(f"curl -sf {base}/keys/sessions/{token} | jq -e '.status == \"pending\"'")
     machine.succeed(f"curl -sf {base}/keys/sessions/{token} | jq -e '.apiKey == null'")
-    # A cross-site form POST (foreign Origin) is refused.
+    # A cross-site form POST (foreign Origin) is refused even with a valid identity.
     assert (
-        http_code(f"-X POST {base}/login -H 'Origin: https://evil.example' -d 'session={token}'")
+        http_code(f"-X POST {base}/login -H 'Origin: https://evil.example' {sso} -d 'session={token}'")
         == "403"
     )
-    # The consent POST (the Approve button) authorizes; polling then completes.
-    machine.succeed(f"curl -sf -X POST {base}/login -d 'session={token}'")
+    # Without the SSO identity the front proxy forwards, the POST is refused.
+    assert http_code(f"-X POST {base}/login -d 'session={token}'") == "403"
+    # A non-authorized identity is refused.
+    assert (
+        http_code(f"-X POST {base}/login -H 'X-Auth-Request-Email: someone@else' -d 'session={token}'")
+        == "403"
+    )
+    # The consent POST (Approve) with the authorized identity completes the flow.
+    machine.succeed(f"curl -sf -X POST {base}/login {sso} -d 'session={token}'")
     machine.succeed(f"curl -sf {base}/keys/sessions/{token} | jq -e '.status == \"completed\"'")
     machine.succeed(f"curl -sf {base}/keys/sessions/{token} | jq -e '.apiKey == \"testtoken\"'")
     # A canceled session no longer hands out the key.
@@ -57,7 +68,10 @@ with subtest("login session hands out the key only after authorization"):
 with subtest("the login consent endpoint validates the session token"):
     assert http_code(f"{base}/login") == "400"  # missing ?session
     assert http_code(f"{base}/login?session=nope") == "404"  # unknown session
-    assert http_code(f"-X POST {base}/login -d 'session=nope'") == "404"
+    assert http_code(f"-X POST {base}/login {sso} -d 'session=nope'") == "404"
+
+with subtest("groups endpoint returns an empty set (single personal library)"):
+    machine.succeed(f"curl -sf {base}/users/1/groups {auth} | jq -e '. == {{}}'")
 
 with subtest("the api key is required off the bootstrap paths"):
     assert http_code(f"{base}/keys/current -H 'Zotero-API-Version: 3'") == "403"
