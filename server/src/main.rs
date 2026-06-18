@@ -102,7 +102,7 @@ fn pool() -> &'static PgPool {
 
 /// Access descriptor for the single configured user; no groups. `write` reflects
 /// the requesting key, so a read-only key reports `write: false`.
-fn access(write: bool) -> Value {
+fn access_payload(write: bool) -> Value {
     json!({
         "user": { "library": true, "files": true, "notes": true, "write": write },
         "groups": {}
@@ -154,7 +154,7 @@ async fn create_key() -> Response {
             "userID": cfg().user_id,
             "username": "zhost",
             "displayName": "zhost",
-            "access": access(true),
+            "access": access_payload(true),
         })),
     )
         .into_response()
@@ -166,7 +166,7 @@ async fn key_current(headers: HeaderMap) -> Response {
         "userID": cfg().user_id,
         "username": "zhost",
         "displayName": "zhost",
-        "access": access(write),
+        "access": access_payload(write),
     }))
     .into_response()
 }
@@ -243,23 +243,33 @@ fn conflict(current: i64) -> Response {
     (StatusCode::PRECONDITION_FAILED, version_headers(current)).into_response()
 }
 
+/// The `since` read cursor (defaults to 0, the initial pull).
+fn since_of(params: &HashMap<String, String>) -> i64 {
+    params
+        .get("since")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0)
+}
+
+/// A comma-separated key list parameter (e.g. `itemKey=a,b`), empty if absent.
+fn csv_of(params: &HashMap<String, String>, key: &str) -> Vec<String> {
+    params
+        .get(key)
+        .map(|csv| csv.split(',').map(String::from).collect())
+        .unwrap_or_default()
+}
+
 /// `format=versions&since=N` returns the changed `{key: version}` map; otherwise
 /// `?<kind>Key=a,b&format=json` returns the full `[{key, version, data}]`.
 async fn read(kind: &str, params: HashMap<String, String>) -> Response {
     let result = if params.get("format").map(String::as_str) == Some("versions") {
-        let since = params
-            .get("since")
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(0);
+        let since = since_of(&params);
         if not_modified(since).await {
             return (StatusCode::NOT_MODIFIED, current_headers().await).into_response();
         }
         store::versions(pool(), kind, since).await
     } else {
-        let keys = params
-            .get(&format!("{kind}Key"))
-            .map(|csv| csv.split(',').map(String::from).collect::<Vec<_>>())
-            .unwrap_or_default();
+        let keys = csv_of(&params, &format!("{kind}Key"));
         store::objects(pool(), kind, &keys).await
     };
     match result {
@@ -467,10 +477,7 @@ async fn delete(kind: &str, headers: HeaderMap, params: HashMap<String, String>)
         Ok(v) => v,
         Err(resp) => return resp,
     };
-    let keys = params
-        .get(&format!("{kind}Key"))
-        .map(|csv| csv.split(',').map(String::from).collect::<Vec<_>>())
-        .unwrap_or_default();
+    let keys = csv_of(&params, &format!("{kind}Key"));
     match store::delete(pool(), kind, &keys, Some(expected)).await {
         Ok(store::Outcome::Done(version)) => {
             (StatusCode::NO_CONTENT, version_headers(version)).into_response()
@@ -481,10 +488,7 @@ async fn delete(kind: &str, headers: HeaderMap, params: HashMap<String, String>)
 }
 
 async fn settings_read(Query(params): Query<HashMap<String, String>>) -> Response {
-    let since = params
-        .get("since")
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(0);
+    let since = since_of(&params);
     if not_modified(since).await {
         return (StatusCode::NOT_MODIFIED, current_headers().await).into_response();
     }
@@ -521,10 +525,7 @@ async fn settings_delete(
         Ok(v) => v,
         Err(resp) => return resp,
     };
-    let keys = params
-        .get("settingKey")
-        .map(|csv| csv.split(',').map(String::from).collect::<Vec<_>>())
-        .unwrap_or_default();
+    let keys = csv_of(&params, "settingKey");
     match store::delete_settings(pool(), &keys, Some(expected)).await {
         Ok(store::Outcome::Done(version)) => {
             (StatusCode::NO_CONTENT, version_headers(version)).into_response()
@@ -535,10 +536,7 @@ async fn settings_delete(
 }
 
 async fn deleted(Query(params): Query<HashMap<String, String>>) -> Response {
-    let since = params
-        .get("since")
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(0);
+    let since = since_of(&params);
     match store::deleted(pool(), since).await {
         Ok(value) => (current_headers().await, Json(value)).into_response(),
         Err(error) => server_error("deleted", error),
@@ -548,10 +546,7 @@ async fn deleted(Query(params): Query<HashMap<String, String>>) -> Response {
 /// `GET /fulltext?format=versions&since=N` → `{itemKey: version}` for content
 /// changed after `since`, so the client downloads only what it lacks.
 async fn fulltext_versions(Query(params): Query<HashMap<String, String>>) -> Response {
-    let since = params
-        .get("since")
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(0);
+    let since = since_of(&params);
     if not_modified(since).await {
         return (StatusCode::NOT_MODIFIED, current_headers().await).into_response();
     }
@@ -588,7 +583,12 @@ async fn fulltext_write(headers: HeaderMap, body: Bytes) -> Response {
     match store::write_fulltext(pool(), batch, Some(expected)).await {
         Ok(store::Outcome::Done((version, successful))) => (
             version_headers(version),
-            Json(json!({ "successful": successful, "unchanged": {}, "failed": {} })),
+            Json(json!({
+                "successful": successful,
+                "success": {},
+                "unchanged": {},
+                "failed": {},
+            })),
         )
             .into_response(),
         Ok(store::Outcome::Conflict(current)) => conflict(current),
@@ -679,7 +679,7 @@ async fn file_post(
 
     let md5 = form.get("md5").cloned().unwrap_or_default();
     let stored_md5 = match store::file_meta(pool(), &key).await {
-        Ok(meta) => meta.map(|(m, _, _)| m),
+        Ok(meta) => meta.map(|(m, _)| m),
         Err(error) => return server_error("file auth", error),
     };
 
@@ -760,7 +760,7 @@ async fn upload_put(Path(token): Path<String>, body: Bytes) -> Response {
 /// The client reads md5/mtime from this response's headers (it does not follow
 /// the redirect automatically) and then downloads the bytes from `Location`.
 async fn file_get(Path((_id, key)): Path<(String, String)>) -> Response {
-    let (md5, _filename, mtime) = match store::file_meta(pool(), &key).await {
+    let (md5, mtime) = match store::file_meta(pool(), &key).await {
         Ok(Some(meta)) => meta,
         Ok(None) => return StatusCode::NOT_FOUND.into_response(),
         Err(error) => return server_error("file meta", error),

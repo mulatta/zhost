@@ -6,9 +6,29 @@
 //! `If-Unmodified-Since-Version` writes stay coherent.
 
 use serde_json::{Map, Value};
+use sqlx::postgres::PgRow;
 use sqlx::{PgPool, Postgres, QueryBuilder, Row};
 
 use crate::query::{ItemQuery, QMode};
+
+/// `{<key_col>: version}` map from version-listing rows (the `format=versions`
+/// shape shared by objects, top items and full-text).
+fn version_map(rows: Vec<PgRow>, key_col: &str) -> Value {
+    let mut map = Map::new();
+    for row in rows {
+        map.insert(row.get(key_col), Value::from(row.get::<i64, _>("version")));
+    }
+    Value::Object(map)
+}
+
+/// `{key, version, data}` for one object row (data re-ordered linkMode-first).
+fn object_json(row: PgRow) -> Value {
+    serde_json::json!({
+        "key": row.get::<String, _>("key"),
+        "version": row.get::<i64, _>("version"),
+        "data": linkmode_first(row.get::<Value, _>("data")),
+    })
+}
 
 /// Single user, single personal library.
 const LIBRARY_ID: i64 = 1;
@@ -103,11 +123,7 @@ pub async fn versions(pool: &PgPool, kind: &str, since: i64) -> sqlx::Result<Val
     .bind(since)
     .fetch_all(pool)
     .await?;
-    let mut map = Map::new();
-    for row in rows {
-        map.insert(row.get("key"), Value::from(row.get::<i64, _>("version")));
-    }
-    Ok(Value::Object(map))
+    Ok(version_map(rows, "key"))
 }
 
 /// `{key: version}` for top-level items changed after `since`. The client's
@@ -122,11 +138,7 @@ pub async fn top_versions(pool: &PgPool, since: i64) -> sqlx::Result<Value> {
     .bind(since)
     .fetch_all(pool)
     .await?;
-    let mut map = Map::new();
-    for row in rows {
-        map.insert(row.get("key"), Value::from(row.get::<i64, _>("version")));
-    }
-    Ok(Value::Object(map))
+    Ok(version_map(rows, "key"))
 }
 
 /// `[{key, version, data}]` for the requested keys.
@@ -140,17 +152,7 @@ pub async fn objects(pool: &PgPool, kind: &str, keys: &[String]) -> sqlx::Result
     .bind(keys)
     .fetch_all(pool)
     .await?;
-    let array = rows
-        .into_iter()
-        .map(|row| {
-            serde_json::json!({
-                "key": row.get::<String, _>("key"),
-                "version": row.get::<i64, _>("version"),
-                "data": linkmode_first(row.get::<Value, _>("data")),
-            })
-        })
-        .collect();
-    Ok(Value::Array(array))
+    Ok(Value::Array(rows.into_iter().map(object_json).collect()))
 }
 
 /// Escape LIKE/ILIKE wildcards so a search term matches literally; the `escape
@@ -256,13 +258,7 @@ pub async fn query_items(pool: &PgPool, q: &ItemQuery) -> sqlx::Result<(Vec<Valu
         .fetch_all(pool)
         .await?
         .into_iter()
-        .map(|row| {
-            serde_json::json!({
-                "key": row.get::<String, _>("key"),
-                "version": row.get::<i64, _>("version"),
-                "data": linkmode_first(row.get::<Value, _>("data")),
-            })
-        })
+        .map(object_json)
         .collect();
     Ok((items, total))
 }
@@ -492,19 +488,15 @@ pub async fn delete_settings(
     Ok(Outcome::Done(version))
 }
 
-/// md5, filename, mtime for an attachment file, if registered.
-pub async fn file_meta(
-    pool: &PgPool,
-    item_key: &str,
-) -> sqlx::Result<Option<(String, String, i64)>> {
-    let row = sqlx::query(
-        "select md5, filename, mtime from file where library_id = $1 and item_key = $2",
-    )
-    .bind(LIBRARY_ID)
-    .bind(item_key)
-    .fetch_optional(pool)
-    .await?;
-    Ok(row.map(|r| (r.get("md5"), r.get("filename"), r.get("mtime"))))
+/// md5 and mtime for an attachment file, if registered (the client reads these
+/// from the download response headers).
+pub async fn file_meta(pool: &PgPool, item_key: &str) -> sqlx::Result<Option<(String, i64)>> {
+    let row = sqlx::query("select md5, mtime from file where library_id = $1 and item_key = $2")
+        .bind(LIBRARY_ID)
+        .bind(item_key)
+        .fetch_optional(pool)
+        .await?;
+    Ok(row.map(|r| (r.get("md5"), r.get("mtime"))))
 }
 
 /// Register an uploaded attachment file, bumping the library version.
@@ -517,12 +509,12 @@ pub async fn register_file(
     mtime: i64,
 ) -> sqlx::Result<i64> {
     let mut tx = pool.begin().await?;
-    let version: i64 =
-        sqlx::query("update library set version = version + 1 where id = $1 returning version")
-            .bind(LIBRARY_ID)
-            .fetch_one(&mut *tx)
-            .await?
-            .get("version");
+    // A file registration always changes the library; bump via the shared
+    // guarded path (no precondition, so it never conflicts) rather than ad-hoc SQL.
+    let version = match guarded_version(&mut tx, None).await? {
+        Outcome::Done(version) => version,
+        Outcome::Conflict(current) => return Ok(current),
+    };
     sqlx::query(
         "insert into file (library_id, item_key, md5, filename, filesize, mtime, version) \
          values ($1, $2, $3, $4, $5, $6, $7) \
@@ -569,14 +561,7 @@ pub async fn fulltext_versions(pool: &PgPool, since: i64) -> sqlx::Result<Value>
     .bind(since)
     .fetch_all(pool)
     .await?;
-    let mut map = Map::new();
-    for row in rows {
-        map.insert(
-            row.get("item_key"),
-            Value::from(row.get::<i64, _>("version")),
-        );
-    }
-    Ok(Value::Object(map))
+    Ok(version_map(rows, "item_key"))
 }
 
 /// Full-text content for one item as `(row_version, {content, indexedChars, …})`.
