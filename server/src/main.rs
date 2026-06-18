@@ -48,17 +48,36 @@ struct Config {
 static CFG: OnceLock<Config> = OnceLock::new();
 static POOL: OnceLock<PgPool> = OnceLock::new();
 
-/// In-flight file uploads, keyed by the upload key (= attachment item key),
-/// remembered between the authorisation and registration steps.
+/// In-flight file uploads, keyed by an unguessable upload token (not the item
+/// key, which is guessable) and remembered between the authorisation, upload and
+/// registration steps. Pruned on insert so a never-completed upload can't leak.
 static PENDING: LazyLock<Mutex<HashMap<String, PendingUpload>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
+/// How long an authorized-but-unfinished upload stays valid.
+const PENDING_TTL: std::time::Duration = std::time::Duration::from_secs(3600);
+
 #[derive(Clone)]
 struct PendingUpload {
+    /// The attachment item the bytes belong to (and the on-disk storage key).
+    item_key: String,
     md5: String,
     filename: String,
     filesize: i64,
     mtime: i64,
+    created: std::time::Instant,
+}
+
+/// An unguessable upload token (128 bits of OS randomness, hex-encoded). `None`
+/// if the OS RNG can't be read, so the caller can fail the request rather than
+/// panic.
+fn upload_token() -> Option<String> {
+    use std::io::Read;
+    let mut buf = [0u8; 16];
+    std::fs::File::open("/dev/urandom")
+        .and_then(|mut f| f.read_exact(&mut buf))
+        .ok()?;
+    Some(buf.iter().map(|b| format!("{b:02x}")).collect())
 }
 
 fn cfg() -> &'static Config {
@@ -544,14 +563,42 @@ fn file_path(item_key: &str) -> std::path::PathBuf {
 /// (`upload` form, after the bytes have been PUT to the upload URL).
 async fn file_post(
     Path((_id, key)): Path<(String, String)>,
+    headers: HeaderMap,
     Form(form): Form<HashMap<String, String>>,
 ) -> Response {
-    if form.contains_key("upload") {
-        let pending = PENDING.lock().unwrap().get(&key).cloned();
+    // Registration step: the client posts upload=<token> after PUTting the bytes.
+    if let Some(token) = form.get("upload") {
+        let pending = PENDING.lock().unwrap().get(token).cloned();
         let Some(upload) = pending else {
             return (StatusCode::BAD_REQUEST, "no pending upload").into_response();
         };
-        match store::register_file(
+        if upload.item_key != key {
+            return (StatusCode::BAD_REQUEST, "upload token does not match item").into_response();
+        }
+        // Verify the stored bytes against the authorized md5/filesize before
+        // committing, so corrupted or swapped bytes are never registered.
+        let bytes = match tokio::fs::read(file_path(&key)).await {
+            Ok(bytes) => bytes,
+            Err(_) => return (StatusCode::BAD_REQUEST, "no uploaded bytes").into_response(),
+        };
+        let actual_md5 = {
+            use md5::{Digest, Md5};
+            format!("{:x}", Md5::new().chain_update(&bytes).finalize())
+        };
+        if bytes.len() as i64 != upload.filesize || actual_md5 != upload.md5.to_lowercase() {
+            tracing::warn!(
+                key,
+                want_md5 = upload.md5,
+                got_md5 = actual_md5,
+                "uploaded bytes do not match authorization"
+            );
+            return (
+                StatusCode::BAD_REQUEST,
+                "uploaded bytes do not match md5/filesize",
+            )
+                .into_response();
+        }
+        return match store::register_file(
             pool(),
             &key,
             &upload.md5,
@@ -562,50 +609,101 @@ async fn file_post(
         .await
         {
             Ok(version) => {
-                PENDING.lock().unwrap().remove(&key);
+                PENDING.lock().unwrap().remove(token);
                 (StatusCode::NO_CONTENT, version_headers(version)).into_response()
             }
             Err(error) => server_error("register file", error),
-        }
-    } else {
-        let md5 = form.get("md5").cloned().unwrap_or_default();
-        match store::file_exists(pool(), &key, &md5).await {
-            Ok(true) => (current_headers().await, Json(json!({ "exists": 1 }))).into_response(),
-            Ok(false) => {
-                PENDING.lock().unwrap().insert(
-                    key.clone(),
-                    PendingUpload {
-                        md5,
-                        filename: form.get("filename").cloned().unwrap_or_default(),
-                        filesize: form
-                            .get("filesize")
-                            .and_then(|s| s.parse().ok())
-                            .unwrap_or(0),
-                        mtime: form.get("mtime").and_then(|s| s.parse().ok()).unwrap_or(0),
-                    },
-                );
-                // Empty prefix/suffix: the client PUTs the raw file bytes to url.
-                Json(json!({
-                    "url": format!("{}/uploads/{}", cfg().public_url, key),
-                    "uploadKey": key,
-                    "contentType": "application/octet-stream",
-                    "prefix": "",
-                    "suffix": "",
-                }))
-                .into_response()
+        };
+    }
+
+    // Authorization step. The client sends a precondition: `If-None-Match: *`
+    // for a new file, or `If-Match: <oldmd5>` to replace an existing one. Without
+    // either, the version guard would be bypassed (428, as zfs.js expects).
+    let if_none_match = headers.contains_key("if-none-match");
+    let if_match = headers
+        .get("if-match")
+        .and_then(|v| v.to_str().ok())
+        .map(String::from);
+    if !if_none_match && if_match.is_none() {
+        return (
+            StatusCode::PRECONDITION_REQUIRED,
+            "If-Match or If-None-Match required",
+        )
+            .into_response();
+    }
+
+    let md5 = form.get("md5").cloned().unwrap_or_default();
+    let stored_md5 = match store::file_meta(pool(), &key).await {
+        Ok(meta) => meta.map(|(m, _, _)| m),
+        Err(error) => return server_error("file auth", error),
+    };
+
+    if if_none_match {
+        // "Only if no file exists." Same md5 → already uploaded (dedup); a
+        // different existing file → conflict.
+        if let Some(existing) = &stored_md5 {
+            if *existing == md5 {
+                return (current_headers().await, Json(json!({ "exists": 1 }))).into_response();
             }
-            Err(error) => server_error("file auth", error),
+            return conflict(store::current_version(pool()).await.unwrap_or(0));
+        }
+    } else if let Some(want) = &if_match {
+        // "Only if the current md5 matches." Otherwise → conflict.
+        if stored_md5.as_deref() != Some(want.as_str()) {
+            return conflict(store::current_version(pool()).await.unwrap_or(0));
         }
     }
+
+    // Authorize: mint an unguessable token, remember the upload (pruning stale
+    // ones), and hand back the upload URL. The bytes land at the item key's path.
+    let Some(token) = upload_token() else {
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    };
+    {
+        let mut pending = PENDING.lock().unwrap();
+        pending.retain(|_, u| u.created.elapsed() < PENDING_TTL);
+        pending.insert(
+            token.clone(),
+            PendingUpload {
+                item_key: key.clone(),
+                md5,
+                filename: form.get("filename").cloned().unwrap_or_default(),
+                filesize: form
+                    .get("filesize")
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(0),
+                mtime: form.get("mtime").and_then(|s| s.parse().ok()).unwrap_or(0),
+                created: std::time::Instant::now(),
+            },
+        );
+    }
+    // Empty prefix/suffix: the client PUTs the raw file bytes to url.
+    Json(json!({
+        "url": format!("{}/uploads/{}", cfg().public_url, token),
+        "uploadKey": token,
+        "contentType": "application/octet-stream",
+        "prefix": "",
+        "suffix": "",
+    }))
+    .into_response()
 }
 
-/// Receive the raw attachment bytes (prefix/suffix are empty) and store them.
-async fn upload_put(Path(upload_key): Path<String>, body: Bytes) -> Response {
+/// Receive the raw attachment bytes for a pending upload token and store them at
+/// the token's item-key path. Rejects an unknown token.
+async fn upload_put(Path(token): Path<String>, body: Bytes) -> Response {
+    let item_key = PENDING
+        .lock()
+        .unwrap()
+        .get(&token)
+        .map(|u| u.item_key.clone());
+    let Some(item_key) = item_key else {
+        return (StatusCode::BAD_REQUEST, "unknown upload token").into_response();
+    };
     if let Err(error) = tokio::fs::create_dir_all(&cfg().storage_dir).await {
         tracing::error!(%error, "create storage dir");
         return StatusCode::INTERNAL_SERVER_ERROR.into_response();
     }
-    match tokio::fs::write(file_path(&upload_key), &body).await {
+    match tokio::fs::write(file_path(&item_key), &body).await {
         Ok(()) => StatusCode::CREATED.into_response(),
         Err(error) => {
             tracing::error!(%error, "store file");

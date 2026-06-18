@@ -106,23 +106,60 @@ with subtest("attachment data is emitted with linkMode first"):
     assert first_key == "linkMode", first_key
 
 with subtest("an attachment file uploads and downloads"):
-    machine.succeed(
+    # md5 of "hello"; the server now verifies the uploaded bytes against it.
+    md5 = "5d41402abc4b2a76b9719d911017c592"
+    # Authorization returns an unguessable upload token (not the item key).
+    token = machine.succeed(
         f"curl -sf -X POST {base}/users/1/items/ATTACH001/file {auth} "
         f"-H 'If-None-Match: *' "
-        f"-d 'md5=abc&filename=t.pdf&filesize=5&mtime=1700000000000' "
-        f"| jq -e '.uploadKey == \"ATTACH001\"'"
-    )
-    machine.succeed(f"printf hello | curl -sf -X POST {base}/uploads/ATTACH001 --data-binary @-")
+        f"-d 'md5={md5}&filename=t.pdf&filesize=5&mtime=1700000000000' "
+        f"| jq -r .uploadKey"
+    ).strip()
+    assert token and token != "ATTACH001", token
+    # The bytes are PUT to the token URL; registration commits via the token.
+    machine.succeed(f"printf hello | curl -sf -X POST {base}/uploads/{token} --data-binary @-")
     machine.succeed(
         f"curl -sf -X POST {base}/users/1/items/ATTACH001/file {auth} "
-        f"-H 'If-None-Match: *' -d 'upload=ATTACH001'"
+        f"-H 'If-None-Match: *' -d 'upload={token}'"
     )
     assert http_code(f"{base}/users/1/items/ATTACH001/file {auth}") == "302"
     machine.succeed(
         f"curl -sf -D - -o /dev/null {base}/users/1/items/ATTACH001/file {auth} "
-        f"| grep -i 'zotero-file-md5: abc'"
+        f"| grep -i 'zotero-file-md5: {md5}'"
     )
     assert machine.succeed(f"curl -sf {base}/files/ATTACH001") == "hello"
+
+with subtest("re-authorizing the same file returns exists:1 (dedup)"):
+    machine.succeed(
+        f"curl -sf -X POST {base}/users/1/items/ATTACH001/file {auth} "
+        f"-H 'If-None-Match: *' "
+        f"-d 'md5=5d41402abc4b2a76b9719d911017c592&filename=t.pdf&filesize=5&mtime=1700000000000' "
+        f"| jq -e '.exists == 1'"
+    )
+
+with subtest("a file authorization without a precondition header is 428"):
+    assert (
+        http_code(
+            f"-X POST {base}/users/1/items/ATTACH001/file {auth} "
+            f"-d 'md5=deadbeef&filename=t.pdf&filesize=5&mtime=1'"
+        )
+        == "428"
+    )
+
+with subtest("registering bytes that do not match the declared md5 is rejected"):
+    bad = machine.succeed(
+        f"curl -sf -X POST {base}/users/1/items/BADHASH01/file {auth} "
+        f"-H 'If-None-Match: *' -d 'md5=00000000000000000000000000000000&filename=b&filesize=5&mtime=1' "
+        f"| jq -r .uploadKey"
+    ).strip()
+    machine.succeed(f"printf hello | curl -sf -X POST {base}/uploads/{bad} --data-binary @-")
+    assert (
+        http_code(
+            f"-X POST {base}/users/1/items/BADHASH01/file {auth} "
+            f"-H 'If-None-Match: *' -d 'upload={bad}'"
+        )
+        == "400"
+    )
 
 with subtest("annotations round-trip as ordinary items"):
     # Highlights/notes are items (itemType annotation/note), so they sync through

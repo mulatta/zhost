@@ -492,18 +492,6 @@ pub async fn delete_settings(
     Ok(Outcome::Done(version))
 }
 
-/// Whether an attachment file with this md5 is already registered.
-pub async fn file_exists(pool: &PgPool, item_key: &str, md5: &str) -> sqlx::Result<bool> {
-    let row =
-        sqlx::query("select 1 from file where library_id = $1 and item_key = $2 and md5 = $3")
-            .bind(LIBRARY_ID)
-            .bind(item_key)
-            .bind(md5)
-            .fetch_optional(pool)
-            .await?;
-    Ok(row.is_some())
-}
-
 /// md5, filename, mtime for an attachment file, if registered.
 pub async fn file_meta(
     pool: &PgPool,

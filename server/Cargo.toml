@@ -6,6 +6,8 @@ edition = "2021"
 [dependencies]
 axum = "0.8"
 flate2 = "1"
+# Verify uploaded attachment bytes against the client-declared md5.
+md-5 = "0.10"
 sqlx = { version = "0.8", default-features = false, features = [
   "runtime-tokio",
   "postgres",
