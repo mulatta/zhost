@@ -57,6 +57,20 @@ static PENDING: LazyLock<Mutex<HashMap<String, PendingUpload>>> =
 /// How long an authorized-but-unfinished upload stays valid.
 const PENDING_TTL: std::time::Duration = std::time::Duration::from_secs(3600);
 
+/// Authorized downloads, keyed by an unguessable token that stands in for the
+/// (guessable) item key in the download URL. `file_get` (authenticated) mints
+/// one and points the client's redirect `Location` at it, so the file-serving
+/// endpoint — which the client fetches without an API key, mirroring an S3
+/// presigned URL — exposes a capability token rather than the raw key. The S3
+/// backend will replace this with a real presigned URL; the redirect contract is
+/// the same, which is why it can be validated against a stock client first.
+static DOWNLOADS: LazyLock<Mutex<HashMap<String, (String, std::time::Instant)>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// How long a download token stays valid; the client follows the redirect
+/// immediately, so this only needs to outlast a slow hop.
+const DOWNLOAD_TTL: std::time::Duration = std::time::Duration::from_secs(600);
+
 #[derive(Clone)]
 struct PendingUpload {
     /// The attachment item the bytes belong to (and the on-disk storage key).
@@ -788,10 +802,21 @@ async fn file_get(Path((_id, key)): Path<(String, String)>) -> Response {
         Ok(None) => return StatusCode::NOT_FOUND.into_response(),
         Err(error) => return server_error("file meta", error),
     };
+    // Mint a capability token for the bytes so the unauthenticated download URL
+    // carries an unguessable token instead of the item key (pruning expired
+    // ones). The client follows this Location without an API key.
+    let Some(token) = upload_token() else {
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    };
+    {
+        let mut downloads = DOWNLOADS.lock().unwrap();
+        downloads.retain(|_, (_, created)| created.elapsed() < DOWNLOAD_TTL);
+        downloads.insert(token.clone(), (key.clone(), std::time::Instant::now()));
+    }
     let mut headers = HeaderMap::new();
     headers.insert(
         "location",
-        header_value(&format!("{}/files/{}", cfg().public_url, key)),
+        header_value(&format!("{}/files/{}", cfg().public_url, token)),
     );
     headers.insert(
         "zotero-file-modification-time",
@@ -802,12 +827,22 @@ async fn file_get(Path((_id, key)): Path<(String, String)>) -> Response {
     (StatusCode::FOUND, headers).into_response()
 }
 
-/// Serve the raw attachment bytes the file_get redirect points at.
-async fn file_download(Path(key): Path<String>) -> Response {
-    if !valid_key(&key) {
+/// Serve the raw attachment bytes the file_get redirect points at. The path
+/// component is the capability token file_get minted, not the item key; an
+/// unknown or expired token is a 404, so the bytes are reachable only through a
+/// freshly authorized download.
+async fn file_download(Path(token): Path<String>) -> Response {
+    let item_key = {
+        let downloads = DOWNLOADS.lock().unwrap();
+        match downloads.get(&token) {
+            Some((key, created)) if created.elapsed() < DOWNLOAD_TTL => key.clone(),
+            _ => return StatusCode::NOT_FOUND.into_response(),
+        }
+    };
+    if !valid_key(&item_key) {
         return StatusCode::NOT_FOUND.into_response();
     }
-    match tokio::fs::read(file_path(&key)).await {
+    match tokio::fs::read(file_path(&item_key)).await {
         Ok(bytes) => bytes.into_response(),
         Err(_) => StatusCode::NOT_FOUND.into_response(),
     }
