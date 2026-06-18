@@ -263,6 +263,21 @@ fn next_link(path: &str, raw: Option<&str>, start: i64) -> String {
     format!("<{}{}?{}>; rel=\"next\"", cfg().public_url, path, qs)
 }
 
+/// `format=keys` returns every matching item key (no paging) as a plain-text
+/// newline list — the shape Zotero's `getKeys()` parses (it reads the body as
+/// `responseText.split('\n')`). Returns `None` for any other format.
+async fn item_keys_response(params: &query::Params, q: &query::ItemQuery) -> Option<Response> {
+    if params.get("format") != Some("keys") {
+        return None;
+    }
+    Some(match store::item_keys(pool(), q).await {
+        // A `String` body sets `Content-Type: text/plain`, which is what the
+        // client expects; current_headers adds `Last-Modified-Version`.
+        Ok(keys) => (current_headers().await, keys.join("\n")).into_response(),
+        Err(error) => server_error("item keys", error),
+    })
+}
+
 /// `GET /users/<id>/items`: the two sync reads, or the CLI query when neither.
 async fn items_get(Path(id): Path<String>, RawQuery(raw): RawQuery) -> Response {
     let params = query::Params::parse(raw.as_deref());
@@ -270,6 +285,9 @@ async fn items_get(Path(id): Path<String>, RawQuery(raw): RawQuery) -> Response 
         return resp;
     }
     let q = query::ItemQuery::from_params(&params);
+    if let Some(resp) = item_keys_response(&params, &q).await {
+        return resp;
+    }
     item_listing(&format!("/users/{id}/items"), raw.as_deref(), &q).await
 }
 
@@ -282,13 +300,20 @@ async fn items_top(Path(id): Path<String>, RawQuery(raw): RawQuery) -> Response 
     }
     let mut q = query::ItemQuery::from_params(&params);
     q.top = true;
+    if let Some(resp) = item_keys_response(&params, &q).await {
+        return resp;
+    }
     item_listing(&format!("/users/{id}/items/top"), raw.as_deref(), &q).await
 }
 
 /// `GET /users/<id>/items/trash`: only trashed items (`data.deleted`).
 async fn items_trash(Path(id): Path<String>, RawQuery(raw): RawQuery) -> Response {
-    let mut q = query::ItemQuery::from_params(&query::Params::parse(raw.as_deref()));
+    let params = query::Params::parse(raw.as_deref());
+    let mut q = query::ItemQuery::from_params(&params);
     q.only_trashed = true;
+    if let Some(resp) = item_keys_response(&params, &q).await {
+        return resp;
+    }
     item_listing(&format!("/users/{id}/items/trash"), raw.as_deref(), &q).await
 }
 
@@ -297,10 +322,36 @@ async fn collection_items(
     Path((id, key)): Path<(String, String)>,
     RawQuery(raw): RawQuery,
 ) -> Response {
-    let mut q = query::ItemQuery::from_params(&query::Params::parse(raw.as_deref()));
+    let params = query::Params::parse(raw.as_deref());
+    let mut q = query::ItemQuery::from_params(&params);
     q.collection = Some(key.clone());
+    if let Some(resp) = item_keys_response(&params, &q).await {
+        return resp;
+    }
     item_listing(
         &format!("/users/{id}/collections/{key}/items"),
+        raw.as_deref(),
+        &q,
+    )
+    .await
+}
+
+/// `GET /users/<id>/collections/<key>/items/top`: top-level items in the
+/// collection. The sync client requests this with `format=keys` when restoring a
+/// previously-deleted collection (syncEngine.js `_restoreRestoredCollectionItems`).
+async fn collection_items_top(
+    Path((id, key)): Path<(String, String)>,
+    RawQuery(raw): RawQuery,
+) -> Response {
+    let params = query::Params::parse(raw.as_deref());
+    let mut q = query::ItemQuery::from_params(&params);
+    q.collection = Some(key.clone());
+    q.top = true;
+    if let Some(resp) = item_keys_response(&params, &q).await {
+        return resp;
+    }
+    item_listing(
+        &format!("/users/{id}/collections/{key}/items/top"),
         raw.as_deref(),
         &q,
     )
@@ -647,8 +698,13 @@ fn app() -> Router {
                 .delete(settings_write),
         )
         .route("/users/{id}/collections", objects("collection"))
-        // CLI listing of a collection's items (query-only; no sync use).
+        // CLI listing of a collection's items, plus the top-level variant the
+        // sync client fetches with format=keys when restoring a collection.
         .route("/users/{id}/collections/{key}/items", get(collection_items))
+        .route(
+            "/users/{id}/collections/{key}/items/top",
+            get(collection_items_top),
+        )
         .route("/users/{id}/searches", objects("search"))
         // Items share the write/delete logic but take a dedicated GET that adds
         // the CLI query API alongside the two sync reads.

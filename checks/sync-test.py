@@ -340,6 +340,21 @@ with subtest("sort=date orders by extracted year, not raw freeform text"):
     ).strip()
     assert order == "DATE0OLD,DATE0MID,DATE0NEW", order
 
+with subtest("collection top items are served as a plain-text key list"):
+    # The sync client fetches collections/<key>/items/top?format=keys when
+    # restoring a deleted collection, parsing the body as newline-split keys.
+    # TOPITEM1 (top, in COLLXXXX) was created by the convenience-listings subtest.
+    body = machine.succeed(
+        f"curl -sf '{base}/users/1/collections/COLLXXXX/items/top?format=keys' {auth}"
+    ).strip()
+    assert body == "TOPITEM1", repr(body)
+    headers = machine.succeed(
+        f"curl -sf -D - -o /dev/null '{base}/users/1/collections/COLLXXXX/items/top?format=keys' {auth}"
+    ).lower()
+    # Plain text (not JSON) plus a version header for the client's 304 handling.
+    assert "content-type: text/plain" in headers, headers
+    assert "last-modified-version:" in headers, headers
+
 with subtest("deletes are recorded in the deletion log"):
     machine.succeed(f"curl -sf -X DELETE '{base}/users/1/items?itemKey=ITEM0001' {auth}")
     machine.succeed(

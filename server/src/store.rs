@@ -278,6 +278,24 @@ pub async fn query_items(pool: &PgPool, q: &ItemQuery) -> sqlx::Result<(Vec<Valu
     Ok((items, total))
 }
 
+/// Every item key matching the query, ordered, with no paging — the plain key
+/// list the sync client's `getKeys()` consumes (e.g. the top-level items of a
+/// restored collection). Shares `push_item_filters`, so `format=keys` honours
+/// the same filters as the JSON listing.
+pub async fn item_keys(pool: &PgPool, q: &ItemQuery) -> sqlx::Result<Vec<String>> {
+    let mut sql: QueryBuilder<Postgres> = QueryBuilder::new("select key from object where ");
+    push_item_filters(&mut sql, q);
+    sql.push(" order by key");
+    let keys = sql
+        .build()
+        .fetch_all(pool)
+        .await?
+        .into_iter()
+        .map(|row| row.get::<String, _>("key"))
+        .collect();
+    Ok(keys)
+}
+
 /// Distinct tags across non-trashed items with their item counts, as
 /// `[{tag, numItems}]` ordered by tag. Backs the CLI-facing `/tags` listing.
 pub async fn tags(pool: &PgPool) -> sqlx::Result<Value> {

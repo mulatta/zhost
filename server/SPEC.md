@@ -205,10 +205,17 @@ Item listings (`GET /users/<id>/items?format=json`) accept:
 
 Convenience listings: `GET /users/<id>/items/top` (no `parentItem`),
 `/items/trash` (`data.deleted`), `/tags` (distinct tags as `[{tag, numItems}]`,
-trashed items excluded), `/collections/<key>/items` (`data.collections` contains
-the key). The item listings carry the same search/filter/sort/paginate params as
-`/items`; `/items/top` also still answers the sync `format=versions`/`itemKey`
-reads the client may send there.
+trashed items excluded), `/collections/<key>/items` and
+`/collections/<key>/items/top` (`data.collections` contains the key). The item
+listings carry the same search/filter/sort/paginate params as `/items`;
+`/items/top` also still answers the sync `format=versions`/`itemKey` reads the
+client may send there.
+
+`format=keys` returns every matching key (unpaged) as a plain-text,
+newline-separated list rather than JSON. The sync client uses it on
+`/collections/<key>/items/top` when restoring a previously-deleted collection
+(`syncEngine.js` `_restoreRestoredCollectionItems`); the list is the same set the
+JSON listing would return.
 
 Matching is case-insensitive substring (`ILIKE`). The default `titleCreatorYear`
 search runs against an immutable `zhost_item_text(data)` expression (title, date
