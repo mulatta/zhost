@@ -320,6 +320,26 @@ with subtest("query API: OR filters, descending sort and includeTrashed"):
     assert first("tag=aa&sort=title&direction=desc&includeTrashed=1") == "COVRT001"
     assert "COVRT001" not in kset("tag=aa")
 
+with subtest("sort=date orders by extracted year, not raw freeform text"):
+    version = library_version()
+    machine.succeed(
+        f"curl -sf -X POST {base}/users/1/items {auth} "
+        f"-H 'If-Unmodified-Since-Version: {version}' "
+        f'-d \'[{{"key":"DATE0OLD","itemType":"book","title":"old","date":"circa 1850",'
+        f'"tags":[{{"tag":"era"}}]}},'
+        f'{{"key":"DATE0MID","itemType":"book","title":"mid","date":"January 1960",'
+        f'"tags":[{{"tag":"era"}}]}},'
+        f'{{"key":"DATE0NEW","itemType":"book","title":"new","date":"2020-05-01",'
+        f'"tags":[{{"tag":"era"}}]}}]\' | jq -e .successful'
+    )
+    # Ascending by year: 1850 < 1960 < 2020, despite the leading-character order
+    # ("2020" < "January" < "circa") a naive text sort would give.
+    order = machine.succeed(
+        f"curl -sf '{base}/users/1/items?tag=era&sort=date&direction=asc' {auth} "
+        f"| jq -r '[.[].key]|join(\",\")'"
+    ).strip()
+    assert order == "DATE0OLD,DATE0MID,DATE0NEW", order
+
 with subtest("deletes are recorded in the deletion log"):
     machine.succeed(f"curl -sf -X DELETE '{base}/users/1/items?itemKey=ITEM0001' {auth}")
     machine.succeed(
