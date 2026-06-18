@@ -237,6 +237,30 @@ with subtest("convenience listings: top, trash, collection items and tags"):
         f"| jq -e '.[] | select(.tag == \"shelf\") | .numItems == 1'"
     )
 
+with subtest("top filtering covers parentItem:false and the versions view"):
+    # A top-level item may carry parentItem:false rather than omitting it; the
+    # /top versions view (the client's parent-first phase) must be top-filtered.
+    version = library_version()
+    machine.succeed(
+        f"curl -sf -X POST {base}/users/1/items {auth} "
+        f"-H 'If-Unmodified-Since-Version: {version}' "
+        f'-d \'[{{"key":"TOPFALS1","itemType":"book","title":"pf",'
+        f'"parentItem":false}}]\' | jq -e .successful'
+    )
+    # parentItem:false is treated as top-level.
+    top = machine.succeed(
+        f"curl -sf '{base}/users/1/items/top' {auth} | jq -r '[.[].key]|join(\"\\n\")'"
+    )
+    assert "TOPFALS1" in top, top
+    # /items/top?format=versions returns only top-level keys; the child CHILDNO1
+    # (from the previous subtest) appears in the full versions map but not here.
+    top_v = machine.succeed(
+        f"curl -sf '{base}/users/1/items/top?format=versions&since=0' {auth} | jq -e 'has(\"CHILDNO1\")|not'"
+    )
+    machine.succeed(
+        f"curl -sf '{base}/users/1/items?format=versions&since=0' {auth} | jq -e '.CHILDNO1'"
+    )
+
 with subtest("malformed (non-array) item data does not 500 the query API"):
     # data is stored opaquely, so an item can carry a scalar where an array is
     # expected; jsonb_array_elements must not crash the listing/tag endpoints.

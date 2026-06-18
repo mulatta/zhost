@@ -204,15 +204,21 @@ async fn read(kind: &str, params: HashMap<String, String>) -> Response {
 }
 
 /// The two sync reads shared by `/items` and `/items/top`: the `format=versions`
-/// map and the `?itemKey=…` batch. Returns `None` when the request carries
-/// neither, i.e. it is a CLI query rather than a sync read.
-async fn item_sync_read(params: &query::Params) -> Option<Response> {
+/// map and the `?itemKey=…` batch. With `top`, the versions map is restricted to
+/// top-level items (the client's parent-first phase). Returns `None` when the
+/// request carries neither, i.e. it is a CLI query rather than a sync read.
+async fn item_sync_read(params: &query::Params, top: bool) -> Option<Response> {
     if params.get("format") == Some("versions") {
         let since = params
             .get("since")
             .and_then(|s| s.parse().ok())
             .unwrap_or(0);
-        return Some(match store::versions(pool(), "item", since).await {
+        let result = if top {
+            store::top_versions(pool(), since).await
+        } else {
+            store::versions(pool(), "item", since).await
+        };
+        return Some(match result {
             Ok(value) => (current_headers().await, Json(value)).into_response(),
             Err(error) => server_error("items versions", error),
         });
@@ -260,18 +266,18 @@ fn next_link(path: &str, raw: Option<&str>, start: i64) -> String {
 /// `GET /users/<id>/items`: the two sync reads, or the CLI query when neither.
 async fn items_get(Path(id): Path<String>, RawQuery(raw): RawQuery) -> Response {
     let params = query::Params::parse(raw.as_deref());
-    if let Some(resp) = item_sync_read(&params).await {
+    if let Some(resp) = item_sync_read(&params, false).await {
         return resp;
     }
     let q = query::ItemQuery::from_params(&params);
     item_listing(&format!("/users/{id}/items"), raw.as_deref(), &q).await
 }
 
-/// `GET /users/<id>/items/top`: top-level items (no `parentItem`). Still answers
-/// the sync `format=versions`/`itemKey` reads the client may send here.
+/// `GET /users/<id>/items/top`: top-level items (no `parentItem`). Also answers
+/// the sync `format=versions` (top-filtered) and `itemKey` reads sent here.
 async fn items_top(Path(id): Path<String>, RawQuery(raw): RawQuery) -> Response {
     let params = query::Params::parse(raw.as_deref());
-    if let Some(resp) = item_sync_read(&params).await {
+    if let Some(resp) = item_sync_read(&params, true).await {
         return resp;
     }
     let mut q = query::ItemQuery::from_params(&params);

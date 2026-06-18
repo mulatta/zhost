@@ -13,6 +13,11 @@ use crate::query::{ItemQuery, QMode};
 /// Single user, single personal library.
 const LIBRARY_ID: i64 = 1;
 
+/// SQL predicate for a top-level item (one with no parent). Zotero omits
+/// `parentItem` on top-level items, but `data` is stored opaquely, so also treat
+/// an explicit null/false/empty value as top. A fixed string, never user input.
+const IS_TOP: &str = "coalesce(data->>'parentItem', '') in ('', 'false')";
+
 /// Zotero's attachment `fromJSON` processes fields in object order and requires
 /// `linkMode` before `filename`/`path`. jsonb storage sorts keys alphabetically
 /// (filename < linkMode), so re-emit attachment data with linkMode first. Relies
@@ -88,6 +93,25 @@ pub async fn versions(pool: &PgPool, kind: &str, since: i64) -> sqlx::Result<Val
     )
     .bind(LIBRARY_ID)
     .bind(kind)
+    .bind(since)
+    .fetch_all(pool)
+    .await?;
+    let mut map = Map::new();
+    for row in rows {
+        map.insert(row.get("key"), Value::from(row.get::<i64, _>("version")));
+    }
+    Ok(Value::Object(map))
+}
+
+/// `{key: version}` for top-level items changed after `since`. The client's
+/// sync fetches top-level items first (a parent-first phase), so this is the
+/// top-filtered counterpart of `versions(pool, "item", since)`.
+pub async fn top_versions(pool: &PgPool, since: i64) -> sqlx::Result<Value> {
+    let rows = sqlx::query(&format!(
+        "select key, version from object \
+         where library_id = $1 and kind = 'item' and {IS_TOP} and version > $2"
+    ))
+    .bind(LIBRARY_ID)
     .bind(since)
     .fetch_all(pool)
     .await?;
@@ -208,7 +232,7 @@ fn push_item_filters(sql: &mut QueryBuilder<Postgres>, q: &ItemQuery) {
 
     // /items/top: only top-level items (those without a parent).
     if q.top {
-        sql.push(" and data->>'parentItem' is null");
+        sql.push(" and ").push(IS_TOP);
     }
 
     // /collections/<key>/items: items whose data.collections array holds the key.
