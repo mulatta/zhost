@@ -123,11 +123,19 @@ with subtest("an attachment file uploads and downloads"):
         f"-H 'If-None-Match: *' -d 'upload={token}'"
     )
     assert http_code(f"{base}/users/1/items/ATTACH001/file {auth}") == "302"
-    machine.succeed(
-        f"curl -sf -D - -o /dev/null {base}/users/1/items/ATTACH001/file {auth} "
-        f"| grep -i 'zotero-file-md5: {md5}'"
-    )
-    assert machine.succeed(f"curl -sf {base}/files/ATTACH001") == "hello"
+    # The 302 carries the md5/mtime headers and a Location whose path is a
+    # capability token (not the item key); follow it to fetch the bytes with no
+    # API key, the way the stock client downloads from a presigned URL.
+    location = machine.succeed(
+        f"curl -sf -D /tmp/dlhdr -o /dev/null {base}/users/1/items/ATTACH001/file {auth} "
+        f"&& grep -i '^location:' /tmp/dlhdr | tr -d '\\r' | awk '{{print $2}}'"
+    ).strip()
+    machine.succeed(f"grep -iq 'zotero-file-md5: {md5}' /tmp/dlhdr")
+    dl_token = location.rsplit("/", 1)[-1]
+    assert dl_token and dl_token != "ATTACH001", location
+    assert machine.succeed(f"curl -sf {base}/files/{dl_token}") == "hello"
+    # The raw item key is no longer a download path — only a minted token works.
+    assert http_code(f"{base}/files/ATTACH001") == "404"
 
 with subtest("re-authorizing the same file returns exists:1 (dedup)"):
     machine.succeed(
@@ -162,9 +170,9 @@ with subtest("registering bytes that do not match the declared md5 is rejected")
     )
 
 with subtest("non-alphanumeric keys are rejected from file endpoints"):
-    # Keys become on-disk path components, so a key with '.'/'/' (path traversal)
-    # must be refused before it reaches the filesystem.
-    assert http_code(f"{base}/files/bad..key") == "404"
+    # The upload key becomes an on-disk path component, so a key with '.'/'/'
+    # (path traversal) must be refused before it reaches the filesystem.
+    # (Downloads no longer take a key — only a minted token resolves to one.)
     assert (
         http_code(
             f"-X POST {base}/users/1/items/bad..key/file {auth} "
@@ -172,6 +180,8 @@ with subtest("non-alphanumeric keys are rejected from file endpoints"):
         )
         == "400"
     )
+    # An unknown download token serves nothing.
+    assert http_code(f"{base}/files/bad..key") == "404"
 
 with subtest("annotations round-trip as ordinary items"):
     # Highlights/notes are items (itemType annotation/note), so they sync through
