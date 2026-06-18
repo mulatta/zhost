@@ -130,11 +130,24 @@ async fn current_headers() -> HeaderMap {
     version_headers(store::current_version(pool()).await.unwrap_or(0))
 }
 
-/// A since/versions read can answer `304 Not Modified` when the client already
-/// holds everything up to the current library version (nothing has a version
-/// greater than `since`). `since == 0` is the initial pull, so never 304 it.
-async fn not_modified(since: i64) -> bool {
-    since > 0 && since >= store::current_version(pool()).await.unwrap_or(0)
+/// For a since/versions read: the current library version, and whether the
+/// client already holds everything up to it (→ `304 Not Modified`; nothing has a
+/// version greater than `since`). `since == 0` is the initial pull, so never
+/// 304 it. One DB read, so the caller reuses `current` for the response's
+/// `Last-Modified-Version` instead of querying it again.
+async fn since_check(since: i64) -> (i64, bool) {
+    let current = store::current_version(pool()).await.unwrap_or(0);
+    (current, since > 0 && since >= current)
+}
+
+/// The `If-Modified-Since-Version` request header (0 if absent/unparseable). The
+/// client uses it on reads that don't carry a `since` query param (e.g. settings).
+fn if_modified_since(headers: &HeaderMap) -> i64 {
+    headers
+        .get("if-modified-since-version")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0)
 }
 
 /// Build a header value from stored/derived text without panicking on a stray
@@ -262,17 +275,19 @@ fn csv_of(params: &HashMap<String, String>, key: &str) -> Vec<String> {
 /// `format=versions&since=N` returns the changed `{key: version}` map; otherwise
 /// `?<kind>Key=a,b&format=json` returns the full `[{key, version, data}]`.
 async fn read(kind: &str, params: HashMap<String, String>) -> Response {
-    let result = if params.get("format").map(String::as_str) == Some("versions") {
+    if params.get("format").map(String::as_str) == Some("versions") {
         let since = since_of(&params);
-        if not_modified(since).await {
-            return (StatusCode::NOT_MODIFIED, current_headers().await).into_response();
+        let (current, fresh) = since_check(since).await;
+        if fresh {
+            return (StatusCode::NOT_MODIFIED, version_headers(current)).into_response();
         }
-        store::versions(pool(), kind, since).await
-    } else {
-        let keys = csv_of(&params, &format!("{kind}Key"));
-        store::objects(pool(), kind, &keys).await
-    };
-    match result {
+        return match store::versions(pool(), kind, since).await {
+            Ok(value) => (version_headers(current), Json(value)).into_response(),
+            Err(error) => server_error("read", error),
+        };
+    }
+    let keys = csv_of(&params, &format!("{kind}Key"));
+    match store::objects(pool(), kind, &keys).await {
         Ok(value) => (current_headers().await, Json(value)).into_response(),
         Err(error) => server_error("read", error),
     }
@@ -288,8 +303,9 @@ async fn item_sync_read(params: &query::Params, top: bool) -> Option<Response> {
             .get("since")
             .and_then(|s| s.parse().ok())
             .unwrap_or(0);
-        if not_modified(since).await {
-            return Some((StatusCode::NOT_MODIFIED, current_headers().await).into_response());
+        let (current, fresh) = since_check(since).await;
+        if fresh {
+            return Some((StatusCode::NOT_MODIFIED, version_headers(current)).into_response());
         }
         let result = if top {
             store::top_versions(pool(), since).await
@@ -297,7 +313,7 @@ async fn item_sync_read(params: &query::Params, top: bool) -> Option<Response> {
             store::versions(pool(), "item", since).await
         };
         return Some(match result {
-            Ok(value) => (current_headers().await, Json(value)).into_response(),
+            Ok(value) => (version_headers(current), Json(value)).into_response(),
             Err(error) => server_error("items versions", error),
         });
     }
@@ -487,13 +503,19 @@ async fn delete(kind: &str, headers: HeaderMap, params: HashMap<String, String>)
     }
 }
 
-async fn settings_read(Query(params): Query<HashMap<String, String>>) -> Response {
-    let since = since_of(&params);
-    if not_modified(since).await {
-        return (StatusCode::NOT_MODIFIED, current_headers().await).into_response();
+async fn settings_read(
+    headers: HeaderMap,
+    Query(params): Query<HashMap<String, String>>,
+) -> Response {
+    // The client may send the cursor as ?since= or the If-Modified-Since-Version
+    // header; honour whichever is higher.
+    let since = since_of(&params).max(if_modified_since(&headers));
+    let (current, fresh) = since_check(since).await;
+    if fresh {
+        return (StatusCode::NOT_MODIFIED, version_headers(current)).into_response();
     }
     match store::settings(pool()).await {
-        Ok(value) => (current_headers().await, Json(value)).into_response(),
+        Ok(value) => (version_headers(current), Json(value)).into_response(),
         Err(error) => server_error("settings", error),
     }
 }
@@ -547,11 +569,12 @@ async fn deleted(Query(params): Query<HashMap<String, String>>) -> Response {
 /// changed after `since`, so the client downloads only what it lacks.
 async fn fulltext_versions(Query(params): Query<HashMap<String, String>>) -> Response {
     let since = since_of(&params);
-    if not_modified(since).await {
-        return (StatusCode::NOT_MODIFIED, current_headers().await).into_response();
+    let (current, fresh) = since_check(since).await;
+    if fresh {
+        return (StatusCode::NOT_MODIFIED, version_headers(current)).into_response();
     }
     match store::fulltext_versions(pool(), since).await {
-        Ok(value) => (current_headers().await, Json(value)).into_response(),
+        Ok(value) => (version_headers(current), Json(value)).into_response(),
         Err(error) => server_error("fulltext versions", error),
     }
 }

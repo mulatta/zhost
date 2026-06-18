@@ -442,6 +442,10 @@ with subtest("a since read returns 304 Not Modified when nothing is newer"):
     assert http_code(f"'{base}/users/1/items?format=versions&since={v}' {auth}") == "304"
     assert http_code(f"'{base}/users/1/fulltext?format=versions&since={v}' {auth}") == "304"
     assert http_code(f"'{base}/users/1/settings?since={v}' {auth}") == "304"
+    # settings also honours the If-Modified-Since-Version header (no since param).
+    assert (
+        http_code(f"{base}/users/1/settings -H 'If-Modified-Since-Version: {v}' {auth}") == "304"
+    )
     # The initial pull (since=0) is never 304.
     assert http_code(f"'{base}/users/1/items?format=versions&since=0' {auth}") == "200"
 
