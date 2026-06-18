@@ -72,6 +72,18 @@ pub async fn connect(url: &str) -> sqlx::Result<PgPool> {
     Ok(pool)
 }
 
+/// A write that changes nothing (empty batch / no matching keys): report the
+/// current version, or a conflict if the client's expectation is already stale,
+/// without bumping the version — a no-op must not churn the counter and make
+/// every other client think the library changed.
+async fn no_change(pool: &PgPool, expected: Option<i64>) -> sqlx::Result<Outcome<i64>> {
+    let current = current_version(pool).await?;
+    Ok(match expected {
+        Some(v) if v != current => Outcome::Conflict(current),
+        _ => Outcome::Done(current),
+    })
+}
+
 pub async fn current_version(pool: &PgPool) -> sqlx::Result<i64> {
     let row = sqlx::query("select version from library where id = $1")
         .bind(LIBRARY_ID)
@@ -307,6 +319,12 @@ pub async fn write(
     batch: Vec<Value>,
     expected: Option<i64>,
 ) -> sqlx::Result<Outcome<(i64, Value)>> {
+    if batch.is_empty() {
+        return Ok(match no_change(pool, expected).await? {
+            Outcome::Done(version) => Outcome::Done((version, Value::Object(Map::new()))),
+            Outcome::Conflict(current) => Outcome::Conflict(current),
+        });
+    }
     let mut tx = pool.begin().await?;
     let version = match guarded_version(&mut tx, expected).await? {
         Outcome::Done(version) => version,
@@ -359,6 +377,9 @@ pub async fn delete(
     keys: &[String],
     expected: Option<i64>,
 ) -> sqlx::Result<Outcome<i64>> {
+    if keys.is_empty() {
+        return no_change(pool, expected).await;
+    }
     let mut tx = pool.begin().await?;
     let version = match guarded_version(&mut tx, expected).await? {
         Outcome::Done(version) => version,
@@ -409,6 +430,9 @@ pub async fn write_settings(
     body: Value,
     expected: Option<i64>,
 ) -> sqlx::Result<Outcome<i64>> {
+    if body.as_object().is_none_or(|m| m.is_empty()) {
+        return no_change(pool, expected).await;
+    }
     let mut tx = pool.begin().await?;
     let version = match guarded_version(&mut tx, expected).await? {
         Outcome::Done(version) => version,
@@ -440,6 +464,9 @@ pub async fn delete_settings(
     keys: &[String],
     expected: Option<i64>,
 ) -> sqlx::Result<Outcome<i64>> {
+    if keys.is_empty() {
+        return no_change(pool, expected).await;
+    }
     let mut tx = pool.begin().await?;
     let version = match guarded_version(&mut tx, expected).await? {
         Outcome::Done(version) => version,
@@ -594,6 +621,12 @@ pub async fn write_fulltext(
     batch: Vec<Value>,
     expected: Option<i64>,
 ) -> sqlx::Result<Outcome<(i64, Value)>> {
+    if batch.is_empty() {
+        return Ok(match no_change(pool, expected).await? {
+            Outcome::Done(version) => Outcome::Done((version, Value::Object(Map::new()))),
+            Outcome::Conflict(current) => Outcome::Conflict(current),
+        });
+    }
     let mut tx = pool.begin().await?;
     let version = match guarded_version(&mut tx, expected).await? {
         Outcome::Done(version) => version,

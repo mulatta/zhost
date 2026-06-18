@@ -73,9 +73,28 @@ with subtest("a stale write is rejected with 412"):
         == "412"
     )
 
+with subtest("a write without If-Unmodified-Since-Version is rejected with 428"):
+    # Without the precondition the version guard would be bypassed.
+    assert (
+        http_code(
+            f"-X POST {base}/users/1/items {auth} "
+            f"-d '[{{\"key\":\"NOPRECON\",\"itemType\":\"book\"}}]'"
+        )
+        == "428"
+    )
+
+with subtest("an empty batch does not bump the library version"):
+    before = library_version()
+    machine.succeed(
+        f"curl -sf -X POST {base}/users/1/items {auth} "
+        f"-H 'If-Unmodified-Since-Version: {before}' -d '[]' | jq -e .successful"
+    )
+    assert library_version() == before, library_version()
+
 with subtest("attachment data is emitted with linkMode first"):
     machine.succeed(
         f"curl -sf -X POST {base}/users/1/items {auth} "
+        f"-H 'If-Unmodified-Since-Version: {library_version()}' "
         f"-d '[{{\"key\":\"ATTACH001\",\"itemType\":\"attachment\","
         f"\"linkMode\":\"imported_file\",\"filename\":\"t.pdf\","
         f"\"contentType\":\"application/pdf\"}}]' | jq -e .successful"
@@ -110,6 +129,7 @@ with subtest("annotations round-trip as ordinary items"):
     # the same opaque object path rather than any dedicated endpoint.
     machine.succeed(
         f"curl -sf -X POST {base}/users/1/items {auth} "
+        f"-H 'If-Unmodified-Since-Version: {library_version()}' "
         f"-d '[{{\"key\":\"ANNOT001\",\"itemType\":\"annotation\","
         f"\"annotationType\":\"highlight\",\"annotationText\":\"marked\","
         f"\"parentItem\":\"ATTACH001\"}}]' "

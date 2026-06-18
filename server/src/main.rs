@@ -177,6 +177,23 @@ fn if_unmodified(headers: &HeaderMap) -> Option<i64> {
         .and_then(|s| s.parse().ok())
 }
 
+/// A mutating data write must carry a parseable `If-Unmodified-Since-Version`.
+/// Without it the version guard is bypassed (a missing/garbage header would let
+/// the write commit unconditionally), so reject it with `428 Precondition
+/// Required` — the same contract the file endpoints use.
+// The Err is a full Response (the idiomatic axum guard shape); it's only built
+// on the rare rejection path, so the large-Err size is fine.
+#[allow(clippy::result_large_err)]
+fn precondition(headers: &HeaderMap) -> Result<i64, Response> {
+    if_unmodified(headers).ok_or_else(|| {
+        (
+            StatusCode::PRECONDITION_REQUIRED,
+            "If-Unmodified-Since-Version required",
+        )
+            .into_response()
+    })
+}
+
 fn conflict(current: i64) -> Response {
     (StatusCode::PRECONDITION_FAILED, version_headers(current)).into_response()
 }
@@ -374,7 +391,11 @@ async fn write(kind: &str, headers: HeaderMap, body: Bytes) -> Response {
             return StatusCode::BAD_REQUEST.into_response();
         }
     };
-    match store::write(pool(), kind, batch, if_unmodified(&headers)).await {
+    let expected = match precondition(&headers) {
+        Ok(v) => v,
+        Err(resp) => return resp,
+    };
+    match store::write(pool(), kind, batch, Some(expected)).await {
         Ok(store::Outcome::Done((version, successful))) => (
             version_headers(version),
             Json(json!({
@@ -391,11 +412,15 @@ async fn write(kind: &str, headers: HeaderMap, body: Bytes) -> Response {
 }
 
 async fn delete(kind: &str, headers: HeaderMap, params: HashMap<String, String>) -> Response {
+    let expected = match precondition(&headers) {
+        Ok(v) => v,
+        Err(resp) => return resp,
+    };
     let keys = params
         .get(&format!("{kind}Key"))
         .map(|csv| csv.split(',').map(String::from).collect::<Vec<_>>())
         .unwrap_or_default();
-    match store::delete(pool(), kind, &keys, if_unmodified(&headers)).await {
+    match store::delete(pool(), kind, &keys, Some(expected)).await {
         Ok(store::Outcome::Done(version)) => {
             (StatusCode::NO_CONTENT, version_headers(version)).into_response()
         }
@@ -412,8 +437,12 @@ async fn settings_read() -> Response {
 }
 
 async fn settings_write(headers: HeaderMap, body: Bytes) -> Response {
+    let expected = match precondition(&headers) {
+        Ok(v) => v,
+        Err(resp) => return resp,
+    };
     let value: Value = serde_json::from_slice(&body).unwrap_or_else(|_| json!({}));
-    match store::write_settings(pool(), value, if_unmodified(&headers)).await {
+    match store::write_settings(pool(), value, Some(expected)).await {
         Ok(store::Outcome::Done(version)) => {
             (StatusCode::NO_CONTENT, version_headers(version)).into_response()
         }
@@ -430,11 +459,15 @@ async fn settings_delete(
     headers: HeaderMap,
     Query(params): Query<HashMap<String, String>>,
 ) -> Response {
+    let expected = match precondition(&headers) {
+        Ok(v) => v,
+        Err(resp) => return resp,
+    };
     let keys = params
         .get("settingKey")
         .map(|csv| csv.split(',').map(String::from).collect::<Vec<_>>())
         .unwrap_or_default();
-    match store::delete_settings(pool(), &keys, if_unmodified(&headers)).await {
+    match store::delete_settings(pool(), &keys, Some(expected)).await {
         Ok(store::Outcome::Done(version)) => {
             (StatusCode::NO_CONTENT, version_headers(version)).into_response()
         }
@@ -487,7 +520,11 @@ async fn fulltext_write(headers: HeaderMap, body: Bytes) -> Response {
             return StatusCode::BAD_REQUEST.into_response();
         }
     };
-    match store::write_fulltext(pool(), batch, if_unmodified(&headers)).await {
+    let expected = match precondition(&headers) {
+        Ok(v) => v,
+        Err(resp) => return resp,
+    };
+    match store::write_fulltext(pool(), batch, Some(expected)).await {
         Ok(store::Outcome::Done((version, successful))) => (
             version_headers(version),
             Json(json!({ "successful": successful, "unchanged": {}, "failed": {} })),
