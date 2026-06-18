@@ -39,8 +39,8 @@ struct Config {
     user_id: u64,
     bind: String,
     /// Client-facing base URL (e.g. the reverse-proxy address). Used for the
-    /// login, upload and download URLs handed to the client, which must be
-    /// reachable by it — not the internal bind address.
+    /// login and upload URLs handed to the client, which must be reachable by it
+    /// — not the internal bind address. (Downloads use a pre-signed bucket URL.)
     public_url: String,
     database_url: String,
     s3: s3::Config,
