@@ -445,8 +445,104 @@ with subtest("a since read returns 304 Not Modified when nothing is newer"):
     # The initial pull (since=0) is never 304.
     assert http_code(f"'{base}/users/1/items?format=versions&since=0' {auth}") == "200"
 
+with subtest("collections round-trip through write, read, versions and delete"):
+    machine.succeed(
+        f"curl -sf -X POST {base}/users/1/collections {auth} "
+        f"-H 'If-Unmodified-Since-Version: {library_version()}' "
+        f'-d \'[{{"key":"COLL0001","name":"Papers"}}]\' '
+        f"| jq -e '.successful.\"0\".key == \"COLL0001\"'"
+    )
+    machine.succeed(
+        f"curl -sf '{base}/users/1/collections?collectionKey=COLL0001&format=json' {auth} "
+        f"| jq -e '.[0].data.name == \"Papers\"'"
+    )
+    machine.succeed(
+        f"curl -sf '{base}/users/1/collections?format=versions&since=0' {auth} | jq -e '.COLL0001'"
+    )
+    machine.succeed(f"curl -sf -X DELETE '{base}/users/1/collections?collectionKey=COLL0001' {auth} "
+                    f"-H 'If-Unmodified-Since-Version: {library_version()}'")
+    machine.succeed(
+        f"curl -sf '{base}/users/1/deleted?since=0' {auth} | jq -e '.collections | index(\"COLL0001\")'"
+    )
+
+with subtest("saved searches round-trip through write, read and delete"):
+    machine.succeed(
+        f"curl -sf -X POST {base}/users/1/searches {auth} "
+        f"-H 'If-Unmodified-Since-Version: {library_version()}' "
+        f'-d \'[{{"key":"SRCH0001","name":"Recent","conditions":[]}}]\' '
+        f"| jq -e '.successful.\"0\".key == \"SRCH0001\"'"
+    )
+    machine.succeed(
+        f"curl -sf '{base}/users/1/searches?searchKey=SRCH0001&format=json' {auth} "
+        f"| jq -e '.[0].data.name == \"Recent\"'"
+    )
+    machine.succeed(f"curl -sf -X DELETE '{base}/users/1/searches?searchKey=SRCH0001' {auth} "
+                    f"-H 'If-Unmodified-Since-Version: {library_version()}'")
+    machine.succeed(
+        f"curl -sf '{base}/users/1/deleted?since=0' {auth} | jq -e '.searches | index(\"SRCH0001\")'"
+    )
+
+with subtest("settings round-trip through write, read and delete"):
+    machine.succeed(
+        f"curl -sf -X POST {base}/users/1/settings {auth} "
+        f"-H 'If-Unmodified-Since-Version: {library_version()}' "
+        f'-d \'{{"tagColors":{{"value":[{{"name":"x","color":"#fff"}}]}}}}\' '
+    )
+    machine.succeed(
+        f"curl -sf {base}/users/1/settings {auth} "
+        f"| jq -e '.tagColors.value[0].name == \"x\" and (.tagColors.version | type == \"number\")'"
+    )
+    # A stale settings write is a 412.
+    assert (
+        http_code(
+            f"-X POST {base}/users/1/settings {auth} "
+            f"-H 'If-Unmodified-Since-Version: 0' -d '{{\"k\":{{\"value\":1}}}}'"
+        )
+        == "412"
+    )
+    # DELETE actually removes the setting (regression: it used to be a no-op).
+    machine.succeed(
+        f"curl -sf -X DELETE '{base}/users/1/settings?settingKey=tagColors' {auth} "
+        f"-H 'If-Unmodified-Since-Version: {library_version()}'"
+    )
+    machine.succeed(f"curl -sf {base}/users/1/settings {auth} | jq -e '.tagColors == null'")
+    machine.succeed(
+        f"curl -sf '{base}/users/1/deleted?since=0' {auth} | jq -e '.settings | index(\"tagColors\")'"
+    )
+
+with subtest("a gzip-compressed write body is decoded"):
+    # The real client gzips write bodies; exercise the decompression middleware.
+    machine.succeed(
+        f"printf '%s' '[{{\"key\":\"GZIP0001\",\"itemType\":\"book\",\"title\":\"zipped\"}}]' "
+        f"| gzip | curl -sf -X POST {base}/users/1/items {auth} "
+        f"-H 'If-Unmodified-Since-Version: {library_version()}' "
+        f"-H 'Content-Encoding: gzip' --data-binary @- | jq -e .successful"
+    )
+    machine.succeed(
+        f"curl -sf '{base}/users/1/items?itemKey=GZIP0001&format=json' {auth} "
+        f"| jq -e '.[0].data.title == \"zipped\"'"
+    )
+
+with subtest("PATCH updates items and is gated by the read-only key"):
+    machine.succeed(
+        f"curl -sf -X PATCH {base}/users/1/items {auth} "
+        f"-H 'If-Unmodified-Since-Version: {library_version()}' "
+        f'-d \'[{{"key":"GZIP0001","itemType":"book","title":"patched"}}]\' '
+        f"| jq -e '.successful.\"0\".data.title == \"patched\"'"
+    )
+    assert (
+        http_code(
+            f"-X PATCH {base}/users/1/items {readonly} "
+            f"-H 'If-Unmodified-Since-Version: 0' -d '[{{\"key\":\"X\",\"itemType\":\"book\"}}]'"
+        )
+        == "403"
+    )
+
 with subtest("deletes are recorded in the deletion log"):
-    machine.succeed(f"curl -sf -X DELETE '{base}/users/1/items?itemKey=ITEM0001' {auth}")
+    machine.succeed(
+        f"curl -sf -X DELETE '{base}/users/1/items?itemKey=ITEM0001' {auth} "
+        f"-H 'If-Unmodified-Since-Version: {library_version()}'"
+    )
     machine.succeed(
         f"curl -sf '{base}/users/1/deleted?since=0' {auth} | jq -e '.items | index(\"ITEM0001\")'"
     )

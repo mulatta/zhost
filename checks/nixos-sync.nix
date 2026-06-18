@@ -29,6 +29,7 @@ testPkgs.testers.runNixOSTest {
     environment.systemPackages = [
       testPkgs.curl
       testPkgs.jq
+      testPkgs.gzip
     ];
   };
 
