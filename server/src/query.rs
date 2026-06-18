@@ -101,18 +101,19 @@ impl Sort {
         }
     }
 
-    /// The jsonb expression to order by. `creator` orders by the first creator's
-    /// last name; `date` orders by the first 4-digit year extracted from the
-    /// freeform date (so "circa 1990" / "January 2000" sort chronologically
-    /// rather than by their leading character); the rest read a top-level field.
+    /// The SQL expression to order by. `date`/`itemType` use the generated
+    /// columns (migration 0006) — `date_year` is the first 4-digit year from the
+    /// freeform date, so "circa 1990" / "January 2000" sort chronologically
+    /// rather than by their leading character. `creator` orders by the first
+    /// creator's last name; the rest read a top-level jsonb field.
     pub fn order_expr(self) -> &'static str {
         match self {
             Sort::DateModified => "data->>'dateModified'",
             Sort::DateAdded => "data->>'dateAdded'",
             Sort::Title => "data->>'title'",
             Sort::Creator => "data->'creators'->0->>'lastName'",
-            Sort::Date => "substring(data->>'date' from '\\d{4}')",
-            Sort::ItemType => "data->>'itemType'",
+            Sort::Date => "date_year",
+            Sort::ItemType => "item_type",
         }
     }
 }
@@ -315,11 +316,9 @@ mod tests {
             Sort::Creator.order_expr(),
             "data->'creators'->0->>'lastName'"
         );
-        // date sorts by the extracted year, not the raw freeform string.
+        // date/itemType sort via the generated columns (migration 0006).
         assert_eq!(query("sort=date").sort, Sort::Date);
-        assert_eq!(
-            Sort::Date.order_expr(),
-            "substring(data->>'date' from '\\d{4}')"
-        );
+        assert_eq!(Sort::Date.order_expr(), "date_year");
+        assert_eq!(Sort::ItemType.order_expr(), "item_type");
     }
 }

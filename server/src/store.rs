@@ -13,11 +13,6 @@ use crate::query::{ItemQuery, QMode};
 /// Single user, single personal library.
 const LIBRARY_ID: i64 = 1;
 
-/// SQL predicate for a top-level item (one with no parent). Zotero omits
-/// `parentItem` on top-level items, but `data` is stored opaquely, so also treat
-/// an explicit null/false/empty value as top. A fixed string, never user input.
-const IS_TOP: &str = "coalesce(data->>'parentItem', '') in ('', 'false')";
-
 /// Zotero's attachment `fromJSON` processes fields in object order and requires
 /// `linkMode` before `filename`/`path`. jsonb storage sorts keys alphabetically
 /// (filename < linkMode), so re-emit attachment data with linkMode first. Relies
@@ -107,10 +102,10 @@ pub async fn versions(pool: &PgPool, kind: &str, since: i64) -> sqlx::Result<Val
 /// sync fetches top-level items first (a parent-first phase), so this is the
 /// top-filtered counterpart of `versions(pool, "item", since)`.
 pub async fn top_versions(pool: &PgPool, since: i64) -> sqlx::Result<Value> {
-    let rows = sqlx::query(&format!(
+    let rows = sqlx::query(
         "select key, version from object \
-         where library_id = $1 and kind = 'item' and {IS_TOP} and version > $2"
-    ))
+         where library_id = $1 and kind = 'item' and is_top and version > $2",
+    )
     .bind(LIBRARY_ID)
     .bind(since)
     .fetch_all(pool)
@@ -154,44 +149,32 @@ fn escape_like(term: &str) -> String {
         .replace('_', "\\_")
 }
 
-/// SQL for `data->'<field>'` but only when it actually holds a JSON array,
-/// else an empty array. `jsonb_array_elements` throws ("cannot extract elements
-/// from a scalar") on a non-array value, and `data` is stored opaquely, so a
-/// malformed item must not be able to 500 the whole query. `field` is always a
-/// fixed literal here, never user input.
-fn json_array(field: &str) -> String {
-    format!(
-        "case when jsonb_typeof(data->'{field}') = 'array' \
-         then data->'{field}' else '[]'::jsonb end"
-    )
-}
-
 /// Append the shared `library_id … and <filters>` predicate for an item query to
-/// `sql` (binding its parameters). Used by both the count and the page query so
-/// the two always filter identically.
+/// `sql` (binding its parameters). Used by the count, page and key queries so
+/// they always filter identically. Filters compare the generated columns from
+/// migration 0006 (item_type/is_top/deleted/search_text/tag_names/…), so they
+/// are plain indexed comparisons rather than jsonb digging.
 fn push_item_filters(sql: &mut QueryBuilder<Postgres>, q: &ItemQuery) {
     sql.push("library_id = ")
         .push_bind(LIBRARY_ID)
         .push(" and kind = 'item'");
 
     // Trash handling: /items/trash returns only trashed items; otherwise trashed
-    // items (data.deleted truthy) are excluded unless includeTrashed is set.
+    // items are excluded unless includeTrashed is set.
     if q.only_trashed {
-        sql.push(" and coalesce(data->>'deleted', '0') in ('1', 'true')");
+        sql.push(" and deleted");
     } else if !q.include_trashed {
-        sql.push(" and coalesce(data->>'deleted', '0') not in ('1', 'true')");
+        sql.push(" and not deleted");
     }
 
     if let Some(term) = &q.q {
         let like = format!("%{}%", escape_like(term));
-        // titleCreatorYear matches title, date and creator names through the
-        // indexed zhost_item_text(data) expression (migration 0005), so the
-        // default search is trigram-index-backed rather than a sequential scan.
-        sql.push(" and (zhost_item_text(data) ilike ")
+        // titleCreatorYear matches title/date/creator names via the search_text
+        // column (trgm-indexed); everything also matches stored full-text content.
+        // That OR spans the fulltext table, so that mode cannot use the index.
+        sql.push(" and (search_text ilike ")
             .push_bind(like.clone())
             .push(" escape '\\'");
-        // `everything` also searches stored full-text content (trgm-indexed).
-        // This OR spans the fulltext table, so that mode cannot use the index.
         if q.qmode == QMode::Everything {
             sql.push(
                 " or exists (select 1 from fulltext f \
@@ -205,37 +188,31 @@ fn push_item_filters(sql: &mut QueryBuilder<Postgres>, q: &ItemQuery) {
     }
 
     if !q.item_type.include.is_empty() {
-        sql.push(" and data->>'itemType' = any(")
+        sql.push(" and item_type = any(")
             .push_bind(q.item_type.include.clone())
             .push(")");
     }
     if !q.item_type.exclude.is_empty() {
-        sql.push(" and data->>'itemType' <> all(")
+        sql.push(" and item_type <> all(")
             .push_bind(q.item_type.exclude.clone())
             .push(")");
     }
 
-    // AND across groups, OR within a group: the item must carry a tag from each.
+    // AND across groups, OR within a group: the item must carry a tag from each
+    // group, i.e. tag_names overlaps every group's alternatives.
     for group in &q.tags {
-        sql.push(" and exists (select 1 from jsonb_array_elements(")
-            .push(json_array("tags"))
-            .push(") t where t->>'tag' = any(")
-            .push_bind(group.clone())
-            .push("))");
+        sql.push(" and tag_names && ").push_bind(group.clone());
     }
 
-    // /items/top: only top-level items (those without a parent).
+    // /items/top: only top-level items.
     if q.top {
-        sql.push(" and ").push(IS_TOP);
+        sql.push(" and is_top");
     }
 
-    // /collections/<key>/items: items whose data.collections array holds the key.
+    // /collections/<key>/items: items whose collections contain the key.
     if let Some(key) = &q.collection {
-        sql.push(" and exists (select 1 from jsonb_array_elements_text(")
-            .push(json_array("collections"))
-            .push(") col where col = ")
-            .push_bind(key.clone())
-            .push(")");
+        sql.push(" and collection_keys @> ")
+            .push_bind(vec![key.clone()]);
     }
 }
 
@@ -299,16 +276,12 @@ pub async fn item_keys(pool: &PgPool, q: &ItemQuery) -> sqlx::Result<Vec<String>
 /// Distinct tags across non-trashed items with their item counts, as
 /// `[{tag, numItems}]` ordered by tag. Backs the CLI-facing `/tags` listing.
 pub async fn tags(pool: &PgPool) -> sqlx::Result<Value> {
-    // Guard against a non-array `tags` value (stored opaquely): without the
-    // jsonb_typeof check a single malformed item would 500 the whole listing.
+    // Unnest the generated tag_names column (already guards malformed data).
     let rows = sqlx::query(
-        "select t->>'tag' as tag, count(*) as num \
-         from object, jsonb_array_elements( \
-             case when jsonb_typeof(data->'tags') = 'array' \
-                  then data->'tags' else '[]'::jsonb end) t \
-         where library_id = $1 and kind = 'item' \
-           and coalesce(data->>'deleted', '0') not in ('1', 'true') \
-         group by t->>'tag' \
+        "select tag, count(*) as num \
+         from object, unnest(tag_names) as tag \
+         where library_id = $1 and kind = 'item' and not deleted \
+         group by tag \
          order by tag",
     )
     .bind(LIBRARY_ID)
