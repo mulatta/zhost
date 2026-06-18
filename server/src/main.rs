@@ -59,6 +59,21 @@ static PENDING: LazyLock<Mutex<HashMap<String, PendingUpload>>> =
 /// How long an authorized-but-unfinished upload stays valid.
 const PENDING_TTL: std::time::Duration = std::time::Duration::from_secs(3600);
 
+/// In-flight login sessions, keyed by an unguessable session token. A session is
+/// created `authorized: false`; the `/login` step (gated by the front proxy's
+/// SSO in production) flips it true, and only then does polling hand out the key.
+/// Pruned on insert so an abandoned session can't linger.
+static SESSIONS: LazyLock<Mutex<HashMap<String, LoginSession>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// How long a login session stays valid; enrollment is a one-off, prompt action.
+const SESSION_TTL: std::time::Duration = std::time::Duration::from_secs(600);
+
+struct LoginSession {
+    authorized: bool,
+    created: std::time::Instant,
+}
+
 #[derive(Clone)]
 struct PendingUpload {
     /// The attachment item the bytes belong to (and the object key in the bucket).
@@ -168,20 +183,6 @@ fn header_value(text: &str) -> axum::http::HeaderValue {
 
 // --- authentication & login session ---------------------------------------
 
-async fn create_key() -> Response {
-    (
-        StatusCode::CREATED,
-        Json(json!({
-            "key": cfg().login_key,
-            "userID": cfg().user_id,
-            "username": "zhost",
-            "displayName": "zhost",
-            "access": access_payload(true),
-        })),
-    )
-        .into_response()
-}
-
 async fn key_current(headers: HeaderMap) -> Response {
     let write = key_access(&headers).is_some_and(|a| a.write);
     Json(json!({
@@ -194,35 +195,119 @@ async fn key_current(headers: HeaderMap) -> Response {
 }
 
 /// Zotero's "Login" uses a browser-authorised session rather than credentials:
-/// the client opens `loginURL`, then polls the session until it reports
-/// `status: "completed"` with a key. Single user, so we authorise immediately.
+/// the client opens `loginURL` in the user's browser, then polls the session
+/// until it reports `status: "completed"` with a key. Mint a pending session and
+/// point `loginURL` at our `/login` (which the user must pass an SSO gate to
+/// reach); the key is withheld until that authorises the session.
 async fn create_session() -> Response {
+    let Some(token) = upload_token() else {
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    };
+    {
+        let mut sessions = SESSIONS.lock().unwrap();
+        sessions.retain(|_, s| s.created.elapsed() < SESSION_TTL);
+        sessions.insert(
+            token.clone(),
+            LoginSession {
+                authorized: false,
+                created: std::time::Instant::now(),
+            },
+        );
+    }
     (
         StatusCode::CREATED,
         Json(json!({
-            "sessionToken": "zhost-session",
-            "loginURL": format!("{}/login", cfg().public_url),
+            "sessionToken": token,
+            "loginURL": format!("{}/login?session={}", cfg().public_url, token),
         })),
     )
         .into_response()
 }
 
-async fn check_session() -> Response {
-    Json(json!({
-        "status": "completed",
-        "apiKey": cfg().login_key,
-        "userID": cfg().user_id,
-        "username": "zhost",
-    }))
-    .into_response()
+/// Poll a login session: hand out the key only once `/login` has authorised it,
+/// otherwise report it still pending (so an unauthorised or unknown token never
+/// yields a key).
+async fn check_session(Path(token): Path<String>) -> Response {
+    let authorized = {
+        let sessions = SESSIONS.lock().unwrap();
+        sessions
+            .get(&token)
+            .is_some_and(|s| s.authorized && s.created.elapsed() < SESSION_TTL)
+    };
+    if authorized {
+        Json(json!({
+            "status": "completed",
+            "apiKey": cfg().login_key,
+            "userID": cfg().user_id,
+            "username": "zhost",
+        }))
+        .into_response()
+    } else {
+        Json(json!({ "status": "pending" })).into_response()
+    }
 }
 
-async fn cancel_session() -> StatusCode {
+async fn cancel_session(Path(token): Path<String>) -> StatusCode {
+    SESSIONS.lock().unwrap().remove(&token);
     StatusCode::NO_CONTENT
 }
 
-async fn login_page() -> &'static str {
-    "Authorized — return to Zotero."
+/// The login consent page. The user reaches it from `loginURL` in their browser
+/// (behind the SSO gate in production). It does **not** authorise on its own — it
+/// renders a form that POSTs back to confirm. Splitting render (GET) from action
+/// (POST) stops a prefetch or a cross-site `GET …/login?session=…` from silently
+/// authorising a session, which would be a confused-deputy key grant: the
+/// attacker creates the session (so knows its token) and only needs an
+/// authenticated browser to hit the URL.
+async fn login_page(Query(params): Query<HashMap<String, String>>) -> Response {
+    let Some(token) = params.get("session") else {
+        return (StatusCode::BAD_REQUEST, "missing session").into_response();
+    };
+    let known = {
+        let sessions = SESSIONS.lock().unwrap();
+        sessions
+            .get(token)
+            .is_some_and(|s| s.created.elapsed() < SESSION_TTL)
+    };
+    if !known {
+        return (StatusCode::NOT_FOUND, "unknown or expired session").into_response();
+    }
+    // The token is server-minted hex, safe to interpolate into the hidden field.
+    let body = format!(
+        "<!doctype html><meta charset=utf-8><title>zhost login</title>\
+         <h1>Authorize this Zotero login?</h1>\
+         <form method=post action=\"/login\">\
+         <input type=hidden name=session value=\"{token}\">\
+         <button type=submit>Approve</button></form>"
+    );
+    axum::response::Html(body).into_response()
+}
+
+/// Authorise the session the consent form submits. Reaching this means the
+/// request cleared the SSO gate; additionally reject a cross-site form post by
+/// requiring `Origin` (when the browser sends it) to be our own, so an
+/// authenticated user's browser can't be steered into authorising someone else's
+/// session. A request with no `Origin` (a CLI, not a browser) is allowed.
+async fn login_authorize(
+    headers: HeaderMap,
+    Form(form): Form<HashMap<String, String>>,
+) -> Response {
+    if let Some(origin) = headers.get("origin").and_then(|v| v.to_str().ok()) {
+        if origin.trim_end_matches('/') != cfg().public_url.trim_end_matches('/') {
+            return (StatusCode::FORBIDDEN, "bad origin").into_response();
+        }
+    }
+    let Some(token) = form.get("session") else {
+        return (StatusCode::BAD_REQUEST, "missing session").into_response();
+    };
+    let mut sessions = SESSIONS.lock().unwrap();
+    match sessions.get_mut(token) {
+        Some(s) if s.created.elapsed() < SESSION_TTL => {
+            s.authorized = true;
+            (StatusCode::OK, "Authorized — return to Zotero.").into_response()
+        }
+        _ => (StatusCode::NOT_FOUND, "unknown or expired session").into_response(),
+    }
 }
 
 // --- library data -----------------------------------------------------------
@@ -874,10 +959,8 @@ async fn log_and_auth(req: Request, next: Next) -> Response {
     );
 
     let path = parts.uri.path();
-    let is_bootstrap = (parts.method == axum::http::Method::POST && path == "/keys")
-        || path.starts_with("/keys/sessions")
-        || path.starts_with("/uploads")
-        || path == "/login";
+    let is_bootstrap =
+        path.starts_with("/keys/sessions") || path.starts_with("/uploads") || path == "/login";
     if !is_bootstrap {
         let Some(access) = key_access(&parts.headers) else {
             return (StatusCode::FORBIDDEN, "invalid API key").into_response();
@@ -916,14 +999,13 @@ fn app() -> Router {
     };
 
     Router::new()
-        .route("/keys", post(create_key))
         .route("/keys/current", get(key_current))
         .route("/keys/sessions", post(create_session))
         .route(
             "/keys/sessions/{token}",
             get(check_session).delete(cancel_session),
         )
-        .route("/login", get(login_page))
+        .route("/login", get(login_page).post(login_authorize))
         .route("/users/{id}/groups", get(groups))
         .route(
             "/users/{id}/settings",
