@@ -6,6 +6,7 @@
 //! protocol contract.
 
 mod query;
+mod s3;
 mod store;
 
 use std::collections::HashMap;
@@ -42,11 +43,12 @@ struct Config {
     /// reachable by it — not the internal bind address.
     public_url: String,
     database_url: String,
-    storage_dir: String,
+    s3: s3::Config,
 }
 
 static CFG: OnceLock<Config> = OnceLock::new();
 static POOL: OnceLock<PgPool> = OnceLock::new();
+static STORAGE: OnceLock<s3::Storage> = OnceLock::new();
 
 /// In-flight file uploads, keyed by an unguessable upload token (not the item
 /// key, which is guessable) and remembered between the authorisation, upload and
@@ -57,28 +59,17 @@ static PENDING: LazyLock<Mutex<HashMap<String, PendingUpload>>> =
 /// How long an authorized-but-unfinished upload stays valid.
 const PENDING_TTL: std::time::Duration = std::time::Duration::from_secs(3600);
 
-/// Authorized downloads, keyed by an unguessable token that stands in for the
-/// (guessable) item key in the download URL. `file_get` (authenticated) mints
-/// one and points the client's redirect `Location` at it, so the file-serving
-/// endpoint — which the client fetches without an API key, mirroring an S3
-/// presigned URL — exposes a capability token rather than the raw key. The S3
-/// backend will replace this with a real presigned URL; the redirect contract is
-/// the same, which is why it can be validated against a stock client first.
-static DOWNLOADS: LazyLock<Mutex<HashMap<String, (String, std::time::Instant)>>> =
-    LazyLock::new(|| Mutex::new(HashMap::new()));
-
-/// How long a download token stays valid; the client follows the redirect
-/// immediately, so this only needs to outlast a slow hop.
-const DOWNLOAD_TTL: std::time::Duration = std::time::Duration::from_secs(600);
-
 #[derive(Clone)]
 struct PendingUpload {
-    /// The attachment item the bytes belong to (and the on-disk storage key).
+    /// The attachment item the bytes belong to (and the object key in the bucket).
     item_key: String,
     md5: String,
     filename: String,
     filesize: i64,
     mtime: i64,
+    /// Set once the bytes have been verified and stored, so registration can't
+    /// commit metadata for an object that was never uploaded.
+    uploaded: bool,
     created: std::time::Instant,
 }
 
@@ -99,9 +90,9 @@ fn upload_token() -> Option<String> {
 /// (the body is fully buffered by the auth middleware before handlers run).
 const MAX_BODY: usize = 256 * 1024 * 1024;
 
-/// Object/file keys become on-disk path components, so reject anything that
-/// isn't a plain alphanumeric token (no `/`, `.`, `..`) before it touches the
-/// filesystem. Zotero keys are 8 alphanumeric chars; allow a little slack.
+/// Item keys become object keys in the bucket (and path components in URLs), so
+/// reject anything that isn't a plain alphanumeric token (no `/`, `.`, `..`).
+/// Zotero keys are 8 alphanumeric chars; allow a little slack.
 fn valid_key(key: &str) -> bool {
     !key.is_empty() && key.len() <= 32 && key.bytes().all(|b| b.is_ascii_alphanumeric())
 }
@@ -112,6 +103,10 @@ fn cfg() -> &'static Config {
 
 fn pool() -> &'static PgPool {
     POOL.get().expect("pool initialised in main")
+}
+
+fn storage() -> &'static s3::Storage {
+    STORAGE.get().expect("storage initialised in main")
 }
 
 /// Access descriptor for the single configured user; no groups. `write` reflects
@@ -238,6 +233,11 @@ async fn groups() -> Response {
 
 fn server_error(context: &str, error: sqlx::Error) -> Response {
     tracing::error!(%error, context, "database error");
+    StatusCode::INTERNAL_SERVER_ERROR.into_response()
+}
+
+fn s3_error(context: &str, error: s3::S3Error) -> Response {
+    tracing::error!(%error, context, "object storage error");
     StatusCode::INTERNAL_SERVER_ERROR.into_response()
 }
 
@@ -633,10 +633,6 @@ async fn fulltext_write(headers: HeaderMap, body: Bytes) -> Response {
     }
 }
 
-fn file_path(item_key: &str) -> std::path::PathBuf {
-    std::path::Path::new(&cfg().storage_dir).join(item_key)
-}
-
 /// Attachment file endpoint. The same path serves both POST steps:
 /// authorisation (`md5`/`filename`/`filesize`/`mtime` form) and registration
 /// (`upload` form, after the bytes have been PUT to the upload URL).
@@ -648,7 +644,8 @@ async fn file_post(
     if !valid_key(&key) {
         return (StatusCode::BAD_REQUEST, "invalid item key").into_response();
     }
-    // Registration step: the client posts upload=<token> after PUTting the bytes.
+    // Registration step: the client posts upload=<token> after PUTting the bytes
+    // to the upload endpoint, which verified them and stored the object.
     if let Some(token) = form.get("upload") {
         let pending = PENDING.lock().unwrap().get(token).cloned();
         let Some(upload) = pending else {
@@ -657,28 +654,8 @@ async fn file_post(
         if upload.item_key != key {
             return (StatusCode::BAD_REQUEST, "upload token does not match item").into_response();
         }
-        // Verify the stored bytes against the authorized md5/filesize before
-        // committing, so corrupted or swapped bytes are never registered.
-        let bytes = match tokio::fs::read(file_path(&key)).await {
-            Ok(bytes) => bytes,
-            Err(_) => return (StatusCode::BAD_REQUEST, "no uploaded bytes").into_response(),
-        };
-        let actual_md5 = {
-            use md5::{Digest, Md5};
-            format!("{:x}", Md5::new().chain_update(&bytes).finalize())
-        };
-        if bytes.len() as i64 != upload.filesize || actual_md5 != upload.md5.to_lowercase() {
-            tracing::warn!(
-                key,
-                want_md5 = upload.md5,
-                got_md5 = actual_md5,
-                "uploaded bytes do not match authorization"
-            );
-            return (
-                StatusCode::BAD_REQUEST,
-                "uploaded bytes do not match md5/filesize",
-            )
-                .into_response();
+        if !upload.uploaded {
+            return (StatusCode::BAD_REQUEST, "no uploaded bytes").into_response();
         }
         return match store::register_file(
             pool(),
@@ -720,18 +697,23 @@ async fn file_post(
         Err(error) => return server_error("file auth", error),
     };
 
+    // md5 hex compares case-insensitively, matching the verification in
+    // upload_put (which lowercases) so dedup and replace agree on normalization.
     if if_none_match {
         // "Only if no file exists." Same md5 → already uploaded (dedup); a
         // different existing file → conflict.
         if let Some(existing) = &stored_md5 {
-            if *existing == md5 {
+            if existing.eq_ignore_ascii_case(&md5) {
                 return (current_headers().await, Json(json!({ "exists": 1 }))).into_response();
             }
             return conflict(store::current_version(pool()).await.unwrap_or(0));
         }
     } else if let Some(want) = &if_match {
         // "Only if the current md5 matches." Otherwise → conflict.
-        if stored_md5.as_deref() != Some(want.as_str()) {
+        if !stored_md5
+            .as_deref()
+            .is_some_and(|m| m.eq_ignore_ascii_case(want))
+        {
             return conflict(store::current_version(pool()).await.unwrap_or(0));
         }
     }
@@ -755,6 +737,7 @@ async fn file_post(
                     .and_then(|s| s.parse().ok())
                     .unwrap_or(0),
                 mtime: form.get("mtime").and_then(|s| s.parse().ok()).unwrap_or(0),
+                uploaded: false,
                 created: std::time::Instant::now(),
             },
         );
@@ -770,54 +753,64 @@ async fn file_post(
     .into_response()
 }
 
-/// Receive the raw attachment bytes for a pending upload token and store them at
-/// the token's item-key path. Rejects an unknown token.
+/// Receive the raw attachment bytes for a pending upload token, verify them
+/// against the authorized md5/filesize, and store the object in the bucket.
+/// Rejects an unknown token. Verifying here (where the bytes are in hand) keeps
+/// the integrity check server-side now that the bytes go straight to S3.
 async fn upload_put(Path(token): Path<String>, body: Bytes) -> Response {
-    let item_key = PENDING
-        .lock()
-        .unwrap()
-        .get(&token)
-        .map(|u| u.item_key.clone());
-    let Some(item_key) = item_key else {
+    let pending = PENDING.lock().unwrap().get(&token).cloned();
+    let Some(upload) = pending else {
         return (StatusCode::BAD_REQUEST, "unknown upload token").into_response();
     };
-    if let Err(error) = tokio::fs::create_dir_all(&cfg().storage_dir).await {
-        tracing::error!(%error, "create storage dir");
-        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    let actual_md5 = {
+        use md5::{Digest, Md5};
+        format!("{:x}", Md5::new().chain_update(&body).finalize())
+    };
+    if body.len() as i64 != upload.filesize || actual_md5 != upload.md5.to_lowercase() {
+        tracing::warn!(
+            key = upload.item_key,
+            want_md5 = upload.md5,
+            got_md5 = actual_md5,
+            "uploaded bytes do not match authorization"
+        );
+        return (
+            StatusCode::BAD_REQUEST,
+            "uploaded bytes do not match md5/filesize",
+        )
+            .into_response();
     }
-    match tokio::fs::write(file_path(&item_key), &body).await {
-        Ok(()) => StatusCode::CREATED.into_response(),
-        Err(error) => {
-            tracing::error!(%error, "store file");
-            StatusCode::INTERNAL_SERVER_ERROR.into_response()
-        }
+    if let Err(error) = storage()
+        .put(&upload.item_key, &body, "application/octet-stream")
+        .await
+    {
+        return s3_error("store file", error);
     }
+    // Mark the pending upload stored so registration can commit its metadata.
+    if let Some(u) = PENDING.lock().unwrap().get_mut(&token) {
+        u.uploaded = true;
+    }
+    StatusCode::CREATED.into_response()
 }
 
-/// The client reads md5/mtime from this response's headers (it does not follow
-/// the redirect automatically) and then downloads the bytes from `Location`.
+/// The client reads md5/mtime from this response's headers and then downloads
+/// the bytes from `Location` — a short-lived pre-signed GET URL pointing straight
+/// at the bucket, so the read path bypasses this server entirely (and the URL is
+/// an unguessable, expiring capability the client follows without an API key).
 async fn file_get(Path((_id, key)): Path<(String, String)>) -> Response {
+    if !valid_key(&key) {
+        return StatusCode::NOT_FOUND.into_response();
+    }
     let (md5, mtime) = match store::file_meta(pool(), &key).await {
         Ok(Some(meta)) => meta,
         Ok(None) => return StatusCode::NOT_FOUND.into_response(),
         Err(error) => return server_error("file meta", error),
     };
-    // Mint a capability token for the bytes so the unauthenticated download URL
-    // carries an unguessable token instead of the item key (pruning expired
-    // ones). The client follows this Location without an API key.
-    let Some(token) = upload_token() else {
-        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    let url = match storage().presign_get(&key).await {
+        Ok(url) => url,
+        Err(error) => return s3_error("presign download", error),
     };
-    {
-        let mut downloads = DOWNLOADS.lock().unwrap();
-        downloads.retain(|_, (_, created)| created.elapsed() < DOWNLOAD_TTL);
-        downloads.insert(token.clone(), (key.clone(), std::time::Instant::now()));
-    }
     let mut headers = HeaderMap::new();
-    headers.insert(
-        "location",
-        header_value(&format!("{}/files/{}", cfg().public_url, token)),
-    );
+    headers.insert("location", header_value(&url));
     headers.insert(
         "zotero-file-modification-time",
         header_value(&mtime.to_string()),
@@ -825,27 +818,6 @@ async fn file_get(Path((_id, key)): Path<(String, String)>) -> Response {
     headers.insert("zotero-file-md5", header_value(&md5));
     headers.insert("zotero-file-compressed", header_value("No"));
     (StatusCode::FOUND, headers).into_response()
-}
-
-/// Serve the raw attachment bytes the file_get redirect points at. The path
-/// component is the capability token file_get minted, not the item key; an
-/// unknown or expired token is a 404, so the bytes are reachable only through a
-/// freshly authorized download.
-async fn file_download(Path(token): Path<String>) -> Response {
-    let item_key = {
-        let downloads = DOWNLOADS.lock().unwrap();
-        match downloads.get(&token) {
-            Some((key, created)) if created.elapsed() < DOWNLOAD_TTL => key.clone(),
-            _ => return StatusCode::NOT_FOUND.into_response(),
-        }
-    };
-    if !valid_key(&item_key) {
-        return StatusCode::NOT_FOUND.into_response();
-    }
-    match tokio::fs::read(file_path(&item_key)).await {
-        Ok(bytes) => bytes.into_response(),
-        Err(_) => StatusCode::NOT_FOUND.into_response(),
-    }
 }
 
 // --- middleware -------------------------------------------------------------
@@ -905,7 +877,6 @@ async fn log_and_auth(req: Request, next: Next) -> Response {
     let is_bootstrap = (parts.method == axum::http::Method::POST && path == "/keys")
         || path.starts_with("/keys/sessions")
         || path.starts_with("/uploads")
-        || path.starts_with("/files")
         || path == "/login";
     if !is_bootstrap {
         let Some(access) = key_access(&parts.headers) else {
@@ -995,7 +966,6 @@ fn app() -> Router {
             get(file_get).post(file_post),
         )
         .route("/uploads/{key}", post(upload_put))
-        .route("/files/{key}", get(file_download))
         .route("/users/{id}/deleted", get(deleted))
         // Attachment uploads exceed the default 2 MiB extractor limit; raise it
         // to MAX_BODY (the middleware enforces the same bound while buffering).
@@ -1047,6 +1017,43 @@ fn load_keys() -> (HashMap<String, Access>, String) {
     )
 }
 
+/// Object storage settings from the environment. The access/secret keys prefer
+/// a file (`*_FILE`, a systemd credential) over the raw env var, which is
+/// visible in /proc — the same precedence as the API keys. `path_style` defaults
+/// on (required by RustFS/MinIO, accepted by R2); `region` defaults to `auto`
+/// (R2 ignores it). Defaults target a local RustFS for development.
+fn load_s3() -> s3::Config {
+    let from_file_or_env = |file: &str, var: &str| {
+        std::env::var(file)
+            .ok()
+            .map(|path| {
+                std::fs::read_to_string(&path)
+                    .unwrap_or_else(|e| panic!("read S3 key file {path}: {e}"))
+                    .trim()
+                    .to_string()
+            })
+            .or_else(|| std::env::var(var).ok())
+            .unwrap_or_default()
+    };
+    s3::Config {
+        endpoint: std::env::var("ZHOST_S3_ENDPOINT")
+            .unwrap_or_else(|_| "http://127.0.0.1:9000".into()),
+        region: std::env::var("ZHOST_S3_REGION").unwrap_or_else(|_| "auto".into()),
+        bucket: std::env::var("ZHOST_S3_BUCKET").unwrap_or_else(|_| "zotero".into()),
+        access_key: from_file_or_env("ZHOST_S3_ACCESS_KEY_FILE", "ZHOST_S3_ACCESS_KEY"),
+        secret_key: from_file_or_env("ZHOST_S3_SECRET_KEY_FILE", "ZHOST_S3_SECRET_KEY"),
+        path_style: std::env::var("ZHOST_S3_PATH_STYLE")
+            .map(|v| v != "false")
+            .unwrap_or(true),
+        // Short by default: the client follows the download redirect right away,
+        // so the URL needn't stay valid long (it is an unauthenticated capability).
+        presign_ttl: std::env::var("ZHOST_S3_PRESIGN_TTL")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(300),
+    }
+}
+
 #[tokio::main]
 async fn main() {
     tracing_subscriber::fmt()
@@ -1069,14 +1076,15 @@ async fn main() {
         database_url: std::env::var("ZHOST_DATABASE_URL")
             .or_else(|_| std::env::var("DATABASE_URL"))
             .unwrap_or_else(|_| "postgres://localhost/zhost".into()),
-        storage_dir: std::env::var("ZHOST_STORAGE_DIR")
-            .unwrap_or_else(|_| "/tmp/zhost-storage".into()),
+        s3: load_s3(),
     });
 
     let pool = store::connect(&cfg().database_url)
         .await
         .expect("connect to database");
     let _ = POOL.set(pool);
+
+    let _ = STORAGE.set(s3::Storage::new(&cfg().s3).expect("init object storage"));
 
     let listener = tokio::net::TcpListener::bind(&cfg().bind)
         .await

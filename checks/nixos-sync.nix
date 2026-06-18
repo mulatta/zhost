@@ -24,12 +24,34 @@ testPkgs.testers.runNixOSTest {
           readOnly = true;
         };
       };
+      # Attachment bytes go to the local RustFS standing in for S3/R2.
+      s3 = {
+        endpoint = "http://127.0.0.1:9000";
+        region = "us-east-1";
+        bucket = "zotero";
+        accessKeyFile = testPkgs.writeText "zhost-s3-access" "rustfsadmin";
+        secretKeyFile = testPkgs.writeText "zhost-s3-secret" "rustfsadmin";
+      };
     };
+
+    # RustFS: an S3-compatible store for the attachment upload/download paths.
+    systemd.services.rustfs = {
+      wantedBy = [ "multi-user.target" ];
+      before = [ "zhost.service" ];
+      serviceConfig = {
+        ExecStart = "${testPkgs.rustfs}/bin/rustfs --address 127.0.0.1:9000 --access-key rustfsadmin --secret-key rustfsadmin /var/lib/rustfs";
+        StateDirectory = "rustfs";
+        Restart = "on-failure";
+      };
+    };
+    systemd.services.zhost.after = [ "rustfs.service" ];
 
     environment.systemPackages = [
       testPkgs.curl
       testPkgs.jq
       testPkgs.gzip
+      # `mc` creates the bucket before the upload subtest.
+      testPkgs.minio-client
     ];
   };
 
