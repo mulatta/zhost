@@ -84,24 +84,24 @@ with subtest("a read-only key reads but cannot write"):
         http_code(
             f"-X POST {base}/users/1/items {readonly} "
             f"-H 'If-Unmodified-Since-Version: 0' "
-            f"-d '[{{\"key\":\"RONLY001\",\"itemType\":\"book\"}}]'"
+            f"-d '[{{\"key\":\"RDNLY222\",\"itemType\":\"book\"}}]'"
         )
         == "403"
     )
-    assert http_code(f"-X DELETE '{base}/users/1/items?itemKey=ITEM0001' {readonly}") == "403"
+    assert http_code(f"-X DELETE '{base}/users/1/items?itemKey=ITEM2223' {readonly}") == "403"
 
 with subtest("an item round-trips through write and read"):
     machine.succeed(
         f"curl -sf -X POST {base}/users/1/items {auth} "
         f"-H 'If-Unmodified-Since-Version: 0' "
-        f"-d '[{{\"key\":\"ITEM0001\",\"itemType\":\"book\",\"title\":\"t\"}}]' "
-        f"| jq -e '.successful.\"0\".key == \"ITEM0001\"'"
+        f"-d '[{{\"key\":\"ITEM2223\",\"itemType\":\"book\",\"title\":\"t\"}}]' "
+        f"| jq -e '.successful.\"0\".key == \"ITEM2223\"'"
     )
     machine.succeed(
-        f"curl -sf '{base}/users/1/items?format=versions&since=0' {auth} | jq -e '.ITEM0001'"
+        f"curl -sf '{base}/users/1/items?format=versions&since=0' {auth} | jq -e '.ITEM2223'"
     )
     machine.succeed(
-        f"curl -sf '{base}/users/1/items?itemKey=ITEM0001&format=json' {auth} "
+        f"curl -sf '{base}/users/1/items?itemKey=ITEM2223&format=json' {auth} "
         f"| jq -e '.[0].data.itemType == \"book\"'"
     )
 
@@ -120,9 +120,27 @@ with subtest("a write without If-Unmodified-Since-Version is rejected with 428")
     assert (
         http_code(
             f"-X POST {base}/users/1/items {auth} "
-            f"-d '[{{\"key\":\"NOPRECON\",\"itemType\":\"book\"}}]'"
+            f"-d '[{{\"key\":\"NPRECN22\",\"itemType\":\"book\"}}]'"
         )
         == "428"
+    )
+
+with subtest("a malformed object key is rejected with 400"):
+    # The client refuses keys outside the 8-char base32 alphabet (no 0/1/O),
+    # queuing them with "key is not valid"; reject them at the API instead.
+    for bad in ["HASOABC2", "HAS0ABC2", "SHORTKY", "TOOLONGKY", "lowercs2"]:
+        v = library_version()
+        assert (
+            http_code(
+                f"-X POST {base}/users/1/items {auth} "
+                f"-H 'If-Unmodified-Since-Version: {v}' "
+                f'-d \'[{{"key":"{bad}","itemType":"book"}}]\''
+            )
+            == "400"
+        ), bad
+    # The version did not move (nothing was written).
+    machine.succeed(
+        f"curl -sf '{base}/users/1/items?itemKey=HASOABC2&format=json' {auth} | jq -e '. == []'"
     )
 
 with subtest("an empty batch does not bump the library version"):
@@ -137,12 +155,12 @@ with subtest("attachment data is emitted with linkMode first"):
     machine.succeed(
         f"curl -sf -X POST {base}/users/1/items {auth} "
         f"-H 'If-Unmodified-Since-Version: {library_version()}' "
-        f"-d '[{{\"key\":\"ATTACH001\",\"itemType\":\"attachment\","
+        f"-d '[{{\"key\":\"ATTACH22\",\"itemType\":\"attachment\","
         f"\"linkMode\":\"imported_file\",\"filename\":\"t.pdf\","
         f"\"contentType\":\"application/pdf\"}}]' | jq -e .successful"
     )
     first_key = machine.succeed(
-        f"curl -sf '{base}/users/1/items?itemKey=ATTACH001&format=json' {auth} "
+        f"curl -sf '{base}/users/1/items?itemKey=ATTACH22&format=json' {auth} "
         f"| jq -r '.[0].data | keys_unsorted[0]'"
     ).strip()
     assert first_key == "linkMode", first_key
@@ -152,25 +170,25 @@ with subtest("an attachment file uploads to S3 and downloads via a presigned URL
     md5 = "5d41402abc4b2a76b9719d911017c592"
     # Authorization returns an unguessable upload token (not the item key).
     token = machine.succeed(
-        f"curl -sf -X POST {base}/users/1/items/ATTACH001/file {auth} "
+        f"curl -sf -X POST {base}/users/1/items/ATTACH22/file {auth} "
         f"-H 'If-None-Match: *' "
         f"-d 'md5={md5}&filename=t.pdf&filesize=5&mtime=1700000000000' "
         f"| jq -r .uploadKey"
     ).strip()
-    assert token and token != "ATTACH001", token
+    assert token and token != "ATTACH22", token
     # Bytes are POSTed to the token URL (zhost verifies them and PUTs to S3);
     # registration then commits via the token.
     machine.succeed(f"printf hello | curl -sf -X POST {base}/uploads/{token} --data-binary @-")
     machine.succeed(
-        f"curl -sf -X POST {base}/users/1/items/ATTACH001/file {auth} "
+        f"curl -sf -X POST {base}/users/1/items/ATTACH22/file {auth} "
         f"-H 'If-None-Match: *' -d 'upload={token}'"
     )
-    assert http_code(f"{base}/users/1/items/ATTACH001/file {auth}") == "302"
+    assert http_code(f"{base}/users/1/items/ATTACH22/file {auth}") == "302"
     # The 302 carries the md5/mtime headers and a Location that is a pre-signed
     # GET URL pointing straight at the S3 store; follow it (no API key) to read
     # the bytes, the way the stock client downloads from a presigned URL.
     location = machine.succeed(
-        f"curl -sf -D /tmp/dlhdr -o /dev/null {base}/users/1/items/ATTACH001/file {auth} "
+        f"curl -sf -D /tmp/dlhdr -o /dev/null {base}/users/1/items/ATTACH22/file {auth} "
         f"&& grep -i '^location:' /tmp/dlhdr | tr -d '\\r' | awk '{{print $2}}'"
     ).strip()
     machine.succeed(f"grep -iq 'zotero-file-md5: {md5}' /tmp/dlhdr")
@@ -180,7 +198,7 @@ with subtest("an attachment file uploads to S3 and downloads via a presigned URL
 
 with subtest("re-authorizing the same file returns exists:1 (dedup)"):
     machine.succeed(
-        f"curl -sf -X POST {base}/users/1/items/ATTACH001/file {auth} "
+        f"curl -sf -X POST {base}/users/1/items/ATTACH22/file {auth} "
         f"-H 'If-None-Match: *' "
         f"-d 'md5=5d41402abc4b2a76b9719d911017c592&filename=t.pdf&filesize=5&mtime=1700000000000' "
         f"| jq -e '.exists == 1'"
@@ -189,7 +207,7 @@ with subtest("re-authorizing the same file returns exists:1 (dedup)"):
 with subtest("a file authorization without a precondition header is 428"):
     assert (
         http_code(
-            f"-X POST {base}/users/1/items/ATTACH001/file {auth} "
+            f"-X POST {base}/users/1/items/ATTACH22/file {auth} "
             f"-d 'md5=deadbeef&filename=t.pdf&filesize=5&mtime=1'"
         )
         == "428"
@@ -199,7 +217,7 @@ with subtest("uploading bytes that do not match the declared md5 is rejected"):
     # Verification happens at the upload step now (the bytes go straight to S3),
     # so a mismatch is refused there rather than at registration.
     bad = machine.succeed(
-        f"curl -sf -X POST {base}/users/1/items/BADHASH01/file {auth} "
+        f"curl -sf -X POST {base}/users/1/items/BADHASH2/file {auth} "
         f"-H 'If-None-Match: *' -d 'md5=00000000000000000000000000000000&filename=b&filesize=5&mtime=1' "
         f"| jq -r .uploadKey"
     ).strip()
@@ -213,13 +231,13 @@ with subtest("registering without a prior upload is rejected"):
     # Authorize but never PUT the bytes, then try to register: the object was
     # never stored, so registration must refuse rather than commit metadata.
     tok = machine.succeed(
-        f"curl -sf -X POST {base}/users/1/items/NOUPLOAD/file {auth} "
+        f"curl -sf -X POST {base}/users/1/items/NQUPLQAD/file {auth} "
         f"-H 'If-None-Match: *' -d 'md5=5d41402abc4b2a76b9719d911017c592&filename=n&filesize=5&mtime=1' "
         f"| jq -r .uploadKey"
     ).strip()
     assert (
         http_code(
-            f"-X POST {base}/users/1/items/NOUPLOAD/file {auth} "
+            f"-X POST {base}/users/1/items/NQUPLQAD/file {auth} "
             f"-H 'If-None-Match: *' -d 'upload={tok}'"
         )
         == "400"
@@ -242,20 +260,20 @@ with subtest("annotations round-trip as ordinary items"):
     machine.succeed(
         f"curl -sf -X POST {base}/users/1/items {auth} "
         f"-H 'If-Unmodified-Since-Version: {library_version()}' "
-        f"-d '[{{\"key\":\"ANNOT001\",\"itemType\":\"annotation\","
+        f"-d '[{{\"key\":\"ANNQT223\",\"itemType\":\"annotation\","
         f"\"annotationType\":\"highlight\",\"annotationText\":\"marked\","
-        f"\"parentItem\":\"ATTACH001\"}}]' "
+        f"\"parentItem\":\"ATTACH22\"}}]' "
         f"| jq -e '.successful.\"0\".data.annotationText == \"marked\"'"
     )
     machine.succeed(
-        f"curl -sf '{base}/users/1/items?itemKey=ANNOT001&format=json' {auth} "
+        f"curl -sf '{base}/users/1/items?itemKey=ANNQT223&format=json' {auth} "
         f"| jq -e '.[0].data.annotationType == \"highlight\"'"
     )
     # Like linkMode, annotationType must be emitted first: the client's fromJSON
     # rejects an annotation ("annotationType must be set before other annotation
     # properties") if it sees other annotation* fields first.
     first_key = machine.succeed(
-        f"curl -sf '{base}/users/1/items?itemKey=ANNOT001&format=json' {auth} "
+        f"curl -sf '{base}/users/1/items?itemKey=ANNQT223&format=json' {auth} "
         f"| jq -r '.[0].data | keys_unsorted[0]'"
     ).strip()
     assert first_key == "annotationType", first_key
@@ -265,25 +283,25 @@ with subtest("full-text content uploads, lists versions, and downloads"):
     machine.succeed(
         f"curl -sf -X POST {base}/users/1/fulltext {auth} "
         f"-H 'If-Unmodified-Since-Version: {version}' "
-        f"-d '[{{\"key\":\"ATTACH001\",\"content\":\"hello world\","
+        f"-d '[{{\"key\":\"ATTACH22\",\"content\":\"hello world\","
         f"\"indexedChars\":11,\"totalChars\":11,\"indexedPages\":1,\"totalPages\":1}}]' "
-        f"| jq -e '.successful.\"0\".key == \"ATTACH001\"'"
+        f"| jq -e '.successful.\"0\".key == \"ATTACH22\"'"
     )
     machine.succeed(
-        f"curl -sf '{base}/users/1/fulltext?format=versions&since=0' {auth} | jq -e '.ATTACH001'"
+        f"curl -sf '{base}/users/1/fulltext?format=versions&since=0' {auth} | jq -e '.ATTACH22'"
     )
     # The per-item version must equal the value in the versions map, else the
     # client re-downloads content it already holds every sync.
     item_v = machine.succeed(
-        f"curl -sf -D - -o /dev/null '{base}/users/1/items/ATTACH001/fulltext' {auth} "
+        f"curl -sf -D - -o /dev/null '{base}/users/1/items/ATTACH22/fulltext' {auth} "
         f"| grep -i last-modified-version | tr -d '\\r' | cut -d' ' -f2"
     ).strip()
     list_v = machine.succeed(
-        f"curl -sf '{base}/users/1/fulltext?format=versions&since=0' {auth} | jq -r '.ATTACH001'"
+        f"curl -sf '{base}/users/1/fulltext?format=versions&since=0' {auth} | jq -r '.ATTACH22'"
     ).strip()
     assert item_v == list_v, f"{item_v} != {list_v}"
     machine.succeed(
-        f"curl -sf '{base}/users/1/items/ATTACH001/fulltext' {auth} "
+        f"curl -sf '{base}/users/1/items/ATTACH22/fulltext' {auth} "
         f"| jq -e '.content == \"hello world\" and .totalPages == 1'"
     )
 
@@ -292,7 +310,7 @@ with subtest("a stale full-text write is rejected with 412"):
         http_code(
             f"-X POST {base}/users/1/fulltext {auth} "
             f"-H 'If-Unmodified-Since-Version: 0' "
-            f"-d '[{{\"key\":\"ATTACH001\",\"content\":\"x\"}}]'"
+            f"-d '[{{\"key\":\"ATTACH22\",\"content\":\"x\"}}]'"
         )
         == "412"
     )
@@ -303,10 +321,10 @@ with subtest("the query API filters, searches, sorts and paginates items"):
     machine.succeed(
         f"curl -sf -X POST {base}/users/1/items {auth} "
         f"-H 'If-Unmodified-Since-Version: {version}' "
-        f'-d \'[{{"key":"QBOOK001","itemType":"book","title":"Borrow Checker",'
+        f'-d \'[{{"key":"QBQQK223","itemType":"book","title":"Borrow Checker",'
         f'"creators":[{{"lastName":"Klabnik","firstName":"Steve"}}],'
         f'"tags":[{{"tag":"rustlang"}},{{"tag":"systems"}}]}},'
-        f'{{"key":"QART0001","itemType":"journalArticle","title":"Unrelated",'
+        f'{{"key":"QART2223","itemType":"journalArticle","title":"Unrelated",'
         f'"tags":[{{"tag":"rustlang"}}]}}]\' | jq -e .successful'
     )
 
@@ -316,18 +334,18 @@ with subtest("the query API filters, searches, sorts and paginates items"):
         ).strip()
 
     # Title and creator search (titleCreatorYear, the default qmode).
-    assert keys("q=borrow") == "QBOOK001", keys("q=borrow")
-    assert keys("q=klabnik") == "QBOOK001", keys("q=klabnik")
+    assert keys("q=borrow") == "QBQQK223", keys("q=borrow")
+    assert keys("q=klabnik") == "QBQQK223", keys("q=klabnik")
     # Type filter, including negation.
-    assert "QBOOK001" in keys("itemType=book")
-    assert "QART0001" not in keys("itemType=book")
-    assert "QART0001" in keys("itemType=-book")
+    assert "QBQQK223" in keys("itemType=book")
+    assert "QART2223" not in keys("itemType=book")
+    assert "QART2223" in keys("itemType=-book")
     # Tags: repeated key is AND, only the book carries both.
-    assert keys("tag=rustlang&tag=systems") == "QBOOK001"
-    assert keys("tag=rustlang") == "QART0001,QBOOK001"
-    # Full-text only matches under qmode=everything (ATTACH001 holds "hello world").
+    assert keys("tag=rustlang&tag=systems") == "QBQQK223"
+    assert keys("tag=rustlang") == "QART2223,QBQQK223"
+    # Full-text only matches under qmode=everything (ATTACH22 holds "hello world").
     assert keys("q=world") == ""
-    assert keys("q=world&qmode=everything") == "ATTACH001"
+    assert keys("q=world&qmode=everything") == "ATTACH22"
 
 with subtest("the query API reports Total-Results and a next-page Link"):
     # Header names come back lower-cased over HTTP/1.1, so match case-insensitively.
@@ -349,10 +367,10 @@ with subtest("convenience listings: top, trash, collection items and tags"):
     machine.succeed(
         f"curl -sf -X POST {base}/users/1/items {auth} "
         f"-H 'If-Unmodified-Since-Version: {version}' "
-        f'-d \'[{{"key":"TOPITEM1","itemType":"book","title":"Shelf Book",'
-        f'"collections":["COLLXXXX"],"tags":[{{"tag":"shelf"}}]}},'
-        f'{{"key":"CHILDNO1","itemType":"note","note":"child","parentItem":"TOPITEM1"}},'
-        f'{{"key":"TRASHED1","itemType":"book","title":"Gone","deleted":1}}]\' '
+        f'-d \'[{{"key":"TQPITEM3","itemType":"book","title":"Shelf Book",'
+        f'"collections":["CQLLXXXX"],"tags":[{{"tag":"shelf"}}]}},'
+        f'{{"key":"CHILDNQ3","itemType":"note","note":"child","parentItem":"TQPITEM3"}},'
+        f'{{"key":"TRASHED3","itemType":"book","title":"Gone","deleted":1}}]\' '
         f"| jq -e .successful"
     )
 
@@ -363,14 +381,14 @@ with subtest("convenience listings: top, trash, collection items and tags"):
 
     # Top excludes children (have parentItem) and trashed items.
     top = path_keys("/users/1/items/top")
-    assert "TOPITEM1" in top, top
-    assert "CHILDNO1" not in top, top
-    assert "TRASHED1" not in top, top
+    assert "TQPITEM3" in top, top
+    assert "CHILDNQ3" not in top, top
+    assert "TRASHED3" not in top, top
     # Trash returns only trashed items.
     trash = path_keys("/users/1/items/trash")
-    assert trash == "TRASHED1", trash
+    assert trash == "TRASHED3", trash
     # Collection membership.
-    assert path_keys("/users/1/collections/COLLXXXX/items") == "TOPITEM1"
+    assert path_keys("/users/1/collections/CQLLXXXX/items") == "TQPITEM3"
     # Tags lists distinct tags with counts; the trashed item's tag is excluded.
     machine.succeed(
         f"curl -sf {base}/users/1/tags {auth} "
@@ -384,21 +402,21 @@ with subtest("top filtering covers parentItem:false and the versions view"):
     machine.succeed(
         f"curl -sf -X POST {base}/users/1/items {auth} "
         f"-H 'If-Unmodified-Since-Version: {version}' "
-        f'-d \'[{{"key":"TOPFALS1","itemType":"book","title":"pf",'
+        f'-d \'[{{"key":"TQPFALS3","itemType":"book","title":"pf",'
         f'"parentItem":false}}]\' | jq -e .successful'
     )
     # parentItem:false is treated as top-level.
     top = machine.succeed(
         f"curl -sf '{base}/users/1/items/top' {auth} | jq -r '[.[].key]|join(\"\\n\")'"
     )
-    assert "TOPFALS1" in top, top
-    # /items/top?format=versions returns only top-level keys; the child CHILDNO1
+    assert "TQPFALS3" in top, top
+    # /items/top?format=versions returns only top-level keys; the child CHILDNQ3
     # (from the previous subtest) appears in the full versions map but not here.
     top_v = machine.succeed(
-        f"curl -sf '{base}/users/1/items/top?format=versions&since=0' {auth} | jq -e 'has(\"CHILDNO1\")|not'"
+        f"curl -sf '{base}/users/1/items/top?format=versions&since=0' {auth} | jq -e 'has(\"CHILDNQ3\")|not'"
     )
     machine.succeed(
-        f"curl -sf '{base}/users/1/items?format=versions&since=0' {auth} | jq -e '.CHILDNO1'"
+        f"curl -sf '{base}/users/1/items?format=versions&since=0' {auth} | jq -e '.CHILDNQ3'"
     )
 
 with subtest("malformed (non-array) item data does not 500 the query API"):
@@ -408,7 +426,7 @@ with subtest("malformed (non-array) item data does not 500 the query API"):
     machine.succeed(
         f"curl -sf -X POST {base}/users/1/items {auth} "
         f"-H 'If-Unmodified-Since-Version: {version}' "
-        f'-d \'[{{"key":"MALFORM1","itemType":"book","title":"weird",'
+        f'-d \'[{{"key":"MALFQRM3","itemType":"book","title":"weird",'
         f'"creators":"notarray","tags":"x","collections":"y"}}]\' | jq -e .successful'
     )
     assert http_code(f"{base}/users/1/tags {auth}") == "200"
@@ -423,7 +441,7 @@ with subtest("malformed (non-array) item data does not 500 the query API"):
     machine.succeed(
         f"curl -sf -X POST {base}/users/1/items {auth} "
         f"-H 'If-Unmodified-Since-Version: {version}' "
-        f'-d \'[{{"key":"BADTAGS1","itemType":"book","title":"bt",'
+        f'-d \'[{{"key":"BADTAGS3","itemType":"book","title":"bt",'
         f'"tags":[{{"tag":"good"}},123,"junk"]}}]\' | jq -e .successful'
     )
     machine.succeed(
@@ -448,9 +466,9 @@ with subtest("query API: OR filters, descending sort and includeTrashed"):
     machine.succeed(
         f"curl -sf -X POST {base}/users/1/items {auth} "
         f"-H 'If-Unmodified-Since-Version: {version}' "
-        f'-d \'[{{"key":"COVRA001","itemType":"book","title":"Aaa","tags":[{{"tag":"aa"}}]}},'
-        f'{{"key":"COVRB001","itemType":"journalArticle","title":"Bbb","tags":[{{"tag":"bb"}}]}},'
-        f'{{"key":"COVRT001","itemType":"book","title":"Ccc","deleted":1,'
+        f'-d \'[{{"key":"CQVRA223","itemType":"book","title":"Aaa","tags":[{{"tag":"aa"}}]}},'
+        f'{{"key":"CQVRB223","itemType":"journalArticle","title":"Bbb","tags":[{{"tag":"bb"}}]}},'
+        f'{{"key":"CQVRT223","itemType":"book","title":"Ccc","deleted":1,'
         f'"tags":[{{"tag":"aa"}}]}}]\' | jq -e .successful'
     )
 
@@ -466,23 +484,23 @@ with subtest("query API: OR filters, descending sort and includeTrashed"):
 
     # `||` is OR for both tag and itemType.
     both = kset("tag=aa||bb&itemType=book||journalArticle")
-    assert "COVRA001" in both and "COVRB001" in both, both
+    assert "CQVRA223" in both and "CQVRB223" in both, both
     # Descending title sort: Bbb before Aaa, trashed Ccc excluded by default.
-    assert first("tag=aa||bb&sort=title&direction=desc") == "COVRB001"
+    assert first("tag=aa||bb&sort=title&direction=desc") == "CQVRB223"
     # includeTrashed surfaces the trashed item (Ccc sorts first descending).
-    assert first("tag=aa&sort=title&direction=desc&includeTrashed=1") == "COVRT001"
-    assert "COVRT001" not in kset("tag=aa")
+    assert first("tag=aa&sort=title&direction=desc&includeTrashed=1") == "CQVRT223"
+    assert "CQVRT223" not in kset("tag=aa")
 
 with subtest("sort=date orders by extracted year, not raw freeform text"):
     version = library_version()
     machine.succeed(
         f"curl -sf -X POST {base}/users/1/items {auth} "
         f"-H 'If-Unmodified-Since-Version: {version}' "
-        f'-d \'[{{"key":"DATE0OLD","itemType":"book","title":"old","date":"circa 1850",'
+        f'-d \'[{{"key":"DATE2QLD","itemType":"book","title":"old","date":"circa 1850",'
         f'"tags":[{{"tag":"era"}}]}},'
-        f'{{"key":"DATE0MID","itemType":"book","title":"mid","date":"January 1960",'
+        f'{{"key":"DATE2MID","itemType":"book","title":"mid","date":"January 1960",'
         f'"tags":[{{"tag":"era"}}]}},'
-        f'{{"key":"DATE0NEW","itemType":"book","title":"new","date":"2020-05-01",'
+        f'{{"key":"DATE2NEW","itemType":"book","title":"new","date":"2020-05-01",'
         f'"tags":[{{"tag":"era"}}]}}]\' | jq -e .successful'
     )
     # Ascending by year: 1850 < 1960 < 2020, despite the leading-character order
@@ -491,18 +509,18 @@ with subtest("sort=date orders by extracted year, not raw freeform text"):
         f"curl -sf '{base}/users/1/items?tag=era&sort=date&direction=asc' {auth} "
         f"| jq -r '[.[].key]|join(\",\")'"
     ).strip()
-    assert order == "DATE0OLD,DATE0MID,DATE0NEW", order
+    assert order == "DATE2QLD,DATE2MID,DATE2NEW", order
 
 with subtest("collection top items are served as a plain-text key list"):
     # The sync client fetches collections/<key>/items/top?format=keys when
     # restoring a deleted collection, parsing the body as newline-split keys.
-    # TOPITEM1 (top, in COLLXXXX) was created by the convenience-listings subtest.
+    # TQPITEM3 (top, in CQLLXXXX) was created by the convenience-listings subtest.
     body = machine.succeed(
-        f"curl -sf '{base}/users/1/collections/COLLXXXX/items/top?format=keys' {auth}"
+        f"curl -sf '{base}/users/1/collections/CQLLXXXX/items/top?format=keys' {auth}"
     ).strip()
-    assert body == "TOPITEM1", repr(body)
+    assert body == "TQPITEM3", repr(body)
     headers = machine.succeed(
-        f"curl -sf -D - -o /dev/null '{base}/users/1/collections/COLLXXXX/items/top?format=keys' {auth}"
+        f"curl -sf -D - -o /dev/null '{base}/users/1/collections/CQLLXXXX/items/top?format=keys' {auth}"
     ).lower()
     # Plain text (not JSON) plus a version header for the client's 304 handling.
     assert "content-type: text/plain" in headers, headers
@@ -538,37 +556,37 @@ with subtest("collections round-trip through write, read, versions and delete"):
     machine.succeed(
         f"curl -sf -X POST {base}/users/1/collections {auth} "
         f"-H 'If-Unmodified-Since-Version: {library_version()}' "
-        f'-d \'[{{"key":"COLL0001","name":"Papers"}}]\' '
-        f"| jq -e '.successful.\"0\".key == \"COLL0001\"'"
+        f'-d \'[{{"key":"CQLL2223","name":"Papers"}}]\' '
+        f"| jq -e '.successful.\"0\".key == \"CQLL2223\"'"
     )
     machine.succeed(
-        f"curl -sf '{base}/users/1/collections?collectionKey=COLL0001&format=json' {auth} "
+        f"curl -sf '{base}/users/1/collections?collectionKey=CQLL2223&format=json' {auth} "
         f"| jq -e '.[0].data.name == \"Papers\"'"
     )
     machine.succeed(
-        f"curl -sf '{base}/users/1/collections?format=versions&since=0' {auth} | jq -e '.COLL0001'"
+        f"curl -sf '{base}/users/1/collections?format=versions&since=0' {auth} | jq -e '.CQLL2223'"
     )
-    machine.succeed(f"curl -sf -X DELETE '{base}/users/1/collections?collectionKey=COLL0001' {auth} "
+    machine.succeed(f"curl -sf -X DELETE '{base}/users/1/collections?collectionKey=CQLL2223' {auth} "
                     f"-H 'If-Unmodified-Since-Version: {library_version()}'")
     machine.succeed(
-        f"curl -sf '{base}/users/1/deleted?since=0' {auth} | jq -e '.collections | index(\"COLL0001\")'"
+        f"curl -sf '{base}/users/1/deleted?since=0' {auth} | jq -e '.collections | index(\"CQLL2223\")'"
     )
 
 with subtest("saved searches round-trip through write, read and delete"):
     machine.succeed(
         f"curl -sf -X POST {base}/users/1/searches {auth} "
         f"-H 'If-Unmodified-Since-Version: {library_version()}' "
-        f'-d \'[{{"key":"SRCH0001","name":"Recent","conditions":[]}}]\' '
-        f"| jq -e '.successful.\"0\".key == \"SRCH0001\"'"
+        f'-d \'[{{"key":"SRCH2223","name":"Recent","conditions":[]}}]\' '
+        f"| jq -e '.successful.\"0\".key == \"SRCH2223\"'"
     )
     machine.succeed(
-        f"curl -sf '{base}/users/1/searches?searchKey=SRCH0001&format=json' {auth} "
+        f"curl -sf '{base}/users/1/searches?searchKey=SRCH2223&format=json' {auth} "
         f"| jq -e '.[0].data.name == \"Recent\"'"
     )
-    machine.succeed(f"curl -sf -X DELETE '{base}/users/1/searches?searchKey=SRCH0001' {auth} "
+    machine.succeed(f"curl -sf -X DELETE '{base}/users/1/searches?searchKey=SRCH2223' {auth} "
                     f"-H 'If-Unmodified-Since-Version: {library_version()}'")
     machine.succeed(
-        f"curl -sf '{base}/users/1/deleted?since=0' {auth} | jq -e '.searches | index(\"SRCH0001\")'"
+        f"curl -sf '{base}/users/1/deleted?since=0' {auth} | jq -e '.searches | index(\"SRCH2223\")'"
     )
 
 with subtest("settings round-trip through write, read and delete"):
@@ -602,13 +620,13 @@ with subtest("settings round-trip through write, read and delete"):
 with subtest("a gzip-compressed write body is decoded"):
     # The real client gzips write bodies; exercise the decompression middleware.
     machine.succeed(
-        f"printf '%s' '[{{\"key\":\"GZIP0001\",\"itemType\":\"book\",\"title\":\"zipped\"}}]' "
+        f"printf '%s' '[{{\"key\":\"GZIP2223\",\"itemType\":\"book\",\"title\":\"zipped\"}}]' "
         f"| gzip | curl -sf -X POST {base}/users/1/items {auth} "
         f"-H 'If-Unmodified-Since-Version: {library_version()}' "
         f"-H 'Content-Encoding: gzip' --data-binary @- | jq -e .successful"
     )
     machine.succeed(
-        f"curl -sf '{base}/users/1/items?itemKey=GZIP0001&format=json' {auth} "
+        f"curl -sf '{base}/users/1/items?itemKey=GZIP2223&format=json' {auth} "
         f"| jq -e '.[0].data.title == \"zipped\"'"
     )
 
@@ -616,7 +634,7 @@ with subtest("PATCH updates items and is gated by the read-only key"):
     machine.succeed(
         f"curl -sf -X PATCH {base}/users/1/items {auth} "
         f"-H 'If-Unmodified-Since-Version: {library_version()}' "
-        f'-d \'[{{"key":"GZIP0001","itemType":"book","title":"patched"}}]\' '
+        f'-d \'[{{"key":"GZIP2223","itemType":"book","title":"patched"}}]\' '
         f"| jq -e '.successful.\"0\".data.title == \"patched\"'"
     )
     assert (
@@ -670,9 +688,9 @@ with subtest("POST also merges: a partial upload keeps unspecified fields"):
 
 with subtest("deletes are recorded in the deletion log"):
     machine.succeed(
-        f"curl -sf -X DELETE '{base}/users/1/items?itemKey=ITEM0001' {auth} "
+        f"curl -sf -X DELETE '{base}/users/1/items?itemKey=ITEM2223' {auth} "
         f"-H 'If-Unmodified-Since-Version: {library_version()}'"
     )
     machine.succeed(
-        f"curl -sf '{base}/users/1/deleted?since=0' {auth} | jq -e '.items | index(\"ITEM0001\")'"
+        f"curl -sf '{base}/users/1/deleted?since=0' {auth} | jq -e '.items | index(\"ITEM2223\")'"
     )
