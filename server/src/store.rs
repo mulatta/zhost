@@ -26,30 +26,36 @@ fn object_json(row: PgRow) -> Value {
     serde_json::json!({
         "key": row.get::<String, _>("key"),
         "version": row.get::<i64, _>("version"),
-        "data": linkmode_first(row.get::<Value, _>("data")),
+        "data": order_fields(row.get::<Value, _>("data")),
     })
 }
 
 /// Single user, single personal library.
 const LIBRARY_ID: i64 = 1;
 
-/// Zotero's attachment `fromJSON` processes fields in object order and requires
-/// `linkMode` before `filename`/`path`. jsonb storage sorts keys alphabetically
-/// (filename < linkMode), so re-emit attachment data with linkMode first. Relies
-/// on serde_json's preserve_order feature.
-fn linkmode_first(data: Value) -> Value {
+/// Zotero's `fromJSON` processes fields in object order and requires a
+/// discriminator field first: an attachment needs `linkMode` before
+/// `filename`/`path` ("Link mode must be set before setting attachment path"),
+/// and an annotation needs `annotationType` before its other `annotation*` fields
+/// ("annotationType must be set before other annotation properties"). jsonb
+/// storage sorts keys alphabetically, putting both after their dependents, so
+/// re-emit them first. Relies on serde_json's preserve_order feature.
+fn order_fields(data: Value) -> Value {
+    const FIRST: [&str; 2] = ["annotationType", "linkMode"];
     let Value::Object(map) = &data else {
         return data;
     };
-    if !map.contains_key("linkMode") {
+    if !FIRST.iter().any(|k| map.contains_key(*k)) {
         return data;
     }
     let mut ordered = Map::new();
-    if let Some(link_mode) = map.get("linkMode") {
-        ordered.insert("linkMode".into(), link_mode.clone());
+    for key in FIRST {
+        if let Some(value) = map.get(key) {
+            ordered.insert(key.to_string(), value.clone());
+        }
     }
     for (key, value) in map {
-        if key != "linkMode" {
+        if !FIRST.contains(&key.as_str()) {
             ordered.insert(key.clone(), value.clone());
         }
     }
@@ -387,7 +393,7 @@ pub async fn write(
             .await?;
         successful.insert(
             index.to_string(),
-            serde_json::json!({ "key": key, "version": version, "data": linkmode_first(object) }),
+            serde_json::json!({ "key": key, "version": version, "data": order_fields(object) }),
         );
     }
     tx.commit().await?;

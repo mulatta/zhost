@@ -284,8 +284,11 @@ rows, so conditional version checks are atomic.
 
 ## Resolved by live testing
 
-- `data` JSON shape: stored opaquely and round-tripped verbatim; only attachment
-  field order matters (linkMode first, see above).
+- `data` JSON shape: stored opaquely and round-tripped verbatim; only the
+  discriminator field order matters — `linkMode` first for attachments,
+  `annotationType` first for annotations (the server re-emits both first, since
+  jsonb sorts keys alphabetically and the client's `fromJSON` requires them
+  before the fields that depend on them).
 - `Zotero-Write-Token` is not required — the client never sends it; the
   `If-Unmodified-Since-Version` → 412 guard is sufficient.
 - `mtime` is in milliseconds.
