@@ -251,6 +251,14 @@ with subtest("annotations round-trip as ordinary items"):
         f"curl -sf '{base}/users/1/items?itemKey=ANNOT001&format=json' {auth} "
         f"| jq -e '.[0].data.annotationType == \"highlight\"'"
     )
+    # Like linkMode, annotationType must be emitted first: the client's fromJSON
+    # rejects an annotation ("annotationType must be set before other annotation
+    # properties") if it sees other annotation* fields first.
+    first_key = machine.succeed(
+        f"curl -sf '{base}/users/1/items?itemKey=ANNOT001&format=json' {auth} "
+        f"| jq -r '.[0].data | keys_unsorted[0]'"
+    ).strip()
+    assert first_key == "annotationType", first_key
 
 with subtest("full-text content uploads, lists versions, and downloads"):
     version = library_version()
