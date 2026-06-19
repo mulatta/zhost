@@ -121,8 +121,12 @@ A monotonic **library version** counter. Every write that changes the library
 bumps it; the new value is returned in `Last-Modified-Version`. Each object also
 carries its own `version` (the library version at which it last changed).
 
-- **Reads** with `since=<v>` (and `If-Modified-Since-Version: <v>`): return only
-  objects with `version > v`; `304 Not Modified` if nothing changed.
+- **Reads** with `since=<v>` return only objects with `version > v` — `200` with
+  the (possibly empty `{}`) map plus `Last-Modified-Version`, **never `304`**. The
+  client's `getVersions` sends no `If-Modified-Since-Version` header and treats a
+  `304` as "no data", which then mismatches its library-version check and loops
+  the sync. `304` is reserved for requests that *do* send the
+  `If-Modified-Since-Version` header (settings), which the client handles.
 - **Writes** send `If-Unmodified-Since-Version: <clientLibraryVersion>`. If the
   server's library version is greater → `412 Precondition Failed`. The client
   then restarts the sync from the top. (syncAPIClient.js:1019)
@@ -140,7 +144,7 @@ carries its own `version` (the library version at which it last changed).
 |---|---|
 | `GET <prefix>/settings?since=<v>` (`If-Modified-Since-Version`) | `200` `{settingKey: {value: ...}}` or `304`. (syncAPIClient.js:118) |
 | `GET <prefix>/deleted?since=<v>` | `200` `{collections:[keys], searches:[keys], items:[keys], tags:[{tag,type}]}`. `409` if `since` precedes the delete-log start. (syncAPIClient.js:151) |
-| `GET <prefix>/{collections,searches,items}?format=versions&since=<v>` (items also `includeTrashed=1`, optional `?top` via `items/top`) | `200` `{key: version}` or `304`. (syncAPIClient.js:213) |
+| `GET <prefix>/{collections,searches,items}?format=versions&since=<v>` (items also `includeTrashed=1`, optional `?top` via `items/top`) | `200` `{key: version}` (empty `{}` if none) + `Last-Modified-Version`; **never `304`** (getVersions sends no header and loops on a 304). (syncAPIClient.js:213) |
 | `GET <prefix>/{collections,searches,items}?{objectKey}=k1,k2,...&format=json` | `200` array of `{key, version, data}`. Client batches ≤100 keys/request. (syncAPIClient.js:269) |
 | `GET <prefix>/fulltext?format=versions&since=<v>` | `200` `{itemKey: version}`. (syncAPIClient.js:462) |
 | `GET <prefix>/items/<key>/fulltext` | `200` `{indexedChars, totalChars, indexedPages, totalPages, content}` or `404`. The `Last-Modified-Version` here **must equal** that item's value in the versions map above (it is the row's own version, not the current library version); otherwise the client re-downloads content it already holds every sync. (syncAPIClient.js:484, syncFullTextEngine.js:91) |

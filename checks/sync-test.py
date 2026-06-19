@@ -508,17 +508,31 @@ with subtest("collection top items are served as a plain-text key list"):
     assert "content-type: text/plain" in headers, headers
     assert "last-modified-version:" in headers, headers
 
-with subtest("a since read returns 304 Not Modified when nothing is newer"):
+with subtest("a versions read with nothing newer returns 200 + empty map, not 304"):
     v = library_version()
-    assert http_code(f"'{base}/users/1/items?format=versions&since={v}' {auth}") == "304"
-    assert http_code(f"'{base}/users/1/fulltext?format=versions&since={v}' {auth}") == "304"
-    assert http_code(f"'{base}/users/1/settings?since={v}' {auth}") == "304"
-    # settings also honours the If-Modified-Since-Version header (no since param).
+    # format=versions reads must NOT 304: the client's getVersions sends no
+    # If-Modified-Since-Version header and treats a 304 as "no data", which then
+    # mismatches its library-version check and loops the sync forever. Return 200
+    # with an empty {} map plus the version header instead.
+    for path in [
+        f"items?format=versions&since={v}",
+        f"items/top?format=versions&since={v}",
+        f"collections?format=versions&since={v}",
+        f"searches?format=versions&since={v}",
+        f"fulltext?format=versions&since={v}",
+    ]:
+        assert http_code(f"'{base}/users/1/{path}' {auth}") == "200", path
+        machine.succeed(f"curl -sf '{base}/users/1/{path}' {auth} | jq -e '. == {{}}'")
+    # The version header is still present so the client keeps tracking the library version.
+    machine.succeed(
+        f"curl -sf -D - -o /dev/null '{base}/users/1/items?format=versions&since={v}' {auth} "
+        f"| grep -iq 'last-modified-version: {v}'"
+    )
+    # settings still 304s — getSettings sends the If-Modified-Since-Version header
+    # and handles a 304 itself.
     assert (
         http_code(f"{base}/users/1/settings -H 'If-Modified-Since-Version: {v}' {auth}") == "304"
     )
-    # The initial pull (since=0) is never 304.
-    assert http_code(f"'{base}/users/1/items?format=versions&since=0' {auth}") == "200"
 
 with subtest("collections round-trip through write, read, versions and delete"):
     machine.succeed(

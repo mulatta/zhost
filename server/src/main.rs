@@ -393,10 +393,12 @@ fn csv_of(params: &HashMap<String, String>, key: &str) -> Vec<String> {
 async fn read(kind: &str, params: HashMap<String, String>) -> Response {
     if params.get("format").map(String::as_str) == Some("versions") {
         let since = since_of(&params);
-        let (current, fresh) = since_check(since).await;
-        if fresh {
-            return (StatusCode::NOT_MODIFIED, version_headers(current)).into_response();
-        }
+        // Always 200 with the (possibly empty) versions map. The client's
+        // `getVersions` sends no `If-Modified-Since-Version` header and treats a
+        // 304 as "no data", which then mismatches its library-version check and
+        // makes it restart the sync forever. 304 is only for the header path
+        // (settings), not for `?since=` versions reads.
+        let current = store::current_version(pool()).await.unwrap_or(0);
         return match store::versions(pool(), kind, since).await {
             Ok(value) => (version_headers(current), Json(value)).into_response(),
             Err(error) => server_error("read", error),
@@ -419,10 +421,8 @@ async fn item_sync_read(params: &query::Params, top: bool) -> Option<Response> {
             .get("since")
             .and_then(|s| s.parse().ok())
             .unwrap_or(0);
-        let (current, fresh) = since_check(since).await;
-        if fresh {
-            return Some((StatusCode::NOT_MODIFIED, version_headers(current)).into_response());
-        }
+        // Always 200 + map (never 304); see `read` — a 304 here loops the client.
+        let current = store::current_version(pool()).await.unwrap_or(0);
         let result = if top {
             store::top_versions(pool(), since).await
         } else {
@@ -687,10 +687,8 @@ async fn deleted(Query(params): Query<HashMap<String, String>>) -> Response {
 /// changed after `since`, so the client downloads only what it lacks.
 async fn fulltext_versions(Query(params): Query<HashMap<String, String>>) -> Response {
     let since = since_of(&params);
-    let (current, fresh) = since_check(since).await;
-    if fresh {
-        return (StatusCode::NOT_MODIFIED, version_headers(current)).into_response();
-    }
+    // Always 200 + map (never 304); see `read` — a 304 here loops the client.
+    let current = store::current_version(pool()).await.unwrap_or(0);
     match store::fulltext_versions(pool(), since).await {
         Ok(value) => (version_headers(current), Json(value)).into_response(),
         Err(error) => server_error("fulltext versions", error),
