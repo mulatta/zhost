@@ -116,6 +116,18 @@ fn valid_key(key: &str) -> bool {
     !key.is_empty() && key.len() <= 32 && key.bytes().all(|b| b.is_ascii_alphanumeric())
 }
 
+/// A Zotero object key: exactly 8 chars from a base32 alphabet (digits 2-9 and
+/// A-Z without the ambiguous `0`/`1`/`O`). The client rejects anything else
+/// ("key is not valid") and queues it, so reject a malformed key at the API
+/// boundary rather than let it sync and break the client. Object keys only —
+/// settings keys are arbitrary names handled on a separate path.
+fn valid_object_key(key: &str) -> bool {
+    key.len() == 8
+        && key
+            .bytes()
+            .all(|b| b"23456789ABCDEFGHIJKLMNPQRSTUVWXYZ".contains(&b))
+}
+
 fn cfg() -> &'static Config {
     CFG.get().expect("config initialised in main")
 }
@@ -587,6 +599,20 @@ async fn write(kind: &str, headers: HeaderMap, body: Bytes) -> Response {
             return StatusCode::BAD_REQUEST.into_response();
         }
     };
+    // Reject a malformed object key up front (a keyless object is fine — the
+    // store assigns one). A bad key would otherwise sync and the client would
+    // refuse it with "key is not valid".
+    if let Some(bad) = batch
+        .iter()
+        .filter_map(|o| o.get("key").and_then(Value::as_str))
+        .find(|k| !valid_object_key(k))
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            format!("invalid object key: {bad}"),
+        )
+            .into_response();
+    }
     let expected = match precondition(&headers) {
         Ok(v) => v,
         Err(resp) => return resp,

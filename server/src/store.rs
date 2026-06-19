@@ -62,6 +62,19 @@ fn order_fields(data: Value) -> Value {
     Value::Object(ordered)
 }
 
+/// Generate a fresh Zotero object key (8 chars from the base32 alphabet) for an
+/// object the client posted without one. 32 divides 256, so the byte→alphabet
+/// mapping is unbiased.
+fn generate_key() -> String {
+    use std::io::Read;
+    const ALPHABET: &[u8] = b"23456789ABCDEFGHIJKLMNPQRSTUVWXYZ";
+    let mut buf = [0u8; 8];
+    let _ = std::fs::File::open("/dev/urandom").and_then(|mut f| f.read_exact(&mut buf));
+    buf.iter()
+        .map(|b| ALPHABET[*b as usize % ALPHABET.len()] as char)
+        .collect()
+}
+
 /// A write either committed at a new version or was rejected because the
 /// client's `If-Unmodified-Since-Version` no longer matches the library.
 pub enum Outcome<T> {
@@ -345,7 +358,7 @@ pub async fn write(
             .get("key")
             .and_then(Value::as_str)
             .map(String::from)
-            .unwrap_or_else(|| format!("ZH{index:06}"));
+            .unwrap_or_else(generate_key);
         // Start from the existing object (read in this txn so the version guard
         // serialises it) and overlay the provided top-level fields; a new key has
         // nothing to merge into, so the provided object is stored as-is.

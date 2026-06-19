@@ -293,6 +293,12 @@ rows, so conditional version checks are atomic.
   `annotationType` first for annotations (the server re-emits both first, since
   jsonb sorts keys alphabetically and the client's `fromJSON` requires them
   before the fields that depend on them).
+- **Object keys** are 8 chars from a base32 alphabet (`23456789ABCDEFGHIJKLMNPQRSTUVWXYZ`
+  — digits 2-9 and A-Z without `0`/`1`/`O`). The client rejects anything else
+  ("key is not valid") and queues it, so the server rejects a malformed key on
+  write with `400` rather than letting it sync. A keyless object on `POST` is
+  assigned a fresh valid key. (Schema is *not* validated — only this stable
+  structural invariant; item types/fields stay opaque for forward-compatibility.)
 - `Zotero-Write-Token` is not required — the client never sends it; the
   `If-Unmodified-Since-Version` → 412 guard is sufficient.
 - `mtime` is in milliseconds.
