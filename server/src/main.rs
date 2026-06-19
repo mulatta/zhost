@@ -576,9 +576,10 @@ async fn tags_get() -> Response {
     }
 }
 
-/// `merge` distinguishes a `PATCH` (partial update, merge into the stored object)
-/// from a `POST` (full replace).
-async fn write(kind: &str, headers: HeaderMap, body: Bytes, merge: bool) -> Response {
+/// Both POST and PATCH create-or-update with merge semantics (see `store::write`):
+/// the Zotero client uploads only an existing object's changed fields, so omitted
+/// fields must be preserved.
+async fn write(kind: &str, headers: HeaderMap, body: Bytes) -> Response {
     let batch: Vec<Value> = match serde_json::from_slice(&body) {
         Ok(batch) => batch,
         Err(error) => {
@@ -590,7 +591,7 @@ async fn write(kind: &str, headers: HeaderMap, body: Bytes, merge: bool) -> Resp
         Ok(v) => v,
         Err(resp) => return resp,
     };
-    match store::write(pool(), kind, batch, Some(expected), merge).await {
+    match store::write(pool(), kind, batch, Some(expected)).await {
         Ok(store::Outcome::Done((version, successful))) => (
             version_headers(version),
             Json(json!({
@@ -1006,8 +1007,8 @@ fn app() -> Router {
     // kind so the handlers stay generic.
     let objects = |kind: &'static str| {
         get(move |Query(p): Query<HashMap<String, String>>| read(kind, p))
-            .post(move |headers: HeaderMap, body: Bytes| write(kind, headers, body, false))
-            .patch(move |headers: HeaderMap, body: Bytes| write(kind, headers, body, true))
+            .post(move |headers: HeaderMap, body: Bytes| write(kind, headers, body))
+            .patch(move |headers: HeaderMap, body: Bytes| write(kind, headers, body))
             .delete(
                 move |headers: HeaderMap, Query(p): Query<HashMap<String, String>>| {
                     delete(kind, headers, p)
@@ -1044,8 +1045,8 @@ fn app() -> Router {
         .route(
             "/users/{id}/items",
             get(items_get)
-                .post(move |headers: HeaderMap, body: Bytes| write("item", headers, body, false))
-                .patch(move |headers: HeaderMap, body: Bytes| write("item", headers, body, true))
+                .post(move |headers: HeaderMap, body: Bytes| write("item", headers, body))
+                .patch(move |headers: HeaderMap, body: Bytes| write("item", headers, body))
                 .delete(
                     move |headers: HeaderMap, Query(p): Query<HashMap<String, String>>| {
                         delete("item", headers, p)

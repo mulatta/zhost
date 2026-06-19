@@ -155,8 +155,8 @@ All writes return `Last-Modified-Version` and use `If-Unmodified-Since-Version`.
 
 | Request | Response |
 |---|---|
-| `POST <prefix>/{collections,searches,items}` — body: JSON array (client batches ≤10, API allows ≤50) | `200` upload-result object (below) or `412`. (syncAPIClient.js:393) |
-| `PATCH <prefix>/{...}` | Partial update: the provided top-level fields are merged into the stored object (omitted fields kept); a provided field replaces its value. (`POST` replaces the whole object.) |
+| `POST <prefix>/{collections,searches,items}` — body: JSON array (client batches ≤10, API allows ≤50) | `200` upload-result object (below) or `412`. **Create-or-update with merge:** for an existing key, the provided top-level fields are overlaid onto the stored object (omitted fields kept, empty value clears). The sync client uploads only an existing object's *changed* fields here — e.g. just `lastRead` after opening an attachment — so a full replace would drop `itemType`/`linkMode` and corrupt it. (syncAPIClient.js:393) |
+| `PATCH <prefix>/{...}` | Same merge semantics as POST (explicit partial update). |
 | `DELETE <prefix>/{collections,searches,items}?{objectKey}=k1,k2,...` (client batches ≤25); tags via `?tags=t1\|\|t2` | `204` or `412`. (syncAPIClient.js:430) |
 | `POST <prefix>/settings` — body `{key: {value}}` (≤250/batch) | `200` result obj / `204` / `412`. (syncAPIClient.js:359) |
 | `DELETE <prefix>/settings?settingKey=k1,k2` | `204` / `412`. (syncAPIClient.js:336) |

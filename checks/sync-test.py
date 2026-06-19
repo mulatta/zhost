@@ -634,7 +634,7 @@ with subtest("PATCH merges: a partial update keeps unspecified fields"):
         f'-d \'[{{"key":"MERGEIT2","itemType":"book","title":"orig","tags":[{{"tag":"keep"}}]}}]\' '
         f"| jq -e .successful"
     )
-    # PATCH only the title; itemType and tags must survive (a POST would drop them).
+    # PATCH only the title; itemType and tags must survive.
     machine.succeed(
         f"curl -sf -X PATCH {base}/users/1/items {auth} "
         f"-H 'If-Unmodified-Since-Version: {library_version()}' "
@@ -644,6 +644,28 @@ with subtest("PATCH merges: a partial update keeps unspecified fields"):
         f"curl -sf '{base}/users/1/items?itemKey=MERGEIT2&format=json' {auth} "
         f"| jq -e '.[0].data.title==\"new\" and .[0].data.itemType==\"book\" "
         f"and .[0].data.tags[0].tag==\"keep\"'"
+    )
+
+with subtest("POST also merges: a partial upload keeps unspecified fields"):
+    # The sync client uploads only an existing object's changed fields via POST
+    # (e.g. just lastRead after opening an attachment). A full replace would drop
+    # itemType/linkMode and corrupt the attachment, so POST must merge too.
+    machine.succeed(
+        f"curl -sf -X POST {base}/users/1/items {auth} "
+        f"-H 'If-Unmodified-Since-Version: {library_version()}' "
+        f'-d \'[{{"key":"PMERGEAT","itemType":"attachment","linkMode":"imported_file",'
+        f'"filename":"f.pdf","contentType":"application/pdf"}}]\' | jq -e .successful'
+    )
+    # POST a partial object: only key + a changed field (mimics lastRead sync).
+    machine.succeed(
+        f"curl -sf -X POST {base}/users/1/items {auth} "
+        f"-H 'If-Unmodified-Since-Version: {library_version()}' "
+        f'-d \'[{{"key":"PMERGEAT","lastRead":1700000000,"tags":[]}}]\''
+    )
+    machine.succeed(
+        f"curl -sf '{base}/users/1/items?itemKey=PMERGEAT&format=json' {auth} "
+        f"| jq -e '.[0].data.itemType==\"attachment\" and .[0].data.linkMode==\"imported_file\" "
+        f"and .[0].data.filename==\"f.pdf\" and .[0].data.lastRead==1700000000'"
     )
 
 with subtest("deletes are recorded in the deletion log"):
