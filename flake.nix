@@ -62,9 +62,9 @@
         rustfs = prev.callPackage ./pkgs/rustfs { };
       };
 
-      # programs.zotero — install + configure + (darwin) sign-on-activation.
-      # Consumers must also apply overlays.default so pkgs.zotero is the patched
-      # build the module expects.
+      # programs.zotero — install + configure + (darwin) sign-on-activation. The
+      # module builds its own patched zotero from pkgs/zotero, so consumers just
+      # set the endpoints; applying overlays.default is not required.
       homeModules.zotero = ./homeModules/zotero.nix;
       homeModules.default = ./homeModules/zotero.nix;
 
