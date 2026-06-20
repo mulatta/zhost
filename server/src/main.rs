@@ -314,13 +314,18 @@ async fn login_authorize(
         }
     }
     // When an authorized user is configured, the front SSO proxy must forward a
-    // matching identity (oauth2-proxy `--set-xauthrequest`). This ties the
-    // approval to a proven identity and guards against a misconfigured/bypassed
-    // proxy; unset (a private network) means the network is the gate.
+    // matching identity. This ties the approval to a proven identity and guards
+    // against a misconfigured/bypassed proxy; unset (a private network) means the
+    // network is the gate. oauth2-proxy forwards the identity differently per
+    // mode: as a reverse proxy (the usual setup) it sets X-Forwarded-Email/-User
+    // on the upstream request (pass-user-headers); in nginx auth_request mode it
+    // sets X-Auth-Request-*. Accept either so the gate works behind both.
     if let Some(want) = &cfg().login_authorized_user {
         let identity = headers
             .get("x-auth-request-email")
+            .or_else(|| headers.get("x-forwarded-email"))
             .or_else(|| headers.get("x-auth-request-user"))
+            .or_else(|| headers.get("x-forwarded-user"))
             .and_then(|v| v.to_str().ok());
         if !identity.is_some_and(|got| got.eq_ignore_ascii_case(want)) {
             return (StatusCode::FORBIDDEN, "not an authorized user").into_response();
