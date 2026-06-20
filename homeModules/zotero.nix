@@ -14,12 +14,13 @@ in
 
     package = lib.mkOption {
       type = lib.types.package;
-      default = pkgs.zotero.override { inherit (cfg) apiUrl wwwUrl streamUrl; };
-      defaultText = lib.literalExpression "pkgs.zotero.override { inherit (config.programs.zotero) apiUrl wwwUrl streamUrl; }";
+      default = pkgs.callPackage ../pkgs/zotero { inherit (cfg) apiUrl wwwUrl streamUrl; };
+      defaultText = lib.literalExpression "pkgs.callPackage <zhost/pkgs/zotero> { inherit (config.programs.zotero) apiUrl wwwUrl streamUrl; }";
       description = ''
-        The Zotero package. Defaults to `pkgs.zotero` from the zhost overlay,
-        patched with the configured endpoints; requires `zhost.overlays.default`
-        to be applied to the nixpkgs instance.
+        The Zotero package, built from this flake's patched derivation against
+        the configured endpoints and the consumer's upstream `pkgs.zotero` base.
+        Self-contained: setting the endpoints is enough, with no need to apply
+        `zhost.overlays.default` to nixpkgs. Override only for a custom build.
       '';
     };
 
