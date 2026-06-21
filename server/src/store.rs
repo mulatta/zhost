@@ -533,6 +533,55 @@ pub async fn delete_settings(
     Ok(Outcome::Done(version))
 }
 
+/// Delete tags library-wide: strip each tag from every item that carries it
+/// (bumping those items to the new version) and record the tag in the deletion
+/// log so `/deleted` propagates the removal. A tag has no object of its own, so
+/// an orphaned tag with zero items still needs its deletion-log entry for
+/// clients to purge it — the deletion is recorded regardless of matches.
+/// Returns the new library version or a conflict.
+pub async fn delete_tags(
+    pool: &PgPool,
+    tags: &[String],
+    expected: Option<i64>,
+) -> sqlx::Result<Outcome<i64>> {
+    if tags.is_empty() {
+        return no_change(pool, expected).await;
+    }
+    let mut tx = pool.begin().await?;
+    let version = match guarded_version(&mut tx, expected).await? {
+        Outcome::Done(version) => version,
+        Outcome::Conflict(current) => return Ok(Outcome::Conflict(current)),
+    };
+    for tag in tags {
+        // Drop the matching entry from each item's data.tags array; the
+        // tag_names generated column and its index update automatically.
+        sqlx::query(
+            "update object set version = $3, data = jsonb_set(data, '{tags}', coalesce((\
+                 select jsonb_agg(t) \
+                 from jsonb_array_elements(data->'tags') t \
+                 where t->>'tag' is distinct from $2\
+             ), '[]'::jsonb)) \
+             where library_id = $1 and kind = 'item' and tag_names @> array[$2]",
+        )
+        .bind(LIBRARY_ID)
+        .bind(tag)
+        .bind(version)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "insert into deletion (library_id, kind, key, version) values ($1, 'tag', $2, $3) \
+             on conflict (library_id, kind, key) do update set version = $3",
+        )
+        .bind(LIBRARY_ID)
+        .bind(tag)
+        .bind(version)
+        .execute(&mut *tx)
+        .await?;
+    }
+    tx.commit().await?;
+    Ok(Outcome::Done(version))
+}
+
 /// md5 and mtime for an attachment file, if registered (the client reads these
 /// from the download response headers).
 pub async fn file_meta(pool: &PgPool, item_key: &str) -> sqlx::Result<Option<(String, i64)>> {
