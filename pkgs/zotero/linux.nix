@@ -7,6 +7,7 @@
   apiUrl,
   wwwUrl,
   streamUrl,
+  prefsFile,
 }:
 
 # Post-process the binary-cached nixpkgs zotero: rewriting the sync endpoints in
@@ -40,6 +41,11 @@ stdenv.mkDerivation {
       --replace-warn "wss://stream.zotero.org/" "${streamUrl}"
 
     ( cd "$work" && zip "$omni" resource/config.mjs >/dev/null )
+    ${lib.optionalString (prefsFile != null) ''
+      unzip -o "$omni" defaults/preferences/zotero.js -d "$work" >/dev/null
+      cat ${prefsFile} >> "$work/defaults/preferences/zotero.js"
+      ( cd "$work" && zip "$omni" defaults/preferences/zotero.js >/dev/null )
+    ''}
 
     runHook postBuild
   '';

@@ -14,8 +14,15 @@ in
 
     package = lib.mkOption {
       type = lib.types.package;
-      default = pkgs.callPackage ../pkgs/zotero { inherit (cfg) apiUrl wwwUrl streamUrl; };
-      defaultText = lib.literalExpression "pkgs.callPackage <zhost/pkgs/zotero> { inherit (config.programs.zotero) apiUrl wwwUrl streamUrl; }";
+      default = pkgs.callPackage ../pkgs/zotero {
+        inherit (cfg)
+          apiUrl
+          wwwUrl
+          streamUrl
+          prefs
+          ;
+      };
+      defaultText = lib.literalExpression "pkgs.callPackage <zhost/pkgs/zotero> { inherit (config.programs.zotero) apiUrl wwwUrl streamUrl prefs; }";
       description = ''
         The Zotero package, built from this flake's patched derivation against
         the configured endpoints and the consumer's upstream `pkgs.zotero` base.
@@ -40,6 +47,25 @@ in
       type = lib.types.str;
       example = "wss://zotero.example.org/stream/";
       description = "Self-hosted server URL for the streaming (live sync) endpoint.";
+    };
+
+    prefs = lib.mkOption {
+      type =
+        with lib.types;
+        attrsOf (oneOf [
+          bool
+          int
+          str
+        ]);
+      default = { };
+      example = lib.literalExpression ''{ "extensions.zotero.automaticTags" = false; }'';
+      description = ''
+        Zotero preferences baked into the bundle's default prefs. A later
+        definition overrides the upstream default, so e.g. setting
+        `"extensions.zotero.automaticTags" = false` stops metadata retrieval and
+        import translators from attaching publisher subject keywords as automatic
+        tags. The user can still change these in-app.
+      '';
     };
 
     applicationsDir = lib.mkOption {
