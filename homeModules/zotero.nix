@@ -1,3 +1,9 @@
+# Curried with zhostpkgs (this flake's own pinned nixpkgs) so the base Zotero
+# release is owned here, not inherited from the consumer's nixpkgs. A consumer
+# whose nixpkgs races ahead of the published Zotero binaries (no dmg yet, no
+# matching hash) therefore cannot break this module; the version only moves when
+# this flake's lock is bumped together with the dmg hash in pkgs/zotero.
+{ zhostpkgs }:
 {
   config,
   lib,
@@ -7,6 +13,9 @@
 
 let
   cfg = config.programs.zotero;
+  # Build tools (stdenv, zip, ...) still come from the consumer pkgs so they
+  # match the host; only the Zotero base (version + linux build) is pinned.
+  baseZotero = zhostpkgs.legacyPackages.${pkgs.stdenv.hostPlatform.system}.zotero;
 in
 {
   options.programs.zotero = {
@@ -21,11 +30,15 @@ in
           streamUrl
           prefs
           ;
+        # Pin the base to this flake's nixpkgs, not the consumer's.
+        zotero = baseZotero;
       };
-      defaultText = lib.literalExpression "pkgs.callPackage <zhost/pkgs/zotero> { inherit (config.programs.zotero) apiUrl wwwUrl streamUrl prefs; }";
+      defaultText = lib.literalExpression "pkgs.callPackage <zhost/pkgs/zotero> { inherit (config.programs.zotero) apiUrl wwwUrl streamUrl prefs; zotero = <zhost nixpkgs>.zotero; }";
       description = ''
         The Zotero package, built from this flake's patched derivation against
-        the configured endpoints and the consumer's upstream `pkgs.zotero` base.
+        the configured endpoints. The base Zotero release is pinned to this
+        flake's own nixpkgs, so it stays buildable even when the consumer's
+        nixpkgs jumps to a version whose binaries are not published yet.
         Self-contained: setting the endpoints is enough, with no need to apply
         `zhost.overlays.default` to nixpkgs. Override only for a custom build.
       '';
