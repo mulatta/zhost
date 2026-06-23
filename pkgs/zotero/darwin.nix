@@ -87,16 +87,33 @@ stdenv.mkDerivation (finalAttrs: {
   # ~/Applications); a nix-darwin/home-manager activation script calls it.
   # The codesign/xattr paths are deliberately the system ones: this runs on the
   # host at activation, not in the build sandbox.
+  #
+  # The install is idempotent: a marker records the store path it was built
+  # from, and a re-run is a no-op while that path and the installed bundle are
+  # both still present. This avoids re-copying and deep-signing the ~300MB app
+  # (and the "replacing existing signature" noise) on every activation. The
+  # `-d "$target"` check keeps the self-healing property for a deleted bundle;
+  # only an in-place corruption with a matching marker is not re-healed, which a
+  # store-path bump or removing the marker fixes. The marker lives beside the
+  # bundle, not inside it, so it never disturbs the signature.
   passthru.darwinInstall = writeShellApplication {
     name = "zotero-darwin-install";
     text = ''
       target="''${1:-$HOME/Applications}/Zotero.app"
+      marker="$(dirname "$target")/.zotero-zhost-src"
+      src="${finalAttrs.finalPackage}"
+
+      if [ -d "$target" ] && [ -f "$marker" ] && [ "$(cat "$marker")" = "$src" ]; then
+        exit 0
+      fi
+
       rm -rf "$target"
       mkdir -p "$(dirname "$target")"
-      cp -R "${finalAttrs.finalPackage}/Applications/Zotero.app" "$target"
+      cp -R "$src/Applications/Zotero.app" "$target"
       chmod -R u+w "$target"
       /usr/bin/codesign --force --deep --sign - "$target"
       /usr/bin/xattr -dr com.apple.quarantine "$target" || true
+      printf '%s' "$src" > "$marker"
     '';
   };
 
