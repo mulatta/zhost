@@ -64,9 +64,11 @@
 
       # programs.zotero — install + configure + (darwin) sign-on-activation. The
       # module builds its own patched zotero from pkgs/zotero, so consumers just
-      # set the endpoints; applying overlays.default is not required.
-      homeModules.zotero = ./homeModules/zotero.nix;
-      homeModules.default = ./homeModules/zotero.nix;
+      # set the endpoints; applying overlays.default is not required. Curried
+      # with this flake's nixpkgs so the base Zotero release is pinned here,
+      # independent of the consumer's (possibly newer) nixpkgs.
+      homeModules.zotero = import ./homeModules/zotero.nix { zhostpkgs = nixpkgs; };
+      homeModules.default = self.homeModules.zotero;
 
       # malt deployment: systemd service + local postgres + credential-loaded key.
       # The host wires the sops secret, wg bind and reverse proxy.
