@@ -38,14 +38,16 @@ testPkgs.testers.runNixOSTest {
     };
 
     # RustFS: an S3-compatible store for the attachment upload/download paths.
-    systemd.services.rustfs = {
-      wantedBy = [ "multi-user.target" ];
-      before = [ "zhost.service" ];
-      serviceConfig = {
-        ExecStart = "${testPkgs.rustfs}/bin/rustfs --address 127.0.0.1:9000 --access-key rustfsadmin --secret-key rustfsadmin /var/lib/rustfs";
-        StateDirectory = "rustfs";
-        Restart = "on-failure";
-      };
+    # Use nixpkgs' package and service module so this repository does not carry
+    # a second RustFS build or lifecycle definition.
+    services.rustfs = {
+      enable = true;
+      environmentFile = toString (
+        testPkgs.writeText "rustfs-secrets.env" ''
+          RUSTFS_ACCESS_KEY=rustfsadmin
+          RUSTFS_SECRET_KEY=rustfsadmin
+        ''
+      );
     };
     systemd.services.zhost.after = [ "rustfs.service" ];
 
