@@ -58,8 +58,6 @@
       overlays.default = _final: prev: {
         zotero = prev.callPackage ./pkgs/zotero { inherit (prev) zotero; };
         zhost = prev.callPackage ./pkgs/zhost { };
-        # S3 backend for the integration test only (production uses R2).
-        rustfs = prev.callPackage ./pkgs/rustfs { };
       };
 
       # programs.zotero — install + configure + (darwin) sign-on-activation. The
@@ -82,7 +80,6 @@
           # Useful for `nix build`/eval smoke tests.
           zotero = pkgs.callPackage ./pkgs/zotero { };
           zhost = pkgs.callPackage ./pkgs/zhost { };
-          rustfs = pkgs.callPackage ./pkgs/rustfs { };
         }
       );
 
