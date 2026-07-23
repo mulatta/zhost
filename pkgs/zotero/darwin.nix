@@ -25,6 +25,7 @@ let
   inherit (zotero) version;
   dmgHashes = {
     "9.0.4" = "sha256-Wbdi7JaCqM+6tTu3YvU+qNW7F2lfQ4+z0zDpz5YDwtI=";
+    "9.0.6" = "sha256-ep7bprSmEfT4AP8/FZ5npitAPO7dVr/a/AY/I+Ucjbc=";
   };
   dmgHash =
     dmgHashes.${version}
