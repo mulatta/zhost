@@ -1270,9 +1270,23 @@ async fn file_post(
 
     let md5 = form.get("md5").cloned().unwrap_or_default();
     let stored_md5 = match store::file_meta(&state.pool, request_library(), &key).await {
-        Ok(meta) => meta.map(|(m, _, _)| m),
+        Ok(meta) => meta.map(|meta| meta.md5),
         Err(error) => return server_error("file auth", error),
     };
+    let zip_md5 = form.get("zipMD5").filter(|value| !value.is_empty());
+    let zip_filename = form.get("zipFilename").filter(|value| !value.is_empty());
+    if zip_md5.is_some() != zip_filename.is_some() {
+        return (
+            StatusCode::BAD_REQUEST,
+            "zipMD5 and zipFilename must be provided together",
+        )
+            .into_response();
+    }
+    let compressed = zip_md5.is_some()
+        || form
+            .get("zip")
+            .is_some_and(|value| !value.is_empty() && value != "0");
+    let upload_md5 = zip_md5.cloned().unwrap_or_else(|| md5.clone());
 
     // md5 hex compares case-insensitively, matching the verification in
     // upload_put (which lowercases) so dedup and replace agree on normalization.
@@ -1330,12 +1344,14 @@ async fn file_post(
         },
         blob_key: upload_storage_key(request_library(), &candidate_id),
         md5,
+        upload_md5,
         filename: form.get("filename").cloned().unwrap_or_default(),
         filesize: form
             .get("filesize")
             .and_then(|s| s.parse().ok())
             .unwrap_or(0),
         mtime: form.get("mtime").and_then(|s| s.parse().ok()).unwrap_or(0),
+        compressed,
         state: store::PendingUploadState::Authorized,
     };
     if let Err(error) = store::create_pending_upload(&state.pool, &key_hash(&token), &upload).await
@@ -1346,7 +1362,7 @@ async fn file_post(
     Json(json!({
         "url": format!("{}/uploads/{}", state.config.public_url, token),
         "uploadKey": token,
-        "contentType": "application/octet-stream",
+        "contentType": if compressed { "application/zip" } else { "application/octet-stream" },
         "prefix": "",
         "suffix": "",
     }))
@@ -1492,7 +1508,7 @@ async fn upload_put(
         use md5::{Digest, Md5};
         format!("{:x}", Md5::new().chain_update(&body).finalize())
     };
-    if body.len() as i64 != upload.filesize || actual_md5 != upload.md5.to_lowercase() {
+    if body.len() as i64 != upload.filesize || actual_md5 != upload.upload_md5.to_lowercase() {
         tracing::warn!("uploaded bytes do not match authorization");
         return (
             StatusCode::BAD_REQUEST,
@@ -1507,9 +1523,14 @@ async fn upload_put(
         }
         Err(error) => return server_error("claim pending upload", error),
     }
+    let content_type = if upload.compressed {
+        "application/zip"
+    } else {
+        "application/octet-stream"
+    };
     if let Err(error) = state
         .storage
-        .put(&upload.blob_key, &body, "application/octet-stream")
+        .put(&upload.blob_key, &body, content_type)
         .await
     {
         if let Err(reset_error) = store::reset_pending_upload(&state.pool, &token_hash).await {
@@ -1543,13 +1564,12 @@ async fn file_get(
     if !valid_key(&key) {
         return StatusCode::NOT_FOUND.into_response();
     }
-    let (md5, mtime, blob_key) = match store::file_meta(&state.pool, request_library(), &key).await
-    {
+    let meta = match store::file_meta(&state.pool, request_library(), &key).await {
         Ok(Some(meta)) => meta,
         Ok(None) => return StatusCode::NOT_FOUND.into_response(),
         Err(error) => return server_error("file meta", error),
     };
-    let url = match state.storage.presign_get(&blob_key).await {
+    let url = match state.storage.presign_get(&meta.blob_key).await {
         Ok(url) => url,
         Err(error) => return s3_error("presign download", error),
     };
@@ -1557,10 +1577,14 @@ async fn file_get(
     headers.insert("location", header_value(&url));
     headers.insert(
         "zotero-file-modification-time",
-        header_value(&mtime.to_string()),
+        header_value(&meta.mtime.to_string()),
     );
-    headers.insert("zotero-file-md5", header_value(&md5));
-    headers.insert("zotero-file-compressed", header_value("No"));
+    headers.insert("zotero-file-md5", header_value(&meta.blob_md5));
+    headers.insert("zotero-file-size", header_value(&meta.filesize.to_string()));
+    headers.insert(
+        "zotero-file-compressed",
+        header_value(if meta.compressed { "Yes" } else { "No" }),
+    );
     (StatusCode::FOUND, headers).into_response()
 }
 

@@ -1321,14 +1321,23 @@ pub async fn delete_tags(
     Ok(Outcome::Done(version))
 }
 
-/// md5, mtime, and immutable object pointer for a registered attachment file.
+pub struct FileMeta {
+    pub md5: String,
+    pub blob_md5: String,
+    pub mtime: i64,
+    pub filesize: i64,
+    pub compressed: bool,
+    pub blob_key: String,
+}
+
+/// Client-visible metadata and immutable object pointer for an attachment file.
 pub async fn file_meta(
     pool: &PgPool,
     library_id: LibraryId,
     item_key: &str,
-) -> sqlx::Result<Option<(String, i64, String)>> {
+) -> sqlx::Result<Option<FileMeta>> {
     let row = sqlx::query(
-        "select f.md5, f.mtime, f.blob_key \
+        "select f.md5, f.blob_md5, f.mtime, f.filesize, f.compressed, f.blob_key \
          from file f \
          join object o on o.library_id = f.library_id \
              and o.kind = 'item' \
@@ -1341,7 +1350,14 @@ pub async fn file_meta(
     .bind(item_key)
     .fetch_optional(pool)
     .await?;
-    Ok(row.map(|r| (r.get("md5"), r.get("mtime"), r.get("blob_key"))))
+    Ok(row.map(|r| FileMeta {
+        md5: r.get("md5"),
+        blob_md5: r.get("blob_md5"),
+        mtime: r.get("mtime"),
+        filesize: r.get("filesize"),
+        compressed: r.get("compressed"),
+        blob_key: r.get("blob_key"),
+    }))
 }
 
 pub async fn stored_file_attachment_exists(
@@ -1378,15 +1394,18 @@ pub struct PendingUpload {
     pub expected_md5: Option<String>,
     pub blob_key: String,
     pub md5: String,
+    pub upload_md5: String,
     pub filename: String,
     pub filesize: i64,
     pub mtime: i64,
+    pub compressed: bool,
     pub state: PendingUploadState,
 }
 
 const PENDING_UPLOAD_COLUMNS: &str = "\
     library_id, group_id, authorizer_key_hash, bootstrap_user_id, \
-    item_key, expected_md5, blob_key, md5, filename, filesize, mtime, state";
+    item_key, expected_md5, blob_key, md5, upload_md5, filename, filesize, \
+    mtime, compressed, state";
 
 fn pending_upload_from_row(row: PgRow) -> PendingUpload {
     let bootstrap_user_id = row
@@ -1404,9 +1423,11 @@ fn pending_upload_from_row(row: PgRow) -> PendingUpload {
         expected_md5: row.get("expected_md5"),
         blob_key: row.get("blob_key"),
         md5: row.get("md5"),
+        upload_md5: row.get("upload_md5"),
         filename: row.get("filename"),
         filesize: row.get("filesize"),
         mtime: row.get("mtime"),
+        compressed: row.get("compressed"),
         state: match row.get::<String, _>("state").as_str() {
             "authorized" => PendingUploadState::Authorized,
             "uploading" => PendingUploadState::Uploading,
@@ -1426,9 +1447,11 @@ pub async fn create_pending_upload(
     sqlx::query(
         "insert into pending_uploads ( \
              token_hash, library_id, group_id, authorizer_key_hash, bootstrap_user_id, \
-             item_key, expected_md5, blob_key, md5, filename, filesize, mtime, state \
+             item_key, expected_md5, blob_key, md5, upload_md5, filename, \
+             filesize, mtime, compressed, state \
          ) values ( \
-             $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, 'authorized' \
+             $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, \
+             'authorized' \
          )",
     )
     .bind(token_hash)
@@ -1440,9 +1463,11 @@ pub async fn create_pending_upload(
     .bind(&upload.expected_md5)
     .bind(&upload.blob_key)
     .bind(&upload.md5)
+    .bind(&upload.upload_md5)
     .bind(&upload.filename)
     .bind(upload.filesize)
     .bind(upload.mtime)
+    .bind(upload.compressed)
     .execute(pool)
     .await?;
     Ok(())
@@ -1657,28 +1682,31 @@ pub async fn register_file(
         .await?;
     sqlx::query(
         "insert into file \
-         (library_id, item_key, blob_key, md5, filename, filesize, mtime, version) \
-         values ($1, $2, $3, $4, $5, $6, $7, $8) \
+         (library_id, item_key, blob_key, md5, blob_md5, filename, filesize, mtime, \
+          compressed, version) \
+         values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) \
          on conflict (library_id, item_key) \
-         do update set blob_key = $3, md5 = $4, filename = $5, filesize = $6, \
-                       mtime = $7, version = $8",
+         do update set blob_key = $3, md5 = $4, blob_md5 = $5, filename = $6, \
+                       filesize = $7, mtime = $8, compressed = $9, version = $10",
     )
     .bind(library_id.get())
     .bind(item_key)
     .bind(&upload.blob_key)
     .bind(&upload.md5)
+    .bind(&upload.upload_md5)
     .bind(&upload.filename)
     .bind(upload.filesize)
     .bind(upload.mtime)
+    .bind(upload.compressed)
     .bind(version)
     .execute(&mut *tx)
     .await?;
-    // Real Zotero stamps md5/mtime onto the attachment item's data when the
-    // file is registered; without them the downloading client can't reconcile
-    // the file and rejects the attachment.
+    // Real Zotero stamps original-file metadata onto the attachment item when
+    // registering a ZIP. Clients use filename to select its primary ZIP entry.
     sqlx::query(
         "update object set version = $3, \
-         data = data || jsonb_build_object('md5', $4::text, 'mtime', $5::bigint, 'version', $3) \
+         data = data || jsonb_build_object( \
+             'md5', $4::text, 'mtime', $5::bigint, 'filename', $6::text, 'version', $3) \
          where library_id = $1 and kind = 'item' and key = $2",
     )
     .bind(library_id.get())
@@ -1686,6 +1714,7 @@ pub async fn register_file(
     .bind(version)
     .bind(&upload.md5)
     .bind(upload.mtime)
+    .bind(&upload.filename)
     .execute(&mut *tx)
     .await?;
     sqlx::query("delete from pending_uploads where token_hash = $1")

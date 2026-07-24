@@ -329,6 +329,91 @@ with subtest("an attachment file uploads to S3 and downloads via a presigned URL
     assert location.split("/", 3)[2] == "127.0.0.1:9000", location
     assert machine.succeed(f"curl -sf '{location}'").strip() == "hello"
 
+with subtest("a Zotero ZIP attachment preserves original metadata and compressed bytes"):
+    machine.succeed(
+        f"curl -sf -X POST {base}/users/1/items {auth} "
+        f"-H 'If-Unmodified-Since-Version: {library_version()}' "
+        "-d '[{\"key\":\"ZIPATT22\",\"itemType\":\"attachment\","
+        "\"linkMode\":\"imported_file\",\"contentType\":\"text/plain\"}]' "
+        "| jq -e .successful"
+    )
+    machine.succeed(
+        "printf 'compressed hello' >/tmp/zipped.txt "
+        "&& zip -jq /tmp/ZIPATT22.zip /tmp/zipped.txt"
+    )
+    original_md5 = machine.succeed("md5sum /tmp/zipped.txt | cut -d' ' -f1").strip()
+    zip_md5 = machine.succeed("md5sum /tmp/ZIPATT22.zip | cut -d' ' -f1").strip()
+    zip_size = machine.succeed("stat -c %s /tmp/ZIPATT22.zip").strip()
+    machine.succeed(
+        f"curl -sf -X POST {base}/users/1/items/ZIPATT22/file {auth} "
+        f"-H 'If-None-Match: *' "
+        f"-d 'md5={original_md5}&filename=zipped.txt&filesize={zip_size}"
+        f"&mtime=1700000000004&zipMD5={zip_md5}&zipFilename=ZIPATT22.zip' "
+        "> /tmp/zip-auth.json"
+    )
+    machine.succeed("jq -e '.contentType == \"application/zip\"' /tmp/zip-auth.json")
+    zip_token = machine.succeed("jq -r .uploadKey /tmp/zip-auth.json").strip()
+    machine.succeed(
+        f"curl -s -X POST {base}/users/1/items/ZIPATT22/file {auth} "
+        f"-H 'If-None-Match: *' "
+        f"-d 'md5={original_md5}&filename=zipped.txt&filesize={zip_size}"
+        f"&mtime=1700000000004&zipMD5={zip_md5}' "
+        "-o /dev/null -w '%{http_code}' | grep -qx 400"
+    )
+    machine.succeed(
+        f"curl -s -X POST {base}/users/1/items/ZIPATT22/file {auth} "
+        f"-H 'If-None-Match: *' "
+        f"-d 'md5={original_md5}&filename=zipped.txt&filesize={zip_size}"
+        "&mtime=1700000000004&zipFilename=ZIPATT22.zip' "
+        "-o /dev/null -w '%{http_code}' | grep -qx 400"
+    )
+    restart_zhost()
+    machine.succeed(
+        "cp /tmp/ZIPATT22.zip /tmp/corrupt.zip "
+        "&& printf X | dd of=/tmp/corrupt.zip bs=1 seek=10 conv=notrunc"
+    )
+    machine.succeed(
+        f"curl -s -X POST {base}/uploads/{zip_token} "
+        "--data-binary @/tmp/corrupt.zip -o /dev/null -w '%{http_code}' "
+        "| grep -qx 400"
+    )
+    machine.succeed(
+        f"curl -sf -X POST {base}/uploads/{zip_token} --data-binary @/tmp/ZIPATT22.zip"
+    )
+    restart_zhost()
+    machine.succeed(
+        f"curl -sf -X POST {base}/users/1/items/ZIPATT22/file {auth} "
+        f"-H 'If-None-Match: *' -d 'upload={zip_token}'"
+    )
+    zip_location = machine.succeed(
+        f"curl -sf -D /tmp/ziphdr -o /dev/null "
+        f"{base}/users/1/items/ZIPATT22/file {auth} "
+        "&& grep -i '^location:' /tmp/ziphdr | tr -d '\\r' | awk '{print $2}'"
+    ).strip()
+    machine.succeed(f"grep -iq 'zotero-file-md5: {zip_md5}' /tmp/ziphdr")
+    machine.succeed(f"grep -iq 'zotero-file-size: {zip_size}' /tmp/ziphdr")
+    machine.succeed("grep -iq 'zotero-file-compressed: Yes' /tmp/ziphdr")
+    machine.succeed(
+        f"curl -sf -D /tmp/zip-object-hdr '{zip_location}' -o /tmp/downloaded.zip"
+    )
+    machine.succeed("grep -iq '^content-type: application/zip' /tmp/zip-object-hdr")
+    machine.fail("grep -iq '^content-encoding:' /tmp/zip-object-hdr")
+    assert machine.succeed("unzip -p /tmp/downloaded.zip zipped.txt").strip() == (
+        "compressed hello"
+    )
+    machine.succeed(
+        f"curl -sf '{base}/users/1/items?itemKey=ZIPATT22&format=json' {auth} "
+        f"| jq -e '.[0].data.md5 == \"{original_md5}\" "
+        "and .[0].data.filename == \"zipped.txt\"'"
+    )
+    assert (
+        psql(
+            """select md5 || ':' || blob_md5 || ':' || compressed::text
+               from file where library_id = 1 and item_key = 'ZIPATT22'"""
+        )
+        == f"{original_md5}:{zip_md5}:true"
+    )
+
 with subtest("re-authorizing the same file returns exists:1 (dedup)"):
     machine.succeed(
         f"curl -sf -X POST {base}/users/1/items/ATTACH22/file {auth} "
@@ -435,13 +520,14 @@ with subtest("expired upload candidates are deleted before their rows"):
     psql(
         """insert into pending_uploads (
                token_hash, library_id, authorizer_key_hash, bootstrap_user_id,
-               item_key, blob_key, md5, filename, filesize, mtime,
+               item_key, blob_key, md5, upload_md5, filename, filesize, mtime,
                created_at, expires_at
            )
            select decode(lpad(to_hex(i), 64, '0'), 'hex'), 1,
                   decode(repeat('00', 32), 'hex'), 1,
                   'GC' || lpad(i::text, 6, '0'),
                   'libraries/1/uploads/gc-' || i,
+                  '00000000000000000000000000000000',
                   '00000000000000000000000000000000', 'gc', 0, 0,
                   now() - interval '2 hours', now() - interval '1 hour'
            from generate_series(1, 33) as i"""
