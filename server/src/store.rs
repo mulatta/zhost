@@ -752,30 +752,6 @@ pub async fn complete_login_session(
     Ok(LoginSessionChange::Done)
 }
 
-pub async fn api_key_active(
-    pool: &PgPool,
-    token_hash: &[u8],
-    library_id: LibraryId,
-) -> sqlx::Result<bool> {
-    let exists = sqlx::query_scalar::<_, bool>(
-        "select exists ( \
-           select 1
-           from api_keys k
-           join users u on u.id = k.user_id
-           join personal_libraries pl on pl.user_id = u.id
-           join library l on l.id = pl.library_id and l.kind = pl.library_kind
-           join api_key_user_permissions p on p.api_key_id = k.id
-           where k.token_hash = $1 and k.revoked_at is null
-             and u.disabled_at is null and pl.library_id = $2
-             and p.library and p.write and p.files )",
-    )
-    .bind(token_hash)
-    .bind(library_id.get())
-    .fetch_one(pool)
-    .await?;
-    Ok(exists)
-}
-
 /// A write that changes nothing (empty batch / no matching keys): report the
 /// current version, or a conflict if the client's expectation is already stale,
 /// without bumping the version — a no-op must not churn the counter and make
@@ -1101,9 +1077,10 @@ pub async fn write(
             fields.insert("key".into(), Value::from(key.clone()));
             fields.insert("version".into(), Value::from(version));
         }
+        let object_is_stored_file = is_stored_file_attachment(&object);
         if kind == "item"
             && !allow_stored_file_write
-            && (existing_is_stored_file || is_stored_file_attachment(&object))
+            && (existing_is_stored_file || object_is_stored_file)
         {
             return Ok(ObjectMutation::FileWriteDenied);
         }
@@ -1120,6 +1097,16 @@ pub async fn write(
         .bind(&object)
         .execute(&mut *tx)
         .await?;
+        if kind == "item" && !(existing_is_stored_file && object_is_stored_file) {
+            // File metadata is valid only while one stored attachment identity
+            // remains continuous. Reusing a deleted or converted key must not
+            // resurrect bytes registered for its previous identity.
+            sqlx::query("delete from file where library_id = $1 and item_key = $2")
+                .bind(library_id.get())
+                .bind(&key)
+                .execute(&mut *tx)
+                .await?;
+        }
         sqlx::query("delete from deletion where library_id = $1 and kind = $2 and key = $3")
             .bind(library_id.get())
             .bind(kind)
@@ -1175,6 +1162,13 @@ pub async fn delete(
             .bind(key)
             .execute(&mut *tx)
             .await?;
+        if kind == "item" {
+            sqlx::query("delete from file where library_id = $1 and item_key = $2")
+                .bind(library_id.get())
+                .bind(key)
+                .execute(&mut *tx)
+                .await?;
+        }
         sqlx::query(
             "insert into deletion (library_id, kind, key, version) values ($1, $2, $3, $4) \
              on conflict (library_id, kind, key) do update set version = $4",
@@ -1334,13 +1328,35 @@ pub async fn file_meta(
     item_key: &str,
 ) -> sqlx::Result<Option<(String, i64, String)>> {
     let row = sqlx::query(
-        "select md5, mtime, blob_key from file where library_id = $1 and item_key = $2",
+        "select f.md5, f.mtime, f.blob_key \
+         from file f \
+         join object o on o.library_id = f.library_id \
+             and o.kind = 'item' \
+             and o.key = f.item_key \
+             and o.data->>'itemType' = 'attachment' \
+             and o.data->>'linkMode' in ('imported_file', 'imported_url') \
+         where f.library_id = $1 and f.item_key = $2",
     )
     .bind(library_id.get())
     .bind(item_key)
     .fetch_optional(pool)
     .await?;
     Ok(row.map(|r| (r.get("md5"), r.get("mtime"), r.get("blob_key"))))
+}
+
+pub async fn stored_file_attachment_exists(
+    pool: &PgPool,
+    library_id: LibraryId,
+    item_key: &str,
+) -> sqlx::Result<bool> {
+    let data: Option<Value> = sqlx::query_scalar(
+        "select data from object where library_id = $1 and kind = 'item' and key = $2",
+    )
+    .bind(library_id.get())
+    .bind(item_key)
+    .fetch_optional(pool)
+    .await?;
+    Ok(data.as_ref().is_some_and(is_stored_file_attachment))
 }
 
 pub struct FileRegistration<'a> {
@@ -1352,20 +1368,40 @@ pub struct FileRegistration<'a> {
     pub mtime: i64,
 }
 
+pub enum FileRegistrationOutcome {
+    Done(i64),
+    Conflict(i64),
+    InvalidItem,
+}
+
 /// Atomically make one immutable candidate the registered attachment.
 pub async fn register_file(
     pool: &PgPool,
     library_id: LibraryId,
     item_key: &str,
     registration: FileRegistration<'_>,
-) -> sqlx::Result<Outcome<i64>> {
+) -> sqlx::Result<FileRegistrationOutcome> {
     let mut tx = pool.begin().await?;
     // Serializing on the library row makes the file CAS safe for both existing
     // rows and two concurrent first uploads, where PostgreSQL has no row to lock.
     let version = match guarded_version(&mut tx, library_id, None).await? {
         Outcome::Done(version) => version,
-        Outcome::Conflict(current) => return Ok(Outcome::Conflict(current)),
+        Outcome::Conflict(current) => return Ok(FileRegistrationOutcome::Conflict(current)),
     };
+    let item: Option<Value> = sqlx::query_scalar(
+        "select data from object \
+         where library_id = $1 and kind = 'item' and key = $2 for update",
+    )
+    .bind(library_id.get())
+    .bind(item_key)
+    .fetch_optional(&mut *tx)
+    .await?;
+    if item
+        .as_ref()
+        .is_none_or(|data| !is_stored_file_attachment(data))
+    {
+        return Ok(FileRegistrationOutcome::InvalidItem);
+    }
     let current_md5 = sqlx::query_scalar::<_, String>(
         "select md5 from file where library_id = $1 and item_key = $2",
     )
@@ -1380,7 +1416,7 @@ pub async fn register_file(
     };
     if !precondition_matches {
         // Dropping this transaction rolls back the tentative version bump.
-        return Ok(Outcome::Conflict(version - 1));
+        return Ok(FileRegistrationOutcome::Conflict(version - 1));
     }
     sqlx::query(
         "insert into file \
@@ -1416,7 +1452,7 @@ pub async fn register_file(
     .execute(&mut *tx)
     .await?;
     tx.commit().await?;
-    Ok(Outcome::Done(version))
+    Ok(FileRegistrationOutcome::Done(version))
 }
 
 /// `{itemKey: version}` for full-text content changed after `since`. The version

@@ -95,10 +95,12 @@ const PENDING_TTL: std::time::Duration = std::time::Duration::from_secs(3600);
 struct PendingUpload {
     /// Library that authorized the upload token.
     library_id: LibraryId,
+    group_id: Option<GroupId>,
     /// DB key digest, when a user-owned key authorized this upload. Static
     /// recovery keys have no digest and are checked through bootstrap identity.
     api_key_hash: Option<Vec<u8>>,
     bootstrap_user_id: Option<UserId>,
+    bootstrap_permissions: Option<Permissions>,
     /// The attachment item the candidate bytes belong to.
     item_key: String,
     /// MD5 that was current when this upload was authorized. `None` means the
@@ -1255,6 +1257,9 @@ async fn file_post(
         if upload.library_id != request_library() {
             return (StatusCode::FORBIDDEN, "upload token library mismatch").into_response();
         }
+        if upload.group_id != request_access().group_id {
+            return (StatusCode::FORBIDDEN, "upload token group mismatch").into_response();
+        }
         if upload.state != PendingUploadState::Uploaded {
             return (StatusCode::BAD_REQUEST, "no uploaded bytes").into_response();
         }
@@ -1273,13 +1278,17 @@ async fn file_post(
         )
         .await
         {
-            Ok(store::Outcome::Done(version)) => {
+            Ok(store::FileRegistrationOutcome::Done(version)) => {
                 PENDING.lock().unwrap().remove(token);
                 (StatusCode::NO_CONTENT, version_headers(version)).into_response()
             }
-            Ok(store::Outcome::Conflict(current)) => {
+            Ok(store::FileRegistrationOutcome::Conflict(current)) => {
                 PENDING.lock().unwrap().remove(token);
                 conflict(current)
+            }
+            Ok(store::FileRegistrationOutcome::InvalidItem) => {
+                PENDING.lock().unwrap().remove(token);
+                (StatusCode::CONFLICT, "attachment item changed").into_response()
             }
             Err(error) => server_error("register file", error),
         };
@@ -1299,6 +1308,11 @@ async fn file_post(
             "If-Match or If-None-Match required",
         )
             .into_response();
+    }
+    match store::stored_file_attachment_exists(&state.pool, request_library(), &key).await {
+        Ok(true) => {}
+        Ok(false) => return StatusCode::NOT_FOUND.into_response(),
+        Err(error) => return server_error("file attachment lookup", error),
     }
 
     let md5 = form.get("md5").cloned().unwrap_or_default();
@@ -1349,6 +1363,7 @@ async fn file_post(
             token.clone(),
             PendingUpload {
                 library_id: request_library(),
+                group_id: request_access().group_id,
                 api_key_hash: if state.config.keys.contains_key(&context.presented_key) {
                     None
                 } else {
@@ -1359,6 +1374,11 @@ async fn file_post(
                     .keys
                     .contains_key(&context.presented_key)
                     .then_some(context.principal.user_id),
+                bootstrap_permissions: state
+                    .config
+                    .keys
+                    .contains_key(&context.presented_key)
+                    .then_some(context.permissions),
                 item_key: key.clone(),
                 expected_md5: if if_none_match {
                     None
@@ -1389,6 +1409,36 @@ async fn file_post(
     .into_response()
 }
 
+async fn upload_scope_authorized(
+    state: &AppState,
+    upload: &PendingUpload,
+    principal: &crate::domain::Principal,
+    api_key_id: Option<crate::domain::ApiKeyId>,
+    permissions: Permissions,
+    static_permissions: Option<Permissions>,
+) -> sqlx::Result<bool> {
+    let Some(group_id) = upload.group_id else {
+        return Ok(principal.library_id == upload.library_id
+            && permissions.library
+            && permissions.write
+            && permissions.files);
+    };
+    match store::resolve_group_library(
+        &state.pool,
+        group_id,
+        principal.user_id,
+        api_key_id,
+        static_permissions,
+    )
+    .await?
+    {
+        store::GroupLibraryResolution::Allowed(access) => {
+            Ok(access.library_id == upload.library_id && access.file_write)
+        }
+        store::GroupLibraryResolution::Denied | store::GroupLibraryResolution::Missing => Ok(false),
+    }
+}
+
 /// Receive the raw attachment bytes for a pending upload token, verify them
 /// against the authorized md5/filesize, and store an immutable candidate.
 /// Rejects an unknown token. Verifying here (where the bytes are in hand) keeps
@@ -1415,15 +1465,48 @@ async fn upload_put(
         return (StatusCode::CONFLICT, "upload token already used").into_response();
     }
     if let Some(token_hash) = &upload.api_key_hash {
-        match store::api_key_active(&state.pool, token_hash, upload.library_id).await {
+        let authenticated = match store::authenticate_api_key(&state.pool, token_hash).await {
+            Ok(authenticated) => authenticated,
+            Err(error) => return server_error("upload authorization", error),
+        };
+        let Some((api_key_id, principal, permissions)) = authenticated else {
+            return (StatusCode::FORBIDDEN, "API key revoked").into_response();
+        };
+        match upload_scope_authorized(
+            &state,
+            &upload,
+            &principal,
+            Some(api_key_id),
+            permissions,
+            None,
+        )
+        .await
+        {
             Ok(true) => {}
-            Ok(false) => return (StatusCode::FORBIDDEN, "API key revoked").into_response(),
+            Ok(false) => return (StatusCode::FORBIDDEN, "upload access revoked").into_response(),
             Err(error) => return server_error("upload authorization", error),
         }
     } else if let Some(user_id) = upload.bootstrap_user_id {
-        match store::bootstrap_principal(&state.pool, user_id).await {
-            Ok(Some(_)) => {}
+        let principal = match store::bootstrap_principal(&state.pool, user_id).await {
+            Ok(Some(principal)) => principal,
             Ok(None) => return (StatusCode::FORBIDDEN, "bootstrap user disabled").into_response(),
+            Err(error) => return server_error("upload authorization", error),
+        };
+        let Some(permissions) = upload.bootstrap_permissions else {
+            return (StatusCode::FORBIDDEN, "bootstrap permission missing").into_response();
+        };
+        match upload_scope_authorized(
+            &state,
+            &upload,
+            &principal,
+            None,
+            permissions,
+            Some(permissions),
+        )
+        .await
+        {
+            Ok(true) => {}
+            Ok(false) => return (StatusCode::FORBIDDEN, "upload access revoked").into_response(),
             Err(error) => return server_error("upload authorization", error),
         }
     }
@@ -1644,6 +1727,9 @@ async fn log_and_auth(State(state): State<AppState>, req: Request, next: Next) -
                 | axum::http::Method::PATCH
                 | axum::http::Method::DELETE
         );
+        if mutating && path.contains("/file") && access.is_some_and(|access| !access.file_write) {
+            return (StatusCode::FORBIDDEN, "file editing denied").into_response();
+        }
         if mutating && access.is_some_and(|access| !access.permissions.write) {
             return (StatusCode::FORBIDDEN, "read-only API key").into_response();
         }
@@ -1781,6 +1867,10 @@ fn app(state: AppState) -> Router {
         .route(
             "/groups/{id}/items/{key}/fulltext",
             get(fulltext_item),
+        )
+        .route(
+            "/groups/{id}/items/{key}/file",
+            get(file_get).post(file_post),
         )
         .route("/groups/{id}/deleted", get(deleted))
         .route(

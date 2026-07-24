@@ -157,6 +157,13 @@ psql(
 )
 psql("insert into library (id, version) values (22, 0)")
 psql(
+    """insert into object (library_id, kind, key, version, data)
+       values (22, 'item', 'OLDLIB22', 0,
+               '{"key":"OLDLIB22","version":0,"itemType":"attachment",
+                 "linkMode":"imported_file","filename":"old.pdf",
+                 "contentType":"application/pdf"}')"""
+)
+psql(
     """insert into file
        (library_id, item_key, md5, filename, filesize, mtime, version)
        values (22, 'OLDLIB22', '27b525e7d8fdb7db5b821c3a0bf7c60e',
@@ -403,6 +410,7 @@ with subtest("non-default legacy attachment path survives the blob-key migration
         "/tmp/old-library-file"
     )
     assert machine.succeed(f"curl -sf '{old_location}'").strip() == "old22"
+    psql("delete from object where library_id = 22 and key = 'OLDLIB22'")
 
 with subtest("current-key introspection returns the authenticated DB owner"):
     machine.succeed(
@@ -786,6 +794,197 @@ with subtest("group mutations enforce key grants, role policy and file policy"):
     )
     psql("update groups set library_editing = 'admins' where id = 303")
     psql("delete from api_key_all_groups_permissions where api_key_id = 1005")
+
+with subtest("group files revalidate policy and grants across upload steps"):
+    file_form = (
+        "md5=5d41402abc4b2a76b9719d911017c592"
+        "&filename=group.pdf&filesize=5&mtime=1700000000000"
+    )
+    psql(
+        """insert into object (library_id, kind, key, version, data)
+           values
+           (33, 'item', 'STALAT22', 21,
+            '{"key":"STALAT22","version":21,"itemType":"attachment",
+              "linkMode":"imported_file","filename":"stale.pdf"}')"""
+    )
+    stale_item = machine.succeed(
+        f"curl -sf -X POST {base}/groups/303/items/STALAT22/file {api_headers} "
+        f"-H 'Zotero-API-Key: {alice}' -H 'If-None-Match: *' "
+        f"-d '{file_form}' | jq -r .uploadKey"
+    ).strip()
+    assert http_code(f"/uploads/{stale_item}", method="POST", body="hello") == "201"
+    psql(
+        """update object
+           set data = data || '{"itemType":"book"}'
+           where library_id = 33 and kind = 'item' and key = 'STALAT22'"""
+    )
+    assert (
+        machine.succeed(
+            f"curl -s -o /dev/null -w '%{{http_code}}' -X POST "
+            f"{base}/groups/303/items/STALAT22/file {api_headers} "
+            f"-H 'Zotero-API-Key: {alice}' -d 'upload={stale_item}'"
+        ).strip()
+        == "409"
+    )
+    assert (
+        psql(
+            """select count(*) from file
+               where library_id = 33 and item_key = 'STALAT22'"""
+        )
+        == "0"
+    )
+    psql(
+        """delete from object
+           where library_id = 33 and kind = 'item' and key = 'STALAT22'"""
+    )
+    assert (
+        machine.succeed(
+            f"curl -s -o /dev/null -w '%{{http_code}}' -X POST "
+            f"{base}/groups/303/items/XLDATT22/file {api_headers} "
+            f"-H 'Zotero-API-Key: {bob_group_rw}' -H 'If-None-Match: *' "
+            f"-d '{file_form}'"
+        ).strip()
+        == "403"
+    )
+
+    psql("update groups set file_editing = 'members' where id = 303")
+    revoked_before_put = machine.succeed(
+        f"curl -sf -X POST {base}/groups/303/items/XLDATT22/file {api_headers} "
+        f"-H 'Zotero-API-Key: {bob_group_rw}' -H 'If-None-Match: *' "
+        f"-d '{file_form}' | jq -r .uploadKey"
+    ).strip()
+    psql("delete from api_key_group_permissions where api_key_id = 1008")
+    assert (
+        http_code(f"/uploads/{revoked_before_put}", method="POST", body="hello")
+        == "403"
+    )
+    psql(
+        """insert into api_key_group_permissions
+           (api_key_id, user_id, group_id, library, write)
+           values (1008, 202, 303, true, true)"""
+    )
+
+    revoked_before_register = machine.succeed(
+        f"curl -sf -X POST {base}/groups/303/items/XLDATT22/file {api_headers} "
+        f"-H 'Zotero-API-Key: {bob_group_rw}' -H 'If-None-Match: *' "
+        f"-d '{file_form}' | jq -r .uploadKey"
+    ).strip()
+    assert (
+        http_code(f"/uploads/{revoked_before_register}", method="POST", body="hello")
+        == "201"
+    )
+    psql("delete from api_key_group_permissions where api_key_id = 1008")
+    assert (
+        machine.succeed(
+            f"curl -s -o /dev/null -w '%{{http_code}}' -X POST "
+            f"{base}/groups/303/items/XLDATT22/file {api_headers} "
+            f"-H 'Zotero-API-Key: {bob_group_rw}' "
+            f"-d 'upload={revoked_before_register}'"
+        ).strip()
+        == "403"
+    )
+    assert (
+        psql(
+            """select count(*) from file
+               where library_id = 33 and item_key = 'XLDATT22'"""
+        )
+        == "0"
+    )
+    psql(
+        """insert into api_key_group_permissions
+           (api_key_id, user_id, group_id, library, write)
+           values (1008, 202, 303, true, true)"""
+    )
+    psql("update groups set file_editing = 'admins' where id = 303")
+
+    owner_upload = machine.succeed(
+        f"curl -sf -X POST {base}/groups/303/items/XLDATT22/file {api_headers} "
+        f"-H 'Zotero-API-Key: {alice}' -H 'If-None-Match: *' "
+        f"-d '{file_form}' | jq -r .uploadKey"
+    ).strip()
+    assert http_code(f"/uploads/{owner_upload}", method="POST", body="hello") == "201"
+    assert (
+        machine.succeed(
+            f"curl -s -o /dev/null -w '%{{http_code}}' -X POST "
+            f"{base}/groups/303/items/XLDATT22/file {api_headers} "
+            f"-H 'Zotero-API-Key: {alice}' -d 'upload={owner_upload}'"
+        ).strip()
+        == "204"
+    )
+    assert http_code("/groups/303/items/XLDATT22/file", bob) == "302"
+    assert psql(
+        """select blob_key from file
+           where library_id = 33 and item_key = 'XLDATT22'"""
+    ).startswith("libraries/33/uploads/")
+
+    group_version = int(psql("select version from library where id = 33"))
+    assert (
+        http_code(
+            "/groups/303/items",
+            alice,
+            method="POST",
+            body='[{"key":"XLDATT22","itemType":"book"}]',
+            version=group_version,
+        )
+        == "200"
+    )
+    assert (
+        psql(
+            """select count(*) from file
+               where library_id = 33 and item_key = 'XLDATT22'"""
+        )
+        == "0"
+    )
+    assert http_code("/groups/303/items/XLDATT22/file", bob) == "404"
+
+    group_version = int(psql("select version from library where id = 33"))
+    assert (
+        http_code(
+            "/groups/303/items",
+            alice,
+            method="POST",
+            body='[{"key":"XLDATT22","itemType":"attachment"}]',
+            version=group_version,
+        )
+        == "200"
+    )
+    assert http_code("/groups/303/items/XLDATT22/file", bob) == "404"
+    replacement_upload = machine.succeed(
+        f"curl -sf -X POST {base}/groups/303/items/XLDATT22/file {api_headers} "
+        f"-H 'Zotero-API-Key: {alice}' -H 'If-None-Match: *' "
+        f"-d '{file_form}' | jq -r .uploadKey"
+    ).strip()
+    assert (
+        http_code(f"/uploads/{replacement_upload}", method="POST", body="hello")
+        == "201"
+    )
+    assert (
+        machine.succeed(
+            f"curl -s -o /dev/null -w '%{{http_code}}' -X POST "
+            f"{base}/groups/303/items/XLDATT22/file {api_headers} "
+            f"-H 'Zotero-API-Key: {alice}' -d 'upload={replacement_upload}'"
+        ).strip()
+        == "204"
+    )
+
+    group_version = int(psql("select version from library where id = 33"))
+    assert (
+        http_code(
+            "/groups/303/items?itemKey=XLDATT22",
+            alice,
+            method="DELETE",
+            version=group_version,
+        )
+        == "204"
+    )
+    assert (
+        psql(
+            """select count(*) from file
+               where library_id = 33 and item_key = 'XLDATT22'"""
+        )
+        == "0"
+    )
+    assert http_code("/groups/303/items/XLDATT22/file", bob) == "404"
     psql("delete from api_keys where id = 1008")
 
 with subtest("static recovery key remains bound to the bootstrap user"):
@@ -1278,6 +1477,15 @@ with subtest("no-notes writers retain upstream batch mutation behavior"):
     )
 
 with subtest("same attachment key stays isolated across personal libraries"):
+    psql(
+        """insert into object (library_id, kind, key, version, data)
+           select id, 'item', 'SHARED22', version,
+                  jsonb_build_object(
+                    'key', 'SHARED22', 'version', version,
+                    'itemType', 'attachment', 'linkMode', 'imported_file',
+                    'filename', 'shared.pdf')
+           from library where id in (1, 22)"""
+    )
     alice_token = machine.succeed(
         f"curl -sf -X POST {base}/users/101/items/SHARED22/file {api_headers} "
         f"-H 'Zotero-API-Key: {alice}' -H 'If-None-Match: *' "
@@ -1322,8 +1530,17 @@ with subtest("same attachment key stays isolated across personal libraries"):
     assert machine.succeed(f"curl -sf '{bob_location}'").strip() == "world"
 
 with subtest("revoked key cannot finish an authorized upload"):
+    psql(
+        """insert into object (library_id, kind, key, version, data)
+           select id, 'item', 'REVKE222', version,
+                  jsonb_build_object(
+                    'key', 'REVKE222', 'version', version,
+                    'itemType', 'attachment', 'linkMode', 'imported_file',
+                    'filename', 'revoked.pdf')
+           from library where id = 22"""
+    )
     pending_token = machine.succeed(
-        f"curl -sf -X POST {base}/users/202/items/REVOKE22/file {api_headers} "
+        f"curl -sf -X POST {base}/users/202/items/REVKE222/file {api_headers} "
         f"-H 'Zotero-API-Key: {bob_full}' -H 'If-None-Match: *' "
         "-d 'md5=7d793037a0760186574b0282f2f435e7&filename=r.pdf&filesize=5&mtime=3' "
         "| jq -r .uploadKey"
