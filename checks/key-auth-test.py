@@ -1141,9 +1141,14 @@ with subtest("bootstrap OIDC ownership conflict fails startup closed"):
             set user_id = 202
             where issuer = '{oidc_issuer}' and subject = '{oidc_subject}'"""
     )
+    machine.succeed(
+        "mkdir -p /run/systemd/system/zhost.service.d && "
+        "printf '[Service]\\nRestart=no\\n' "
+        "> /run/systemd/system/zhost.service.d/test-no-restart.conf && "
+        "systemctl daemon-reload"
+    )
     machine.succeed("systemctl start zhost.service >/dev/null 2>&1 || true")
-    machine.wait_until_fails("systemctl is-active --quiet zhost.service")
-    machine.succeed("systemctl is-failed --quiet zhost.service")
+    machine.wait_until_succeeds("systemctl is-failed --quiet zhost.service")
     assert (
         psql(
             f"""select user_id
@@ -1157,6 +1162,10 @@ with subtest("bootstrap OIDC ownership conflict fails startup closed"):
         f"""update external_identities
             set user_id = 101
             where issuer = '{oidc_issuer}' and subject = '{oidc_subject}'"""
+    )
+    machine.succeed(
+        "rm /run/systemd/system/zhost.service.d/test-no-restart.conf && "
+        "systemctl daemon-reload"
     )
     machine.succeed("systemctl reset-failed zhost.service")
     machine.succeed("systemctl start zhost.service")
