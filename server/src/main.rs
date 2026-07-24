@@ -33,6 +33,9 @@ use sqlx::PgPool;
 use crate::config::Config;
 use crate::domain::{GroupId, LibraryAccess, LibraryId, Permissions, RequestContext, UserId};
 use crate::error::{s3_error, server_error};
+use crate::http::access::{
+    request_access, request_access_scope, request_library, request_permissions,
+};
 use crate::http::headers::{
     conflict, csv_of, current_headers, header_value, if_modified_since, next_link, precondition,
     since_check, since_of, version_headers,
@@ -47,28 +50,6 @@ struct AppState {
     config: Arc<Config>,
     pool: PgPool,
     storage: Arc<s3::Storage>,
-}
-
-tokio::task_local! {
-    static REQUEST_ACCESS: LibraryAccess;
-}
-
-fn request_library() -> LibraryId {
-    REQUEST_ACCESS
-        .try_with(|access| access.library_id)
-        .expect("library store access requires authenticated request context")
-}
-
-fn request_access() -> LibraryAccess {
-    REQUEST_ACCESS
-        .try_with(|access| *access)
-        .expect("library access requires authenticated request context")
-}
-
-fn request_permissions() -> Permissions {
-    REQUEST_ACCESS
-        .try_with(|access| access.permissions)
-        .expect("permission-aware access requires authenticated request context")
 }
 
 fn upload_storage_key(library_id: LibraryId, upload_token: &str) -> String {
@@ -1581,7 +1562,7 @@ async fn log_and_auth(State(state): State<AppState>, req: Request, next: Next) -
 
     let request = Request::from_parts(parts, Body::from(bytes));
     let response = match selected_access {
-        Some(access) => REQUEST_ACCESS.scope(access, next.run(request)).await,
+        Some(access) => request_access_scope(access, next.run(request)).await,
         None => next.run(request).await,
     };
     let status = response.status();
