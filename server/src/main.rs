@@ -76,14 +76,8 @@ fn request_permissions() -> Permissions {
         .expect("permission-aware access requires authenticated request context")
 }
 
-fn storage_key(library_id: LibraryId, item_key: &str) -> String {
-    // Preserve existing single-user blobs at bare keys. New personal/group
-    // libraries use a namespace so equal Zotero keys cannot collide.
-    if library_id.get() == 1 {
-        item_key.to_owned()
-    } else {
-        format!("libraries/{}/{}", library_id.get(), item_key)
-    }
+fn upload_storage_key(library_id: LibraryId, upload_token: &str) -> String {
+    format!("libraries/{}/uploads/{upload_token}", library_id.get())
 }
 
 /// In-flight file uploads, keyed by an unguessable upload token (not the item
@@ -118,16 +112,27 @@ struct PendingUpload {
     /// recovery keys have no digest and are checked through bootstrap identity.
     api_key_hash: Option<Vec<u8>>,
     bootstrap_user_id: Option<UserId>,
-    /// The attachment item the bytes belong to (and the object key in the bucket).
+    /// The attachment item the candidate bytes belong to.
     item_key: String,
+    /// MD5 that was current when this upload was authorized. `None` means the
+    /// authorization required no registered file to exist.
+    expected_md5: Option<String>,
+    /// Immutable candidate object. Registration atomically makes this live by
+    /// storing the pointer beside the file metadata.
+    blob_key: String,
     md5: String,
     filename: String,
     filesize: i64,
     mtime: i64,
-    /// Set once the bytes have been verified and stored, so registration can't
-    /// commit metadata for an object that was never uploaded.
-    uploaded: bool,
+    state: PendingUploadState,
     created: std::time::Instant,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PendingUploadState {
+    Authorized,
+    Uploading,
+    Uploaded,
 }
 
 /// An unguessable upload token (128 bits of OS randomness, hex-encoded). `None`
@@ -995,7 +1000,16 @@ async fn file_post(
     // Registration step: the client posts upload=<token> after PUTting the bytes
     // to the upload endpoint, which verified them and stored the object.
     if let Some(token) = form.get("upload") {
-        let pending = PENDING.lock().unwrap().get(token).cloned();
+        let pending = {
+            let mut pending = PENDING.lock().unwrap();
+            if pending
+                .get(token)
+                .is_some_and(|upload| upload.created.elapsed() >= PENDING_TTL)
+            {
+                pending.remove(token);
+            }
+            pending.get(token).cloned()
+        };
         let Some(upload) = pending else {
             return (StatusCode::BAD_REQUEST, "no pending upload").into_response();
         };
@@ -1005,23 +1019,31 @@ async fn file_post(
         if upload.library_id != request_library() {
             return (StatusCode::FORBIDDEN, "upload token library mismatch").into_response();
         }
-        if !upload.uploaded {
+        if upload.state != PendingUploadState::Uploaded {
             return (StatusCode::BAD_REQUEST, "no uploaded bytes").into_response();
         }
         return match store::register_file(
             &state.pool,
             request_library(),
             &key,
-            &upload.md5,
-            &upload.filename,
-            upload.filesize,
-            upload.mtime,
+            store::FileRegistration {
+                expected_md5: upload.expected_md5.as_deref(),
+                blob_key: &upload.blob_key,
+                md5: &upload.md5,
+                filename: &upload.filename,
+                filesize: upload.filesize,
+                mtime: upload.mtime,
+            },
         )
         .await
         {
-            Ok(version) => {
+            Ok(store::Outcome::Done(version)) => {
                 PENDING.lock().unwrap().remove(token);
                 (StatusCode::NO_CONTENT, version_headers(version)).into_response()
+            }
+            Ok(store::Outcome::Conflict(current)) => {
+                PENDING.lock().unwrap().remove(token);
+                conflict(current)
             }
             Err(error) => server_error("register file", error),
         };
@@ -1045,7 +1067,7 @@ async fn file_post(
 
     let md5 = form.get("md5").cloned().unwrap_or_default();
     let stored_md5 = match store::file_meta(&state.pool, request_library(), &key).await {
-        Ok(meta) => meta.map(|(m, _)| m),
+        Ok(meta) => meta.map(|(m, _, _)| m),
         Err(error) => return server_error("file auth", error),
     };
 
@@ -1080,7 +1102,7 @@ async fn file_post(
     }
 
     // Authorize: mint an unguessable token, remember the upload (pruning stale
-    // ones), and hand back the upload URL. The bytes land at the item key's path.
+    // ones), and hand back the upload URL. Bytes land at a token-specific path.
     let Some(token) = upload_token() else {
         return StatusCode::INTERNAL_SERVER_ERROR.into_response();
     };
@@ -1102,6 +1124,12 @@ async fn file_post(
                     .contains_key(&context.presented_key)
                     .then_some(context.principal.user_id),
                 item_key: key.clone(),
+                expected_md5: if if_none_match {
+                    None
+                } else {
+                    stored_md5.clone()
+                },
+                blob_key: upload_storage_key(request_library(), &token),
                 md5,
                 filename: form.get("filename").cloned().unwrap_or_default(),
                 filesize: form
@@ -1109,7 +1137,7 @@ async fn file_post(
                     .and_then(|s| s.parse().ok())
                     .unwrap_or(0),
                 mtime: form.get("mtime").and_then(|s| s.parse().ok()).unwrap_or(0),
-                uploaded: false,
+                state: PendingUploadState::Authorized,
                 created: std::time::Instant::now(),
             },
         );
@@ -1126,7 +1154,7 @@ async fn file_post(
 }
 
 /// Receive the raw attachment bytes for a pending upload token, verify them
-/// against the authorized md5/filesize, and store the object in the bucket.
+/// against the authorized md5/filesize, and store an immutable candidate.
 /// Rejects an unknown token. Verifying here (where the bytes are in hand) keeps
 /// the integrity check server-side now that the bytes go straight to S3.
 async fn upload_put(
@@ -1134,10 +1162,22 @@ async fn upload_put(
     Path(token): Path<String>,
     body: Bytes,
 ) -> Response {
-    let pending = PENDING.lock().unwrap().get(&token).cloned();
+    let pending = {
+        let mut pending = PENDING.lock().unwrap();
+        if pending
+            .get(&token)
+            .is_some_and(|upload| upload.created.elapsed() >= PENDING_TTL)
+        {
+            pending.remove(&token);
+        }
+        pending.get(&token).cloned()
+    };
     let Some(upload) = pending else {
         return (StatusCode::BAD_REQUEST, "unknown upload token").into_response();
     };
+    if upload.state != PendingUploadState::Authorized {
+        return (StatusCode::CONFLICT, "upload token already used").into_response();
+    }
     if let Some(token_hash) = &upload.api_key_hash {
         match store::api_key_active(&state.pool, token_hash, upload.library_id).await {
             Ok(true) => {}
@@ -1168,20 +1208,37 @@ async fn upload_put(
         )
             .into_response();
     }
+    {
+        let mut pending = PENDING.lock().unwrap();
+        let Some(current) = pending.get_mut(&token) else {
+            return (StatusCode::BAD_REQUEST, "unknown upload token").into_response();
+        };
+        if current.created.elapsed() >= PENDING_TTL {
+            pending.remove(&token);
+            return (StatusCode::BAD_REQUEST, "expired upload token").into_response();
+        }
+        if current.state != PendingUploadState::Authorized {
+            return (StatusCode::CONFLICT, "upload token already used").into_response();
+        }
+        current.state = PendingUploadState::Uploading;
+    }
     if let Err(error) = state
         .storage
-        .put(
-            &storage_key(upload.library_id, &upload.item_key),
-            &body,
-            "application/octet-stream",
-        )
+        .put(&upload.blob_key, &body, "application/octet-stream")
         .await
     {
+        if let Some(current) = PENDING.lock().unwrap().get_mut(&token) {
+            if current.state == PendingUploadState::Uploading {
+                current.state = PendingUploadState::Authorized;
+            }
+        }
         return s3_error("store file", error);
     }
     // Mark the pending upload stored so registration can commit its metadata.
     if let Some(u) = PENDING.lock().unwrap().get_mut(&token) {
-        u.uploaded = true;
+        if u.state == PendingUploadState::Uploading {
+            u.state = PendingUploadState::Uploaded;
+        }
     }
     StatusCode::CREATED.into_response()
 }
@@ -1197,16 +1254,13 @@ async fn file_get(
     if !valid_key(&key) {
         return StatusCode::NOT_FOUND.into_response();
     }
-    let (md5, mtime) = match store::file_meta(&state.pool, request_library(), &key).await {
+    let (md5, mtime, blob_key) = match store::file_meta(&state.pool, request_library(), &key).await
+    {
         Ok(Some(meta)) => meta,
         Ok(None) => return StatusCode::NOT_FOUND.into_response(),
         Err(error) => return server_error("file meta", error),
     };
-    let url = match state
-        .storage
-        .presign_get(&storage_key(request_library(), &key))
-        .await
-    {
+    let url = match state.storage.presign_get(&blob_key).await {
         Ok(url) => url,
         Err(error) => return s3_error("presign download", error),
     };
