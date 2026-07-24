@@ -2,7 +2,7 @@
 # release is owned here, not inherited from the consumer's nixpkgs. A consumer
 # whose nixpkgs races ahead of the published Zotero binaries (no dmg yet, no
 # matching hash) therefore cannot break this module; the version only moves when
-# this flake's lock is bumped together with the dmg hash in pkgs/zotero.
+# this flake's lock is bumped together with the dmg hash in nix/packages/zotero.
 { zhostpkgs }:
 {
   config,
@@ -23,7 +23,7 @@ in
 
     package = lib.mkOption {
       type = lib.types.package;
-      default = pkgs.callPackage ../pkgs/zotero {
+      default = pkgs.callPackage ../../packages/zotero {
         inherit (cfg)
           apiUrl
           wwwUrl
@@ -33,7 +33,7 @@ in
         # Pin the base to this flake's nixpkgs, not the consumer's.
         zotero = baseZotero;
       };
-      defaultText = lib.literalExpression "pkgs.callPackage <zhost/pkgs/zotero> { inherit (config.programs.zotero) apiUrl wwwUrl streamUrl prefs; zotero = <zhost nixpkgs>.zotero; }";
+      defaultText = lib.literalExpression "pkgs.callPackage <zhost/nix/packages/zotero> { inherit (config.programs.zotero) apiUrl wwwUrl streamUrl prefs; zotero = <zhost nixpkgs>.zotero; }";
       description = ''
         The Zotero package, built from this flake's patched derivation against
         the configured endpoints. The base Zotero release is pinned to this

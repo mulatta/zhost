@@ -63,5 +63,5 @@ testPkgs.testers.runNixOSTest {
     ];
   };
 
-  testScript = builtins.readFile ./sync-test.py;
+  testScript = builtins.readFile ../../checks/sync-test.py;
 }

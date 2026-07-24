@@ -29,7 +29,7 @@ let
   };
   dmgHash =
     dmgHashes.${version}
-      or (throw "zhost: no Zotero dmg hash for ${version}; prefetch it and add it to pkgs/zotero/darwin.nix");
+      or (throw "zhost: no Zotero dmg hash for ${version}; prefetch it and add it to nix/packages/zotero/darwin.nix");
 in
 stdenv.mkDerivation (finalAttrs: {
   pname = "zotero";
