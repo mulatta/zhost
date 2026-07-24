@@ -7,8 +7,10 @@ rustPlatform.buildRustPackage {
   pname = "zhost";
   version = "0.1.0";
 
-  src = ../../../server;
-  cargoLock.lockFile = ../../../server/Cargo.lock;
+  src = ../../..;
+  cargoLock.lockFile = ../../../Cargo.lock;
+
+  buildAndTestSubdir = "server";
 
   meta = {
     description = "Self-hosted Zotero Web API v3 sync server";
