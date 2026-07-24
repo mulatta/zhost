@@ -27,6 +27,7 @@ testPkgs.testers.runNixOSTest {
       # Only this SSO identity (as forwarded by the front proxy) may authorize a
       # login; the test simulates the proxy by sending the header directly.
       loginAuthorizedUser = "owner@mulatta.io";
+      loginKdfKeyFile = testPkgs.writeText "zhost-login-kdf-key" "0123456789abcdef0123456789abcdef";
       # Attachment bytes go to the local RustFS standing in for S3/R2.
       s3 = {
         endpoint = "http://127.0.0.1:9000";

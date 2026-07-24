@@ -6,6 +6,8 @@ edition = "2021"
 [dependencies]
 axum = "0.8"
 flate2 = "1"
+# Derive restart-stable login handoff keys from a dedicated server credential.
+hmac = "0.12"
 # Verify uploaded attachment bytes against the client-declared md5.
 md-5 = "0.10"
 sqlx = { version = "0.8", default-features = false, features = [

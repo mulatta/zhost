@@ -59,6 +59,10 @@ with subtest("login session hands out the key only after authorization"):
     machine.succeed(f"curl -sf '{login_url}' | grep -qi 'Authorize'")
     machine.succeed(f"curl -sf {base}/keys/sessions/{token} | jq -e '.status == \"pending\"'")
     machine.succeed(f"curl -sf {base}/keys/sessions/{token} | jq -e '.apiKey == null'")
+    machine.succeed("systemctl restart zhost.service")
+    machine.wait_for_unit("zhost.service")
+    machine.wait_for_open_port(8189)
+    machine.succeed(f"curl -sf {base}/keys/sessions/{token} | jq -e '.status == \"pending\"'")
     # A cross-site form POST (foreign Origin) is refused even with a valid identity.
     assert (
         http_code(f"-X POST {base}/login -H 'Origin: https://evil.example' {sso} -d 'session={token}'")
@@ -73,16 +77,52 @@ with subtest("login session hands out the key only after authorization"):
     )
     # The consent POST (Approve) with the authorized identity completes the flow.
     machine.succeed(f"curl -sf -X POST {base}/login {sso} -d 'session={token}'")
-    machine.succeed(f"curl -sf {base}/keys/sessions/{token} | jq -e '.status == \"completed\"'")
-    machine.succeed(f"curl -sf {base}/keys/sessions/{token} | jq -e '.apiKey == \"testtoken\"'")
-    # A canceled session no longer hands out the key.
-    machine.succeed(f"curl -sf -X DELETE {base}/keys/sessions/{token}")
-    machine.succeed(f"curl -sf {base}/keys/sessions/{token} | jq -e '.status == \"pending\"'")
+    machine.succeed(f"curl -sf {base}/keys/sessions/{token} > /tmp/completed-session")
+    login_key = machine.succeed("jq -r .apiKey /tmp/completed-session").strip()
+    assert len(login_key) == 24
+    assert set(login_key) <= set("23456789ABCDEFGHIJKLMNPQRSTUVWXYZ"), login_key
+    assert login_key != "testtoken"
+    machine.succeed(
+        "jq -e '.status == \"completed\" and .userID == 1 and .username == \"zhost\"' "
+        "/tmp/completed-session"
+    )
+
+    machine.succeed("systemctl restart zhost.service")
+    machine.wait_for_unit("zhost.service")
+    machine.wait_for_open_port(8189)
+    machine.succeed(f"curl -sf {base}/keys/sessions/{token} > /tmp/restarted-session")
+    assert machine.succeed("jq -r .apiKey /tmp/restarted-session").strip() == login_key
+    machine.succeed(
+        "jq -e '.status == \"completed\" and .userID == 1 and .username == \"zhost\"' "
+        "/tmp/restarted-session"
+    )
+    machine.succeed(
+        f"""curl -sf -H 'Zotero-API-Key: {login_key}' {base}/keys/current |
+        jq -e '. == {{
+          "key":"{login_key}",
+          "userID":1,
+          "username":"zhost",
+          "displayName":"zhost",
+          "access":{{"user":{{
+            "library":true,"files":true,"notes":true,"write":true
+          }}}}
+        }}'"""
+    )
+    assert http_code(f"-X DELETE {base}/keys/sessions/{token}") == "409"
+
+    machine.succeed(f"curl -sf -X POST {base}/keys/sessions -d '{{}}' > /tmp/cancel-session")
+    cancel_token = machine.succeed("jq -r .sessionToken /tmp/cancel-session").strip()
+    assert http_code(f"-X DELETE {base}/keys/sessions/{cancel_token}") == "204"
+    machine.succeed(
+        f"curl -sf {base}/keys/sessions/{cancel_token} | jq -e '.status == \"cancelled\"'"
+    )
+    assert http_code(f"-X DELETE {base}/keys/sessions/{cancel_token}") == "409"
 
 with subtest("the login consent endpoint validates the session token"):
     assert http_code(f"{base}/login") == "400"  # missing ?session
     assert http_code(f"{base}/login?session=nope") == "404"  # unknown session
     assert http_code(f"-X POST {base}/login {sso} -d 'session=nope'") == "404"
+    assert http_code(f"{base}/keys/sessions/nope") == "404"
 
 with subtest("groups endpoint returns an empty set (single personal library)"):
     machine.succeed(f"curl -sf {base}/users/1/groups {auth} | jq -e '. == {{}}'")
@@ -886,6 +926,7 @@ with subtest("request journal keeps routing evidence without secrets or content"
             ("attachment body", upload_marker),
             ("JSON body", json_marker),
             ("API key", "testtoken"),
+            ("login API key", login_key),
         )
         if secret in journal
     ]

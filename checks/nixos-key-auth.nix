@@ -30,6 +30,8 @@ testPkgs.testers.runNixOSTest {
       bind = "127.0.0.1:8189";
       publicUrl = "http://localhost:8189";
       keys.recovery.file = testPkgs.writeText "zhost-recovery-key" "recoverytoken";
+      loginAuthorizedUser = "owner@mulatta.io";
+      loginKdfKeyFile = testPkgs.writeText "zhost-login-kdf-key" "0123456789abcdef0123456789abcdef";
       s3 = {
         endpoint = "http://127.0.0.1:9000";
         region = "us-east-1";

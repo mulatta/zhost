@@ -1,5 +1,9 @@
 """DB-backed API-key contract and populated-v7 migration coverage."""
 
+import hashlib
+import json
+
+
 base = "http://localhost:8189"
 recovery = "recoverytoken"
 alice = "AliceKey23456789AbCdEfGh"
@@ -9,6 +13,7 @@ bob_full = "BobFllAB23456789CdEfGhJK"
 bob_notes_write = "BobNwrtAB23456789CdEfGh"
 revoked = "RevokedK23456789AbCdEfGh"
 api_headers = "-H 'Zotero-API-Version: 3' -H 'Zotero-Schema-Version: 42'"
+sso = "-H 'X-Auth-Request-Email: owner@mulatta.io'"
 
 
 def psql(sql):
@@ -29,6 +34,27 @@ def http_code(path, token=None, method="GET", body=None, version=None):
         f"curl -s -o /dev/null -w '%{{http_code}}' -X {method} "
         f"{api_headers} {auth} {data} {base}{path}"
     ).strip()
+
+
+def sha256_hex(value):
+    return hashlib.sha256(value.encode()).hexdigest()
+
+
+def create_login_session():
+    return json.loads(
+        machine.succeed(f"curl -sf -X POST {base}/keys/sessions -d '{{}}'")
+    )["sessionToken"]
+
+
+def approve_login_session(token):
+    return machine.succeed(
+        f"curl -s -o /dev/null -w '%{{http_code}}' -X POST "
+        f"{base}/login {sso} -d 'session={token}'"
+    ).strip()
+
+
+def poll_login_session(token):
+    return json.loads(machine.succeed(f"curl -sf {base}/keys/sessions/{token}"))
 
 
 machine.wait_for_unit("postgresql.service")
@@ -292,6 +318,163 @@ with subtest("static recovery key remains bound to the bootstrap user"):
           }}}}
         }}'"""
     )
+
+with subtest("browser login mints distinct hashed full-access keys for Alice"):
+    initial_alice_keys = int(psql("select count(*) from api_keys where user_id = 101"))
+    first_session = create_login_session()
+    second_session = create_login_session()
+    assert first_session != second_session
+
+    for session in (first_session, second_session):
+        session_hash = sha256_hex(session)
+        assert (
+            psql(
+                f"""select status = 'pending'
+                           and api_key_id is null
+                           and encode(token_hash, 'hex') = '{session_hash}'
+                    from login_sessions
+                    where token_hash = decode('{session_hash}', 'hex')"""
+            )
+            == "t"
+        )
+        assert (
+            psql(
+                f"""select position('{session}' in row_to_json(login_sessions)::text) = 0
+                    from login_sessions
+                    where token_hash = decode('{session_hash}', 'hex')"""
+            )
+            == "t"
+        )
+
+    assert approve_login_session(first_session) == "200"
+    first_result = poll_login_session(first_session)
+    assert first_result["status"] == "completed"
+    assert first_result["userID"] == 101 and first_result["username"] == "alice"
+    first_key = first_result["apiKey"]
+    assert len(first_key) == 24
+    assert set(first_key) <= set("23456789ABCDEFGHIJKLMNPQRSTUVWXYZ"), first_key
+    assert first_key != recovery
+    assert int(psql("select count(*) from api_keys where user_id = 101")) == initial_alice_keys + 1
+    first_api_key_id = psql(
+        f"""select api_key_id from login_sessions
+            where token_hash = decode('{sha256_hex(first_session)}', 'hex')"""
+    )
+    assert first_api_key_id
+
+    # Approval is a one-way state transition. A replay cannot mint another key.
+    assert approve_login_session(first_session) == "409"
+    assert int(psql("select count(*) from api_keys where user_id = 101")) == initial_alice_keys + 1
+    assert (
+        psql(
+            f"""select api_key_id from login_sessions
+                where token_hash = decode('{sha256_hex(first_session)}', 'hex')"""
+        )
+        == first_api_key_id
+    )
+
+    assert approve_login_session(second_session) == "200"
+    second_result = poll_login_session(second_session)
+    assert second_result["status"] == "completed"
+    assert second_result["userID"] == 101 and second_result["username"] == "alice"
+    second_key = second_result["apiKey"]
+    assert len(second_key) == 24
+    assert set(second_key) <= set("23456789ABCDEFGHIJKLMNPQRSTUVWXYZ"), second_key
+    assert second_key not in (first_key, recovery)
+    assert int(psql("select count(*) from api_keys where user_id = 101")) == initial_alice_keys + 2
+
+    for session, key in ((first_session, first_key), (second_session, second_key)):
+        session_hash = sha256_hex(session)
+        key_hash = sha256_hex(key)
+        assert (
+            psql(
+                f"""select ls.status = 'completed'
+                           and ls.user_id = 101
+                           and ls.api_key_id = k.id
+                           and k.user_id = 101
+                           and encode(ls.token_hash, 'hex') = '{session_hash}'
+                           and encode(k.token_hash, 'hex') = '{key_hash}'
+                           and octet_length(ls.token_hash) = 32
+                           and octet_length(k.token_hash) = 32
+                           and p.library and p.notes and p.write and p.files
+                    from login_sessions ls
+                    join api_keys k on k.id = ls.api_key_id
+                    join api_key_user_permissions p on p.api_key_id = k.id
+                    where ls.token_hash = decode('{session_hash}', 'hex')"""
+            )
+            == "t"
+        )
+        assert (
+            psql(
+                f"""select position('{session}' in row_to_json(ls)::text) = 0
+                           and position('{key}' in row_to_json(ls)::text) = 0
+                           and position('{session}' in row_to_json(k)::text) = 0
+                           and position('{key}' in row_to_json(k)::text) = 0
+                    from login_sessions ls
+                    join api_keys k on k.id = ls.api_key_id
+                    where ls.token_hash = decode('{session_hash}', 'hex')"""
+            )
+            == "t"
+        )
+        machine.succeed(
+            f"""curl -sf {api_headers} -H 'Zotero-API-Key: {key}' {base}/keys/current |
+            jq -e '.userID == 101
+              and .username == "alice"
+              and .displayName == "Alice"
+              and .access.user == {{
+                "library":true,"files":true,"notes":true,"write":true
+              }}'"""
+        )
+
+    # Recovery remains a configured credential, never a login-minted DB row.
+    assert (
+        psql(
+            f"""select count(*) from api_keys
+                where token_hash = decode('{sha256_hex(recovery)}', 'hex')"""
+        )
+        == "0"
+    )
+    assert http_code("/keys/current", recovery) == "200"
+
+with subtest("expired login sessions are terminal without minting a key"):
+    expired_session = create_login_session()
+    expired_hash = sha256_hex(expired_session)
+    alice_keys_before_expiry = psql("select count(*) from api_keys where user_id = 101")
+    psql(
+        f"""update login_sessions
+            set created_at = now() - interval '1 hour',
+                expires_at = now() - interval '1 second'
+            where token_hash = decode('{expired_hash}', 'hex')
+              and status = 'pending'"""
+    )
+    assert (
+        psql(
+            f"""select expires_at < now() and status = 'pending' and api_key_id is null
+                from login_sessions
+                where token_hash = decode('{expired_hash}', 'hex')"""
+        )
+        == "t"
+    )
+    assert http_code(f"/keys/sessions/{expired_session}") == "410"
+    assert http_code(f"/keys/sessions/{expired_session}", method="DELETE") == "409"
+    assert psql("select count(*) from api_keys where user_id = 101") == alice_keys_before_expiry
+
+with subtest("disabled bootstrap user cannot approve a login session"):
+    disabled_session = create_login_session()
+    disabled_hash = sha256_hex(disabled_session)
+    alice_keys_before_disable = psql("select count(*) from api_keys where user_id = 101")
+    psql("update users set disabled_at = now() where id = 101")
+    assert approve_login_session(disabled_session) == "403"
+    assert psql("select count(*) from api_keys where user_id = 101") == alice_keys_before_disable
+    assert (
+        psql(
+            f"""select status = 'pending' and api_key_id is null
+                from login_sessions
+                where token_hash = decode('{disabled_hash}', 'hex')"""
+        )
+        == "t"
+    )
+    psql("update users set disabled_at = null where id = 101")
+    assert http_code("/keys/current", recovery) == "200"
 
 with subtest("unknown and revoked keys fail closed"):
     assert http_code("/keys/current", "unknown-token") == "403"
@@ -566,5 +749,5 @@ with subtest("revocation takes effect on the next request"):
     assert http_code("/keys/current", alice) == "403"
 
 with subtest("database stores only fixed-length key digests"):
-    assert psql("select count(*) from api_keys where octet_length(token_hash) = 32") == "6"
+    assert psql("select count(*) from api_keys where octet_length(token_hash) = 32") == "8"
     assert psql("select count(*) from api_keys where encode(token_hash, 'escape') like '%token%'") == "0"

@@ -91,6 +91,15 @@ in
       '';
     };
 
+    loginKdfKeyFile = lib.mkOption {
+      type = lib.types.path;
+      description = ''
+        File containing at least 32 bytes of stable secret material used only to
+        derive browser-login API keys. All replicas must use the same value.
+        Loaded as a systemd credential.
+      '';
+    };
+
     s3 = lib.mkOption {
       description = "S3-compatible object storage for attachment bytes (e.g. Cloudflare R2).";
       type = lib.types.submodule {
@@ -163,10 +172,9 @@ in
         }
       '';
       description = ''
-        Named API keys, each loaded from a secret file as a systemd credential
-        and held in memory (never in the store or database). The token bytes stay
-        in the secret; the access level is declared here. The login session is
-        handed the first read/write key. At least one read/write key is required.
+        Named recovery or development API keys, each loaded from a secret file
+        as a systemd credential and held in memory. Browser login mints separate
+        database-owned keys and never returns these static credentials.
       '';
     };
 
@@ -192,10 +200,6 @@ in
       {
         assertion = allKeys != { };
         message = "services.zhost: configure at least one key via `keys` or `apiKeyFile`.";
-      }
-      {
-        assertion = lib.any (k: !k.readOnly) (lib.attrValues allKeys);
-        message = "services.zhost: at least one key must be read/write (the app login needs it).";
       }
     ];
 
@@ -237,6 +241,7 @@ in
         # %d expands to the systemd credentials directory at runtime.
         ZHOST_S3_ACCESS_KEY_FILE = "%d/s3-access-key";
         ZHOST_S3_SECRET_KEY_FILE = "%d/s3-secret-key";
+        ZHOST_LOGIN_KDF_KEY_FILE = "%d/login-kdf-key";
         ZHOST_KEYS = keyManifest;
         RUST_LOG = "info";
       }
@@ -251,6 +256,7 @@ in
         LoadCredential = (lib.mapAttrsToList (name: k: "${credName name}:${k.file}") allKeys) ++ [
           "s3-access-key:${cfg.s3.accessKeyFile}"
           "s3-secret-key:${cfg.s3.secretKeyFile}"
+          "login-kdf-key:${cfg.loginKdfKeyFile}"
         ];
         Restart = "on-failure";
 
