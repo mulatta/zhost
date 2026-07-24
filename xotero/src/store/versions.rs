@@ -66,8 +66,6 @@ pub async fn top_versions(
     Ok(version_map(rows, "key"))
 }
 
-/// `[{key, version, data}]` for the requested keys.
-
 /// Deleted object keys after `since`, grouped by kind for the /deleted endpoint.
 pub async fn deleted(pool: &PgPool, library_id: LibraryId, since: i64) -> sqlx::Result<Value> {
     let rows = sqlx::query("select kind, key from deletion where library_id = $1 and version > $2")
