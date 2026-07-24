@@ -10,11 +10,11 @@ mod s3;
 mod store;
 
 use std::collections::HashMap;
-use std::sync::{LazyLock, Mutex, OnceLock};
+use std::sync::{Arc, LazyLock, Mutex};
 
 use axum::{
     body::{Body, Bytes},
-    extract::{DefaultBodyLimit, Form, Path, Query, RawQuery, Request},
+    extract::{DefaultBodyLimit, Form, Path, Query, RawQuery, Request, State},
     http::{HeaderMap, StatusCode},
     middleware::{self, Next},
     response::{IntoResponse, Response},
@@ -50,9 +50,12 @@ struct Config {
     login_authorized_user: Option<String>,
 }
 
-static CFG: OnceLock<Config> = OnceLock::new();
-static POOL: OnceLock<PgPool> = OnceLock::new();
-static STORAGE: OnceLock<s3::Storage> = OnceLock::new();
+#[derive(Clone)]
+struct AppState {
+    config: Arc<Config>,
+    pool: PgPool,
+    storage: Arc<s3::Storage>,
+}
 
 /// In-flight file uploads, keyed by an unguessable upload token (not the item
 /// key, which is guessable) and remembered between the authorisation, upload and
@@ -128,18 +131,6 @@ fn valid_object_key(key: &str) -> bool {
             .all(|b| b"23456789ABCDEFGHIJKLMNPQRSTUVWXYZ".contains(&b))
 }
 
-fn cfg() -> &'static Config {
-    CFG.get().expect("config initialised in main")
-}
-
-fn pool() -> &'static PgPool {
-    POOL.get().expect("pool initialised in main")
-}
-
-fn storage() -> &'static s3::Storage {
-    STORAGE.get().expect("storage initialised in main")
-}
-
 /// Access descriptor for the single configured user; no groups. `write` reflects
 /// the requesting key, so a read-only key reports `write: false`.
 fn access_payload(write: bool) -> Value {
@@ -150,11 +141,11 @@ fn access_payload(write: bool) -> Value {
 }
 
 /// The access the request's key carries, if it presents a known one.
-fn key_access(headers: &HeaderMap) -> Option<Access> {
+fn key_access(config: &Config, headers: &HeaderMap) -> Option<Access> {
     headers
         .get("zotero-api-key")
         .and_then(|v| v.to_str().ok())
-        .and_then(|token| cfg().keys.get(token).copied())
+        .and_then(|token| config.keys.get(token).copied())
 }
 
 fn version_headers(version: i64) -> HeaderMap {
@@ -166,8 +157,8 @@ fn version_headers(version: i64) -> HeaderMap {
     headers
 }
 
-async fn current_headers() -> HeaderMap {
-    version_headers(store::current_version(pool()).await.unwrap_or(0))
+async fn current_headers(state: &AppState) -> HeaderMap {
+    version_headers(store::current_version(&state.pool).await.unwrap_or(0))
 }
 
 /// For a since/versions read: the current library version, and whether the
@@ -175,8 +166,8 @@ async fn current_headers() -> HeaderMap {
 /// version greater than `since`). `since == 0` is the initial pull, so never
 /// 304 it. One DB read, so the caller reuses `current` for the response's
 /// `Last-Modified-Version` instead of querying it again.
-async fn since_check(since: i64) -> (i64, bool) {
-    let current = store::current_version(pool()).await.unwrap_or(0);
+async fn since_check(state: &AppState, since: i64) -> (i64, bool) {
+    let current = store::current_version(&state.pool).await.unwrap_or(0);
     (current, since > 0 && since >= current)
 }
 
@@ -199,10 +190,10 @@ fn header_value(text: &str) -> axum::http::HeaderValue {
 
 // --- authentication & login session ---------------------------------------
 
-async fn key_current(headers: HeaderMap) -> Response {
-    let write = key_access(&headers).is_some_and(|a| a.write);
+async fn key_current(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    let write = key_access(&state.config, &headers).is_some_and(|a| a.write);
     Json(json!({
-        "userID": cfg().user_id,
+        "userID": state.config.user_id,
         "username": "zhost",
         "displayName": "zhost",
         "access": access_payload(write),
@@ -215,7 +206,7 @@ async fn key_current(headers: HeaderMap) -> Response {
 /// until it reports `status: "completed"` with a key. Mint a pending session and
 /// point `loginURL` at our `/login` (which the user must pass an SSO gate to
 /// reach); the key is withheld until that authorises the session.
-async fn create_session() -> Response {
+async fn create_session(State(state): State<AppState>) -> Response {
     let Some(token) = upload_token() else {
         return StatusCode::INTERNAL_SERVER_ERROR.into_response();
     };
@@ -234,7 +225,7 @@ async fn create_session() -> Response {
         StatusCode::CREATED,
         Json(json!({
             "sessionToken": token,
-            "loginURL": format!("{}/login?session={}", cfg().public_url, token),
+            "loginURL": format!("{}/login?session={}", state.config.public_url, token),
         })),
     )
         .into_response()
@@ -243,7 +234,7 @@ async fn create_session() -> Response {
 /// Poll a login session: hand out the key only once `/login` has authorised it,
 /// otherwise report it still pending (so an unauthorised or unknown token never
 /// yields a key).
-async fn check_session(Path(token): Path<String>) -> Response {
+async fn check_session(State(state): State<AppState>, Path(token): Path<String>) -> Response {
     let authorized = {
         let sessions = SESSIONS.lock().unwrap();
         sessions
@@ -253,8 +244,8 @@ async fn check_session(Path(token): Path<String>) -> Response {
     if authorized {
         Json(json!({
             "status": "completed",
-            "apiKey": cfg().login_key,
-            "userID": cfg().user_id,
+            "apiKey": state.config.login_key,
+            "userID": state.config.user_id,
             "username": "zhost",
         }))
         .into_response()
@@ -305,11 +296,12 @@ async fn login_page(Query(params): Query<HashMap<String, String>>) -> Response {
 /// authenticated user's browser can't be steered into authorising someone else's
 /// session. A request with no `Origin` (a CLI, not a browser) is allowed.
 async fn login_authorize(
+    State(state): State<AppState>,
     headers: HeaderMap,
     Form(form): Form<HashMap<String, String>>,
 ) -> Response {
     if let Some(origin) = headers.get("origin").and_then(|v| v.to_str().ok()) {
-        if origin.trim_end_matches('/') != cfg().public_url.trim_end_matches('/') {
+        if origin.trim_end_matches('/') != state.config.public_url.trim_end_matches('/') {
             return (StatusCode::FORBIDDEN, "bad origin").into_response();
         }
     }
@@ -320,7 +312,7 @@ async fn login_authorize(
     // mode: as a reverse proxy (the usual setup) it sets X-Forwarded-Email/-User
     // on the upstream request (pass-user-headers); in nginx auth_request mode it
     // sets X-Auth-Request-*. Accept either so the gate works behind both.
-    if let Some(want) = &cfg().login_authorized_user {
+    if let Some(want) = &state.config.login_authorized_user {
         let identity = headers
             .get("x-auth-request-email")
             .or_else(|| headers.get("x-forwarded-email"))
@@ -346,8 +338,8 @@ async fn login_authorize(
 
 // --- library data -----------------------------------------------------------
 
-async fn groups() -> Response {
-    (current_headers().await, Json(json!({}))).into_response()
+async fn groups(State(state): State<AppState>) -> Response {
+    (current_headers(&state).await, Json(json!({}))).into_response()
 }
 
 fn server_error(context: &str, error: sqlx::Error) -> Response {
@@ -407,7 +399,7 @@ fn csv_of(params: &HashMap<String, String>, key: &str) -> Vec<String> {
 
 /// `format=versions&since=N` returns the changed `{key: version}` map; otherwise
 /// `?<kind>Key=a,b&format=json` returns the full `[{key, version, data}]`.
-async fn read(kind: &str, params: HashMap<String, String>) -> Response {
+async fn read(state: &AppState, kind: &str, params: HashMap<String, String>) -> Response {
     if params.get("format").map(String::as_str) == Some("versions") {
         let since = since_of(&params);
         // Always 200 with the (possibly empty) versions map. The client's
@@ -415,15 +407,15 @@ async fn read(kind: &str, params: HashMap<String, String>) -> Response {
         // 304 as "no data", which then mismatches its library-version check and
         // makes it restart the sync forever. 304 is only for the header path
         // (settings), not for `?since=` versions reads.
-        let current = store::current_version(pool()).await.unwrap_or(0);
-        return match store::versions(pool(), kind, since).await {
+        let current = store::current_version(&state.pool).await.unwrap_or(0);
+        return match store::versions(&state.pool, kind, since).await {
             Ok(value) => (version_headers(current), Json(value)).into_response(),
             Err(error) => server_error("read", error),
         };
     }
     let keys = csv_of(&params, &format!("{kind}Key"));
-    match store::objects(pool(), kind, &keys).await {
-        Ok(value) => (current_headers().await, Json(value)).into_response(),
+    match store::objects(&state.pool, kind, &keys).await {
+        Ok(value) => (current_headers(state).await, Json(value)).into_response(),
         Err(error) => server_error("read", error),
     }
 }
@@ -432,18 +424,18 @@ async fn read(kind: &str, params: HashMap<String, String>) -> Response {
 /// map and the `?itemKey=…` batch. With `top`, the versions map is restricted to
 /// top-level items (the client's parent-first phase). Returns `None` when the
 /// request carries neither, i.e. it is a CLI query rather than a sync read.
-async fn item_sync_read(params: &query::Params, top: bool) -> Option<Response> {
+async fn item_sync_read(state: &AppState, params: &query::Params, top: bool) -> Option<Response> {
     if params.get("format") == Some("versions") {
         let since = params
             .get("since")
             .and_then(|s| s.parse().ok())
             .unwrap_or(0);
         // Always 200 + map (never 304); see `read` — a 304 here loops the client.
-        let current = store::current_version(pool()).await.unwrap_or(0);
+        let current = store::current_version(&state.pool).await.unwrap_or(0);
         let result = if top {
-            store::top_versions(pool(), since).await
+            store::top_versions(&state.pool, since).await
         } else {
-            store::versions(pool(), "item", since).await
+            store::versions(&state.pool, "item", since).await
         };
         return Some(match result {
             Ok(value) => (version_headers(current), Json(value)).into_response(),
@@ -452,8 +444,8 @@ async fn item_sync_read(params: &query::Params, top: bool) -> Option<Response> {
     }
     if let Some(csv) = params.get("itemKey") {
         let keys: Vec<String> = csv.split(',').map(String::from).collect();
-        return Some(match store::objects(pool(), "item", &keys).await {
-            Ok(value) => (current_headers().await, Json(value)).into_response(),
+        return Some(match store::objects(&state.pool, "item", &keys).await {
+            Ok(value) => (current_headers(state).await, Json(value)).into_response(),
             Err(error) => server_error("items batch", error),
         });
     }
@@ -463,13 +455,18 @@ async fn item_sync_read(params: &query::Params, top: bool) -> Option<Response> {
 /// Render an item query as a paged JSON listing: the `[{key, version, data}]`
 /// array plus `Total-Results` and, while more rows remain, a `Link: …;
 /// rel="next"` built against `path` (the public-URL endpoint).
-async fn item_listing(path: &str, raw: Option<&str>, q: &query::ItemQuery) -> Response {
-    match store::query_items(pool(), q).await {
+async fn item_listing(
+    state: &AppState,
+    path: &str,
+    raw: Option<&str>,
+    q: &query::ItemQuery,
+) -> Response {
+    match store::query_items(&state.pool, q).await {
         Ok((items, total)) => {
-            let mut headers = current_headers().await;
+            let mut headers = current_headers(state).await;
             headers.insert("total-results", total.to_string().parse().unwrap());
             if q.start + q.limit < total {
-                let link = next_link(path, raw, q.start + q.limit);
+                let link = next_link(&state.config, path, raw, q.start + q.limit);
                 headers.insert("link", link.parse().unwrap());
             }
             (headers, Json(Value::Array(items))).into_response()
@@ -480,82 +477,112 @@ async fn item_listing(path: &str, raw: Option<&str>, q: &query::ItemQuery) -> Re
 
 /// The `Link: <…>; rel="next"` header for the page after `start`, preserving the
 /// request's other params and pointing at the public (reverse-proxy) URL.
-fn next_link(path: &str, raw: Option<&str>, start: i64) -> String {
+fn next_link(config: &Config, path: &str, raw: Option<&str>, start: i64) -> String {
     let mut pairs: Vec<(String, String)> = raw
         .and_then(|q| serde_urlencoded::from_str(q).ok())
         .unwrap_or_default();
     pairs.retain(|(k, _)| k != "start");
     pairs.push(("start".into(), start.to_string()));
     let qs = serde_urlencoded::to_string(&pairs).unwrap_or_default();
-    format!("<{}{}?{}>; rel=\"next\"", cfg().public_url, path, qs)
+    format!("<{}{}?{}>; rel=\"next\"", config.public_url, path, qs)
 }
 
 /// `format=keys` returns every matching item key (no paging) as a plain-text
 /// newline list — the shape Zotero's `getKeys()` parses (it reads the body as
 /// `responseText.split('\n')`). Returns `None` for any other format.
-async fn item_keys_response(params: &query::Params, q: &query::ItemQuery) -> Option<Response> {
+async fn item_keys_response(
+    state: &AppState,
+    params: &query::Params,
+    q: &query::ItemQuery,
+) -> Option<Response> {
     if params.get("format") != Some("keys") {
         return None;
     }
-    Some(match store::item_keys(pool(), q).await {
+    Some(match store::item_keys(&state.pool, q).await {
         // A `String` body sets `Content-Type: text/plain`, which is what the
         // client expects; current_headers adds `Last-Modified-Version`.
-        Ok(keys) => (current_headers().await, keys.join("\n")).into_response(),
+        Ok(keys) => (current_headers(state).await, keys.join("\n")).into_response(),
         Err(error) => server_error("item keys", error),
     })
 }
 
 /// `GET /users/<id>/items`: the two sync reads, or the CLI query when neither.
-async fn items_get(Path(id): Path<String>, RawQuery(raw): RawQuery) -> Response {
+async fn items_get(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    RawQuery(raw): RawQuery,
+) -> Response {
     let params = query::Params::parse(raw.as_deref());
-    if let Some(resp) = item_sync_read(&params, false).await {
+    if let Some(resp) = item_sync_read(&state, &params, false).await {
         return resp;
     }
     let q = query::ItemQuery::from_params(&params);
-    if let Some(resp) = item_keys_response(&params, &q).await {
+    if let Some(resp) = item_keys_response(&state, &params, &q).await {
         return resp;
     }
-    item_listing(&format!("/users/{id}/items"), raw.as_deref(), &q).await
+    item_listing(&state, &format!("/users/{id}/items"), raw.as_deref(), &q).await
 }
 
 /// `GET /users/<id>/items/top`: top-level items (no `parentItem`). Also answers
 /// the sync `format=versions` (top-filtered) and `itemKey` reads sent here.
-async fn items_top(Path(id): Path<String>, RawQuery(raw): RawQuery) -> Response {
+async fn items_top(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    RawQuery(raw): RawQuery,
+) -> Response {
     let params = query::Params::parse(raw.as_deref());
-    if let Some(resp) = item_sync_read(&params, true).await {
+    if let Some(resp) = item_sync_read(&state, &params, true).await {
         return resp;
     }
     let mut q = query::ItemQuery::from_params(&params);
     q.top = true;
-    if let Some(resp) = item_keys_response(&params, &q).await {
+    if let Some(resp) = item_keys_response(&state, &params, &q).await {
         return resp;
     }
-    item_listing(&format!("/users/{id}/items/top"), raw.as_deref(), &q).await
+    item_listing(
+        &state,
+        &format!("/users/{id}/items/top"),
+        raw.as_deref(),
+        &q,
+    )
+    .await
 }
 
 /// `GET /users/<id>/items/trash`: only trashed items (`data.deleted`).
-async fn items_trash(Path(id): Path<String>, RawQuery(raw): RawQuery) -> Response {
+async fn items_trash(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    RawQuery(raw): RawQuery,
+) -> Response {
     let params = query::Params::parse(raw.as_deref());
     let mut q = query::ItemQuery::from_params(&params);
     q.only_trashed = true;
-    if let Some(resp) = item_keys_response(&params, &q).await {
+    if let Some(resp) = item_keys_response(&state, &params, &q).await {
         return resp;
     }
-    item_listing(&format!("/users/{id}/items/trash"), raw.as_deref(), &q).await
+    item_listing(
+        &state,
+        &format!("/users/{id}/items/trash"),
+        raw.as_deref(),
+        &q,
+    )
+    .await
 }
 
 /// `GET /users/<id>/collections/<key>/items`: items in the given collection.
 async fn collection_items(
+    State(state): State<AppState>,
     Path((id, key)): Path<(String, String)>,
     RawQuery(raw): RawQuery,
 ) -> Response {
     let params = query::Params::parse(raw.as_deref());
     let mut q = query::ItemQuery::from_params(&params);
     q.collection = Some(key.clone());
-    if let Some(resp) = item_keys_response(&params, &q).await {
+    if let Some(resp) = item_keys_response(&state, &params, &q).await {
         return resp;
     }
     item_listing(
+        &state,
         &format!("/users/{id}/collections/{key}/items"),
         raw.as_deref(),
         &q,
@@ -567,6 +594,7 @@ async fn collection_items(
 /// collection. The sync client requests this with `format=keys` when restoring a
 /// previously-deleted collection (syncEngine.js `_restoreRestoredCollectionItems`).
 async fn collection_items_top(
+    State(state): State<AppState>,
     Path((id, key)): Path<(String, String)>,
     RawQuery(raw): RawQuery,
 ) -> Response {
@@ -574,10 +602,11 @@ async fn collection_items_top(
     let mut q = query::ItemQuery::from_params(&params);
     q.collection = Some(key.clone());
     q.top = true;
-    if let Some(resp) = item_keys_response(&params, &q).await {
+    if let Some(resp) = item_keys_response(&state, &params, &q).await {
         return resp;
     }
     item_listing(
+        &state,
         &format!("/users/{id}/collections/{key}/items/top"),
         raw.as_deref(),
         &q,
@@ -586,9 +615,9 @@ async fn collection_items_top(
 }
 
 /// `GET /users/<id>/tags`: distinct tags with item counts.
-async fn tags_get() -> Response {
-    match store::tags(pool()).await {
-        Ok(value) => (current_headers().await, Json(value)).into_response(),
+async fn tags_get(State(state): State<AppState>) -> Response {
+    match store::tags(&state.pool).await {
+        Ok(value) => (current_headers(&state).await, Json(value)).into_response(),
         Err(error) => server_error("tags", error),
     }
 }
@@ -599,6 +628,7 @@ async fn tags_get() -> Response {
 /// Zotero `||` separator. The sync client sends `tags`; the public API documents
 /// `tag`, so accept either.
 async fn tags_delete(
+    State(state): State<AppState>,
     headers: HeaderMap,
     Query(params): Query<HashMap<String, String>>,
 ) -> Response {
@@ -616,7 +646,7 @@ async fn tags_delete(
                 .collect()
         })
         .unwrap_or_default();
-    match store::delete_tags(pool(), &tags, Some(expected)).await {
+    match store::delete_tags(&state.pool, &tags, Some(expected)).await {
         Ok(store::Outcome::Done(version)) => {
             (StatusCode::NO_CONTENT, version_headers(version)).into_response()
         }
@@ -628,7 +658,7 @@ async fn tags_delete(
 /// Both POST and PATCH create-or-update with merge semantics (see `store::write`):
 /// the Zotero client uploads only an existing object's changed fields, so omitted
 /// fields must be preserved.
-async fn write(kind: &str, headers: HeaderMap, body: Bytes) -> Response {
+async fn write(state: &AppState, kind: &str, headers: HeaderMap, body: Bytes) -> Response {
     let batch: Vec<Value> = match serde_json::from_slice(&body) {
         Ok(batch) => batch,
         Err(error) => {
@@ -654,7 +684,7 @@ async fn write(kind: &str, headers: HeaderMap, body: Bytes) -> Response {
         Ok(v) => v,
         Err(resp) => return resp,
     };
-    match store::write(pool(), kind, batch, Some(expected)).await {
+    match store::write(&state.pool, kind, batch, Some(expected)).await {
         Ok(store::Outcome::Done((version, successful))) => (
             version_headers(version),
             Json(json!({
@@ -670,13 +700,18 @@ async fn write(kind: &str, headers: HeaderMap, body: Bytes) -> Response {
     }
 }
 
-async fn delete(kind: &str, headers: HeaderMap, params: HashMap<String, String>) -> Response {
+async fn delete(
+    state: &AppState,
+    kind: &str,
+    headers: HeaderMap,
+    params: HashMap<String, String>,
+) -> Response {
     let expected = match precondition(&headers) {
         Ok(v) => v,
         Err(resp) => return resp,
     };
     let keys = csv_of(&params, &format!("{kind}Key"));
-    match store::delete(pool(), kind, &keys, Some(expected)).await {
+    match store::delete(&state.pool, kind, &keys, Some(expected)).await {
         Ok(store::Outcome::Done(version)) => {
             (StatusCode::NO_CONTENT, version_headers(version)).into_response()
         }
@@ -686,29 +721,34 @@ async fn delete(kind: &str, headers: HeaderMap, params: HashMap<String, String>)
 }
 
 async fn settings_read(
+    State(state): State<AppState>,
     headers: HeaderMap,
     Query(params): Query<HashMap<String, String>>,
 ) -> Response {
     // The client may send the cursor as ?since= or the If-Modified-Since-Version
     // header; honour whichever is higher.
     let since = since_of(&params).max(if_modified_since(&headers));
-    let (current, fresh) = since_check(since).await;
+    let (current, fresh) = since_check(&state, since).await;
     if fresh {
         return (StatusCode::NOT_MODIFIED, version_headers(current)).into_response();
     }
-    match store::settings(pool()).await {
+    match store::settings(&state.pool).await {
         Ok(value) => (version_headers(current), Json(value)).into_response(),
         Err(error) => server_error("settings", error),
     }
 }
 
-async fn settings_write(headers: HeaderMap, body: Bytes) -> Response {
+async fn settings_write(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
     let expected = match precondition(&headers) {
         Ok(v) => v,
         Err(resp) => return resp,
     };
     let value: Value = serde_json::from_slice(&body).unwrap_or_else(|_| json!({}));
-    match store::write_settings(pool(), value, Some(expected)).await {
+    match store::write_settings(&state.pool, value, Some(expected)).await {
         Ok(store::Outcome::Done(version)) => {
             (StatusCode::NO_CONTENT, version_headers(version)).into_response()
         }
@@ -722,6 +762,7 @@ async fn settings_write(headers: HeaderMap, body: Bytes) -> Response {
 /// here was a no-op: a DELETE has no body, so it deleted nothing yet returned
 /// 204 and the setting persisted.)
 async fn settings_delete(
+    State(state): State<AppState>,
     headers: HeaderMap,
     Query(params): Query<HashMap<String, String>>,
 ) -> Response {
@@ -730,7 +771,7 @@ async fn settings_delete(
         Err(resp) => return resp,
     };
     let keys = csv_of(&params, "settingKey");
-    match store::delete_settings(pool(), &keys, Some(expected)).await {
+    match store::delete_settings(&state.pool, &keys, Some(expected)).await {
         Ok(store::Outcome::Done(version)) => {
             (StatusCode::NO_CONTENT, version_headers(version)).into_response()
         }
@@ -739,21 +780,27 @@ async fn settings_delete(
     }
 }
 
-async fn deleted(Query(params): Query<HashMap<String, String>>) -> Response {
+async fn deleted(
+    State(state): State<AppState>,
+    Query(params): Query<HashMap<String, String>>,
+) -> Response {
     let since = since_of(&params);
-    match store::deleted(pool(), since).await {
-        Ok(value) => (current_headers().await, Json(value)).into_response(),
+    match store::deleted(&state.pool, since).await {
+        Ok(value) => (current_headers(&state).await, Json(value)).into_response(),
         Err(error) => server_error("deleted", error),
     }
 }
 
 /// `GET /fulltext?format=versions&since=N` → `{itemKey: version}` for content
 /// changed after `since`, so the client downloads only what it lacks.
-async fn fulltext_versions(Query(params): Query<HashMap<String, String>>) -> Response {
+async fn fulltext_versions(
+    State(state): State<AppState>,
+    Query(params): Query<HashMap<String, String>>,
+) -> Response {
     let since = since_of(&params);
     // Always 200 + map (never 304); see `read` — a 304 here loops the client.
-    let current = store::current_version(pool()).await.unwrap_or(0);
-    match store::fulltext_versions(pool(), since).await {
+    let current = store::current_version(&state.pool).await.unwrap_or(0);
+    match store::fulltext_versions(&state.pool, since).await {
         Ok(value) => (version_headers(current), Json(value)).into_response(),
         Err(error) => server_error("fulltext versions", error),
     }
@@ -761,8 +808,11 @@ async fn fulltext_versions(Query(params): Query<HashMap<String, String>>) -> Res
 
 /// `GET /items/<key>/fulltext` → the item's content object, with the row's
 /// version in `Last-Modified-Version` (the client stores it to skip re-fetching).
-async fn fulltext_item(Path((_id, key)): Path<(String, String)>) -> Response {
-    match store::fulltext_item(pool(), &key).await {
+async fn fulltext_item(
+    State(state): State<AppState>,
+    Path((_id, key)): Path<(String, String)>,
+) -> Response {
+    match store::fulltext_item(&state.pool, &key).await {
         Ok(Some((version, data))) => (version_headers(version), Json(data)).into_response(),
         Ok(None) => StatusCode::NOT_FOUND.into_response(),
         Err(error) => server_error("fulltext item", error),
@@ -771,7 +821,11 @@ async fn fulltext_item(Path((_id, key)): Path<(String, String)>) -> Response {
 
 /// `POST /fulltext` — store a batch of extracted content, returning the per-index
 /// result map the client reads to mark each item synced (or `412` if stale).
-async fn fulltext_write(headers: HeaderMap, body: Bytes) -> Response {
+async fn fulltext_write(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
     let batch: Vec<Value> = match serde_json::from_slice(&body) {
         Ok(batch) => batch,
         Err(error) => {
@@ -783,7 +837,7 @@ async fn fulltext_write(headers: HeaderMap, body: Bytes) -> Response {
         Ok(v) => v,
         Err(resp) => return resp,
     };
-    match store::write_fulltext(pool(), batch, Some(expected)).await {
+    match store::write_fulltext(&state.pool, batch, Some(expected)).await {
         Ok(store::Outcome::Done((version, successful))) => (
             version_headers(version),
             Json(json!({
@@ -803,6 +857,7 @@ async fn fulltext_write(headers: HeaderMap, body: Bytes) -> Response {
 /// authorisation (`md5`/`filename`/`filesize`/`mtime` form) and registration
 /// (`upload` form, after the bytes have been PUT to the upload URL).
 async fn file_post(
+    State(state): State<AppState>,
     Path((_id, key)): Path<(String, String)>,
     headers: HeaderMap,
     Form(form): Form<HashMap<String, String>>,
@@ -824,7 +879,7 @@ async fn file_post(
             return (StatusCode::BAD_REQUEST, "no uploaded bytes").into_response();
         }
         return match store::register_file(
-            pool(),
+            &state.pool,
             &key,
             &upload.md5,
             &upload.filename,
@@ -858,7 +913,7 @@ async fn file_post(
     }
 
     let md5 = form.get("md5").cloned().unwrap_or_default();
-    let stored_md5 = match store::file_meta(pool(), &key).await {
+    let stored_md5 = match store::file_meta(&state.pool, &key).await {
         Ok(meta) => meta.map(|(m, _)| m),
         Err(error) => return server_error("file auth", error),
     };
@@ -870,9 +925,10 @@ async fn file_post(
         // different existing file → conflict.
         if let Some(existing) = &stored_md5 {
             if existing.eq_ignore_ascii_case(&md5) {
-                return (current_headers().await, Json(json!({ "exists": 1 }))).into_response();
+                return (current_headers(&state).await, Json(json!({ "exists": 1 })))
+                    .into_response();
             }
-            return conflict(store::current_version(pool()).await.unwrap_or(0));
+            return conflict(store::current_version(&state.pool).await.unwrap_or(0));
         }
     } else if let Some(want) = &if_match {
         // "Only if the current md5 matches." Otherwise → conflict.
@@ -880,7 +936,7 @@ async fn file_post(
             .as_deref()
             .is_some_and(|m| m.eq_ignore_ascii_case(want))
         {
-            return conflict(store::current_version(pool()).await.unwrap_or(0));
+            return conflict(store::current_version(&state.pool).await.unwrap_or(0));
         }
     }
 
@@ -910,7 +966,7 @@ async fn file_post(
     }
     // Empty prefix/suffix: the client PUTs the raw file bytes to url.
     Json(json!({
-        "url": format!("{}/uploads/{}", cfg().public_url, token),
+        "url": format!("{}/uploads/{}", state.config.public_url, token),
         "uploadKey": token,
         "contentType": "application/octet-stream",
         "prefix": "",
@@ -923,7 +979,11 @@ async fn file_post(
 /// against the authorized md5/filesize, and store the object in the bucket.
 /// Rejects an unknown token. Verifying here (where the bytes are in hand) keeps
 /// the integrity check server-side now that the bytes go straight to S3.
-async fn upload_put(Path(token): Path<String>, body: Bytes) -> Response {
+async fn upload_put(
+    State(state): State<AppState>,
+    Path(token): Path<String>,
+    body: Bytes,
+) -> Response {
     let pending = PENDING.lock().unwrap().get(&token).cloned();
     let Some(upload) = pending else {
         return (StatusCode::BAD_REQUEST, "unknown upload token").into_response();
@@ -945,7 +1005,8 @@ async fn upload_put(Path(token): Path<String>, body: Bytes) -> Response {
         )
             .into_response();
     }
-    if let Err(error) = storage()
+    if let Err(error) = state
+        .storage
         .put(&upload.item_key, &body, "application/octet-stream")
         .await
     {
@@ -962,16 +1023,19 @@ async fn upload_put(Path(token): Path<String>, body: Bytes) -> Response {
 /// the bytes from `Location` — a short-lived pre-signed GET URL pointing straight
 /// at the bucket, so the read path bypasses this server entirely (and the URL is
 /// an unguessable, expiring capability the client follows without an API key).
-async fn file_get(Path((_id, key)): Path<(String, String)>) -> Response {
+async fn file_get(
+    State(state): State<AppState>,
+    Path((_id, key)): Path<(String, String)>,
+) -> Response {
     if !valid_key(&key) {
         return StatusCode::NOT_FOUND.into_response();
     }
-    let (md5, mtime) = match store::file_meta(pool(), &key).await {
+    let (md5, mtime) = match store::file_meta(&state.pool, &key).await {
         Ok(Some(meta)) => meta,
         Ok(None) => return StatusCode::NOT_FOUND.into_response(),
         Err(error) => return server_error("file meta", error),
     };
-    let url = match storage().presign_get(&key).await {
+    let url = match state.storage.presign_get(&key).await {
         Ok(url) => url,
         Err(error) => return s3_error("presign download", error),
     };
@@ -990,7 +1054,7 @@ async fn file_get(Path((_id, key)): Path<(String, String)>) -> Response {
 
 /// Decode gzip write bodies, log the request, and reject anything without the
 /// configured key except the bootstrap (key/session creation, login) endpoints.
-async fn log_and_auth(req: Request, next: Next) -> Response {
+async fn log_and_auth(State(state): State<AppState>, req: Request, next: Next) -> Response {
     let (mut parts, body) = req.into_parts();
     let raw = match axum::body::to_bytes(body, MAX_BODY).await {
         Ok(raw) => raw,
@@ -1043,7 +1107,7 @@ async fn log_and_auth(req: Request, next: Next) -> Response {
     let is_bootstrap =
         path.starts_with("/keys/sessions") || path.starts_with("/uploads") || path == "/login";
     if !is_bootstrap {
-        let Some(access) = key_access(&parts.headers) else {
+        let Some(access) = key_access(&state.config, &parts.headers) else {
             return (StatusCode::FORBIDDEN, "invalid API key").into_response();
         };
         let mutating = matches!(
@@ -1065,16 +1129,31 @@ async fn log_and_auth(req: Request, next: Next) -> Response {
     response
 }
 
-fn app() -> Router {
+fn app(state: AppState) -> Router {
     // Each object kind shares the read/write/delete logic; the closures bind the
     // kind so the handlers stay generic.
     let objects = |kind: &'static str| {
-        get(move |Query(p): Query<HashMap<String, String>>| read(kind, p))
-            .post(move |headers: HeaderMap, body: Bytes| write(kind, headers, body))
-            .patch(move |headers: HeaderMap, body: Bytes| write(kind, headers, body))
+        get(
+            move |State(state): State<AppState>,
+                  Query(p): Query<HashMap<String, String>>| async move {
+                read(&state, kind, p).await
+            },
+        )
+        .post(
+            move |State(state): State<AppState>, headers: HeaderMap, body: Bytes| async move {
+                write(&state, kind, headers, body).await
+            },
+        )
+        .patch(
+            move |State(state): State<AppState>, headers: HeaderMap, body: Bytes| async move {
+                write(&state, kind, headers, body).await
+            },
+        )
             .delete(
-                move |headers: HeaderMap, Query(p): Query<HashMap<String, String>>| {
-                    delete(kind, headers, p)
+                move |State(state): State<AppState>,
+                      headers: HeaderMap,
+                      Query(p): Query<HashMap<String, String>>| async move {
+                    delete(&state, kind, headers, p).await
                 },
             )
     };
@@ -1108,11 +1187,25 @@ fn app() -> Router {
         .route(
             "/users/{id}/items",
             get(items_get)
-                .post(move |headers: HeaderMap, body: Bytes| write("item", headers, body))
-                .patch(move |headers: HeaderMap, body: Bytes| write("item", headers, body))
+                .post(
+                    move |State(state): State<AppState>,
+                          headers: HeaderMap,
+                          body: Bytes| async move {
+                        write(&state, "item", headers, body).await
+                    },
+                )
+                .patch(
+                    move |State(state): State<AppState>,
+                          headers: HeaderMap,
+                          body: Bytes| async move {
+                        write(&state, "item", headers, body).await
+                    },
+                )
                 .delete(
-                    move |headers: HeaderMap, Query(p): Query<HashMap<String, String>>| {
-                        delete("item", headers, p)
+                    move |State(state): State<AppState>,
+                          headers: HeaderMap,
+                          Query(p): Query<HashMap<String, String>>| async move {
+                        delete(&state, "item", headers, p).await
                     },
                 ),
         )
@@ -1133,7 +1226,11 @@ fn app() -> Router {
         // Attachment uploads exceed the default 2 MiB extractor limit; raise it
         // to MAX_BODY (the middleware enforces the same bound while buffering).
         .layer(DefaultBodyLimit::max(MAX_BODY))
-        .layer(middleware::from_fn(log_and_auth))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            log_and_auth,
+        ))
+        .with_state(state)
 }
 
 /// Build the token→access map from secret files. `ZHOST_KEYS` is a
@@ -1227,7 +1324,7 @@ async fn main() {
 
     let (keys, login_key) = load_keys();
     let bind = std::env::var("ZHOST_BIND").unwrap_or_else(|_| "127.0.0.1:8189".into());
-    let _ = CFG.set(Config {
+    let config = Arc::new(Config {
         keys,
         login_key,
         user_id: std::env::var("ZHOST_USER_ID")
@@ -1245,18 +1342,21 @@ async fn main() {
             .filter(|s| !s.is_empty()),
     });
 
-    let pool = store::connect(&cfg().database_url)
+    let pool = store::connect(&config.database_url)
         .await
         .expect("connect to database");
-    let _ = POOL.set(pool);
+    let storage = Arc::new(s3::Storage::new(&config.s3).expect("init object storage"));
+    let state = AppState {
+        config,
+        pool,
+        storage,
+    };
 
-    let _ = STORAGE.set(s3::Storage::new(&cfg().s3).expect("init object storage"));
-
-    let listener = tokio::net::TcpListener::bind(&cfg().bind)
+    let listener = tokio::net::TcpListener::bind(&state.config.bind)
         .await
         .expect("bind address");
-    tracing::info!(bind = %cfg().bind, "zhost listening");
-    axum::serve(listener, app())
+    tracing::info!(bind = %state.config.bind, "zhost listening");
+    axum::serve(listener, app(state))
         .with_graceful_shutdown(async {
             let _ = tokio::signal::ctrl_c().await;
         })
