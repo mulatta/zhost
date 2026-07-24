@@ -56,6 +56,8 @@ testPkgs.testers.runNixOSTest {
       testPkgs.jq
       testPkgs.gzip
       testPkgs.postgresql
+      testPkgs.unzip
+      testPkgs.zip
       # `mc` creates the bucket before the upload subtest.
       testPkgs.minio-client
     ];
