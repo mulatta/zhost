@@ -46,6 +46,55 @@ def http_code(path, token=None, method="GET", body=None, version=None):
     ).strip()
 
 
+def get_json(path, token):
+    return json.loads(
+        machine.succeed(
+            f"curl -sf {api_headers} -H 'Zotero-API-Key: {token}' '{base}{path}'"
+        )
+    )
+
+
+def response_header(raw_headers, name):
+    prefix = f"{name.lower()}:"
+    values = [
+        line.split(":", 1)[1].strip()
+        for line in raw_headers.splitlines()
+        if line.lower().startswith(prefix)
+    ]
+    assert len(values) == 1, (name, values, raw_headers)
+    return values[0]
+
+
+def assert_group_entry(entry, is_admin):
+    assert set(entry) == {"id", "version", "links", "meta", "data"}
+    assert entry["id"] == 303 and entry["version"] == 4
+    assert entry["links"]["self"] == {
+        "href": f"{base}/groups/303",
+        "type": "application/json",
+    }
+    assert entry["links"]["alternate"]["href"].endswith("/groups/303")
+    assert entry["links"]["alternate"]["type"] == "text/html"
+    assert entry["meta"] == {
+        "created": "2024-01-02T03:04:05Z",
+        "lastModified": "2024-02-03T04:05:06Z",
+        "numItems": 2,
+        "isAdmin": is_admin,
+    }
+    assert entry["data"] == {
+        "id": 303,
+        "version": 4,
+        "name": "Alice Research Group",
+        "owner": 101,
+        "type": "Private",
+        "description": "Private collaboration fixture",
+        "url": "https://groups.example.test/alice-research",
+        "libraryEditing": "admins",
+        "libraryReading": "members",
+        "fileEditing": "admins",
+        "members": [202],
+    }
+
+
 def sha256_hex(value):
     return hashlib.sha256(value.encode()).hexdigest()
 
@@ -213,12 +262,45 @@ psql(
     """insert into users (id, username, display_name)
        values (202, 'bob', 'Bob')"""
 )
+psql(
+    """insert into users (id, username, display_name, disabled_at)
+       values (404, 'disabled-member', 'Disabled Member', now())"""
+)
 psql("insert into personal_libraries (user_id, library_id) values (202, 22)")
 psql(
     f"""insert into external_identities (issuer, subject, user_id)
         values ('{oidc_issuer}', '{oidc_bob_subject}', 202)"""
 )
 psql("update library set version = 3 where id = 22")
+psql("insert into library (id, version, kind) values (33, 17, 'group')")
+psql(
+    """begin;
+       insert into groups
+       (id, library_id, owner_user_id, name, description, url, type,
+        library_reading, library_editing, file_editing, version,
+        created_at, updated_at)
+       values
+       (303, 33, 101, 'Alice Research Group', 'Private collaboration fixture',
+        'https://groups.example.test/alice-research', 'Private',
+        'members', 'admins', 'admins', 4,
+        '2024-01-02 03:04:05+00', '2024-02-03 04:05:06+00');
+       insert into group_memberships (group_id, user_id, role)
+       values
+       (303, 101, 'owner'),
+       (303, 202, 'member'),
+       (303, 404, 'member');
+       commit"""
+)
+psql(
+    """insert into object (library_id, kind, key, version, data)
+       values
+       (33, 'item', 'GRPBKK22', 17,
+        '{"key":"GRPBKK22","version":17,"itemType":"book",
+          "title":"Group fixture item"}'),
+       (33, 'item', 'GRPTRS22', 17,
+        '{"key":"GRPTRS22","version":17,"itemType":"book",
+          "title":"Trashed group fixture item","deleted":true}')"""
+)
 psql(
     """insert into object (library_id, kind, key, version, data)
        values (22, 'item', 'LEGACY22', 3,
@@ -282,6 +364,15 @@ psql(
        (1007, true, false, true, true),
        (1003, true, true, true, true)"""
 )
+psql(
+    """insert into api_key_all_groups_permissions (api_key_id, library, write)
+       values (1001, true, true)"""
+)
+psql(
+    """insert into api_key_group_permissions
+       (api_key_id, user_id, group_id, library, write)
+       values (1002, 202, 303, true, false)"""
+)
 psql("update api_keys set revoked_at = now() where id = 1003")
 
 with subtest("non-default legacy attachment path survives the blob-key migration"):
@@ -309,9 +400,12 @@ with subtest("current-key introspection returns the authenticated DB owner"):
           "userID":101,
           "username":"alice",
           "displayName":"Alice",
-          "access":{{"user":{{
-            "library":true,"files":true,"notes":true,"write":true
-          }}}}
+          "access":{{
+            "user":{{
+              "library":true,"files":true,"notes":true,"write":true
+            }},
+            "groups":{{"all":{{"library":true,"write":true}}}}
+          }}
         }}'"""
     )
     machine.succeed(
@@ -321,7 +415,10 @@ with subtest("current-key introspection returns the authenticated DB owner"):
           "userID":202,
           "username":"bob",
           "displayName":"Bob",
-          "access":{{"user":{{"library":true,"files":true}}}}
+          "access":{{
+            "user":{{"library":true,"files":true}},
+            "groups":{{"303":{{"library":true,"write":false}}}}
+          }}
         }}'"""
     )
     machine.succeed(
@@ -349,6 +446,142 @@ with subtest("current-key introspection returns the authenticated DB owner"):
         }}'"""
     )
 
+with subtest("group listings intersect user membership with key grants"):
+    assert (
+        psql(
+            """select g.library_id = 33 and g.version = 4
+                      and l.version = 17 and g.owner_user_id = 101
+               from groups g join library l on l.id = g.library_id
+               where g.id = 303"""
+        )
+        == "t"
+    )
+    for user_id, token, is_admin in (
+        (101, alice, True),
+        (202, bob, False),
+    ):
+        headers = machine.succeed(
+            f"curl -sf -D - -o /tmp/groups-{user_id}.json "
+            f"{api_headers} -H 'Zotero-API-Key: {token}' "
+            f"'{base}/users/{user_id}/groups'"
+        )
+        assert response_header(headers, "Total-Results") == "1"
+        listing = json.loads(machine.succeed(f"cat /tmp/groups-{user_id}.json"))
+        assert len(listing) == 1
+        assert_group_entry(listing[0], is_admin)
+        assert get_json(f"/users/{user_id}/groups?format=versions", token) == {
+            "303": 4
+        }
+
+    assert get_json("/users/202/groups", bob_ro) == []
+    assert get_json("/users/202/groups?format=versions", bob_ro) == {}
+    assert http_code("/groups/303", bob_ro) == "404"
+    alice_cross_listing = get_json("/users/202/groups", alice)
+    assert len(alice_cross_listing) == 1
+    assert_group_entry(alice_cross_listing[0], True)
+    bob_cross_listing = get_json("/users/101/groups", bob)
+    assert len(bob_cross_listing) == 1
+    assert_group_entry(bob_cross_listing[0], False)
+    assert http_code("/users/404/groups", alice) == "404"
+    assert http_code("/users/999/groups", alice) == "404"
+
+    list_head = machine.succeed(
+        f"curl -sfI {api_headers} -H 'Zotero-API-Key: {alice}' "
+        f"{base}/users/101/groups"
+    )
+    assert response_header(list_head, "Total-Results") == "1"
+    assert 'rel="alternate"' in response_header(list_head, "Link")
+    assert not any(
+        line.lower().startswith("last-modified-version:")
+        for line in list_head.splitlines()
+    )
+    versions_headers = machine.succeed(
+        f"curl -sf -D - -o /tmp/group-versions.json "
+        f"{api_headers} -H 'Zotero-API-Key: {alice}' "
+        f"'{base}/users/101/groups?format=versions'"
+    )
+    assert response_header(versions_headers, "Total-Results") == "1"
+    assert 'rel="alternate"' in response_header(versions_headers, "Link")
+    assert not any(
+        line.lower().startswith("last-modified-version:")
+        for line in versions_headers.splitlines()
+    )
+    assert json.loads(machine.succeed("cat /tmp/group-versions.json")) == {"303": 4}
+
+with subtest("group metadata and HEAD use upstream wrapper and version"):
+    for label, token, is_admin in (
+        ("owner", alice, True),
+        ("member", bob, False),
+    ):
+        get_headers = machine.succeed(
+            f"curl -sf -D - -o /tmp/group-{label}.json "
+            f"{api_headers} -H 'Zotero-API-Key: {token}' "
+            f"{base}/groups/303"
+        )
+        assert response_header(get_headers, "Last-Modified-Version") == "4"
+        entry = json.loads(machine.succeed(f"cat /tmp/group-{label}.json"))
+        assert_group_entry(entry, is_admin)
+
+        head_headers = machine.succeed(
+            f"curl -sfI {api_headers} -H 'Zotero-API-Key: {token}' "
+            f"{base}/groups/303"
+        )
+        assert response_header(head_headers, "Last-Modified-Version") == "4"
+        assert not any(
+            line.lower().startswith("total-results:")
+            for line in head_headers.splitlines()
+        )
+
+with subtest("group admins receive isAdmin and admin membership metadata"):
+    psql(
+        """update group_memberships set role = 'admin'
+           where group_id = 303 and user_id = 202"""
+    )
+    admin_entry = get_json("/groups/303", bob)
+    assert admin_entry["meta"]["isAdmin"] is True
+    assert admin_entry["data"]["admins"] == [202]
+    assert "members" not in admin_entry["data"]
+    psql(
+        """update group_memberships set role = 'member'
+           where group_id = 303 and user_id = 202"""
+    )
+    assert_group_entry(get_json("/groups/303", bob), False)
+
+with subtest("membership removal immediately revokes explicit group discovery"):
+    psql("delete from group_memberships where group_id = 303 and user_id = 202")
+    assert (
+        psql(
+            """select count(*) = 0
+               from api_key_group_permissions
+               where api_key_id = 1002 and user_id = 202 and group_id = 303"""
+        )
+        == "t"
+    )
+    assert get_json("/users/202/groups?format=versions", bob) == {}
+    assert http_code("/groups/303", bob) == "404"
+    assert get_json("/users/202/groups?format=versions", alice) == {}
+    assert get_json("/users/101/groups?format=versions", bob) == {}
+    assert get_json("/users/101/groups?format=versions", alice) == {"303": 4}
+    assert http_code("/groups/303", alice) == "200"
+
+    psql(
+        """insert into group_memberships (group_id, user_id, role)
+           values (303, 202, 'member')"""
+    )
+    psql(
+        """insert into api_key_group_permissions
+           (api_key_id, user_id, group_id, library, write)
+           values (1002, 202, 303, true, false)"""
+    )
+
+with subtest("a disabled private-group owner hides the group from members"):
+    psql("update users set disabled_at = now() where id = 101")
+    assert get_json("/users/202/groups?format=versions", bob) == {}
+    assert http_code("/groups/303", bob) == "404"
+    psql("update users set disabled_at = null where id = 101")
+    assert get_json("/users/202/groups?format=versions", bob) == {"303": 4}
+    assert http_code("/groups/303", bob) == "200"
+
 with subtest("static recovery key remains bound to the bootstrap user"):
     machine.succeed(
         f"""curl -sf {api_headers} -H 'Zotero-API-Key: {recovery}' {base}/keys/current |
@@ -357,9 +590,12 @@ with subtest("static recovery key remains bound to the bootstrap user"):
           "userID":101,
           "username":"alice",
           "displayName":"Alice",
-          "access":{{"user":{{
-            "library":true,"files":true,"notes":true,"write":true
-          }}}}
+          "access":{{
+            "user":{{
+              "library":true,"files":true,"notes":true,"write":true
+            }},
+            "groups":{{"all":{{"library":true,"write":true}}}}
+          }}
         }}'"""
     )
 
@@ -493,9 +729,11 @@ with subtest("browser login mints distinct hashed full-access keys for Alice"):
                            and octet_length(ls.token_hash) = 32
                            and octet_length(k.token_hash) = 32
                            and p.library and p.notes and p.write and p.files
+                           and gp.library and gp.write
                     from login_sessions ls
                     join api_keys k on k.id = ls.api_key_id
                     join api_key_user_permissions p on p.api_key_id = k.id
+                    join api_key_all_groups_permissions gp on gp.api_key_id = k.id
                     where ls.token_hash = decode('{session_hash}', 'hex')"""
             )
             == "t"
@@ -519,6 +757,9 @@ with subtest("browser login mints distinct hashed full-access keys for Alice"):
               and .displayName == "Alice"
               and .access.user == {{
                 "library":true,"files":true,"notes":true,"write":true
+              }}
+              and .access.groups == {{
+                "all":{{"library":true,"write":true}}
               }}'"""
         )
 
@@ -551,9 +792,11 @@ with subtest("mapped non-bootstrap OIDC identity mints a key for Bob"):
                        and k.user_id = 202
                        and encode(k.token_hash, 'hex') = '{sha256_hex(bob_login_key)}'
                        and p.library and p.notes and p.write and p.files
+                       and gp.library and gp.write
                 from login_sessions ls
                 join api_keys k on k.id = ls.api_key_id
                 join api_key_user_permissions p on p.api_key_id = k.id
+                join api_key_all_groups_permissions gp on gp.api_key_id = k.id
                 where ls.token_hash = decode('{sha256_hex(bob_session)}', 'hex')"""
         )
         == "t"
@@ -565,9 +808,12 @@ with subtest("mapped non-bootstrap OIDC identity mints a key for Bob"):
           "userID":202,
           "username":"bob",
           "displayName":"Bob",
-          "access":{{"user":{{
-            "library":true,"files":true,"notes":true,"write":true
-          }}}}
+          "access":{{
+            "user":{{
+              "library":true,"files":true,"notes":true,"write":true
+            }},
+            "groups":{{"all":{{"library":true,"write":true}}}}
+          }}
         }}'"""
     )
 

@@ -9,7 +9,7 @@ use serde_json::{Map, Value};
 use sqlx::postgres::PgRow;
 use sqlx::{PgPool, Postgres, QueryBuilder, Row};
 
-use crate::domain::{LibraryId, Permissions, Principal, UserId};
+use crate::domain::{ApiKeyId, GroupId, LibraryId, Permissions, Principal, UserId};
 use crate::query::{ItemQuery, QMode};
 
 /// `{<key_col>: version}` map from version-listing rows (the `format=versions`
@@ -276,9 +276,9 @@ pub async fn bootstrap_principal(
 pub async fn authenticate_api_key(
     pool: &PgPool,
     token_hash: &[u8],
-) -> sqlx::Result<Option<(Principal, Permissions)>> {
+) -> sqlx::Result<Option<(ApiKeyId, Principal, Permissions)>> {
     let row = sqlx::query(
-        "select u.id as user_id, u.username, u.display_name, pl.library_id, \
+        "select k.id as api_key_id, u.id as user_id, u.username, u.display_name, pl.library_id, \
                 p.library, p.notes, p.write, p.files \
          from api_keys k \
          join users u on u.id = k.user_id \
@@ -293,7 +293,12 @@ pub async fn authenticate_api_key(
     .await?;
     row.as_ref()
         .map(|row| {
+            let raw_api_key_id = row.get::<i64, _>("api_key_id");
+            let api_key_id = ApiKeyId::new(raw_api_key_id).ok_or_else(|| {
+                sqlx::Error::Protocol(format!("invalid API key ID {raw_api_key_id}"))
+            })?;
             Ok((
+                api_key_id,
                 principal_from_row(row)?,
                 Permissions {
                     library: row.get("library"),
@@ -304,6 +309,168 @@ pub async fn authenticate_api_key(
             ))
         })
         .transpose()
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GroupGrant {
+    pub group_id: Option<GroupId>,
+    pub library: bool,
+    pub write: bool,
+}
+
+pub async fn api_key_group_grants(
+    pool: &PgPool,
+    api_key_id: ApiKeyId,
+) -> sqlx::Result<Vec<GroupGrant>> {
+    let rows = sqlx::query(
+        "select null::bigint as group_id, library, write \
+         from api_key_all_groups_permissions where api_key_id = $1 \
+         union all \
+         select group_id, library, write \
+         from api_key_group_permissions where api_key_id = $1 \
+         order by group_id nulls first",
+    )
+    .bind(api_key_id.get())
+    .fetch_all(pool)
+    .await?;
+    rows.into_iter()
+        .map(|row| {
+            let group_id = row
+                .get::<Option<i64>, _>("group_id")
+                .map(|raw| {
+                    GroupId::new(raw)
+                        .ok_or_else(|| sqlx::Error::Protocol(format!("invalid group ID {raw}")))
+                })
+                .transpose()?;
+            Ok(GroupGrant {
+                group_id,
+                library: row.get("library"),
+                write: row.get("write"),
+            })
+        })
+        .collect::<sqlx::Result<Vec<_>>>()
+}
+
+pub struct GroupMetadata {
+    pub id: GroupId,
+    pub version: i64,
+    pub name: String,
+    pub description: String,
+    pub url: String,
+    pub group_type: String,
+    pub library_reading: String,
+    pub library_editing: String,
+    pub file_editing: String,
+    pub owner: i64,
+    pub role: String,
+    pub admins: Vec<i64>,
+    pub members: Vec<i64>,
+    pub created: String,
+    pub last_modified: String,
+    pub num_items: i64,
+}
+
+fn group_metadata_from_row(row: &PgRow) -> sqlx::Result<GroupMetadata> {
+    let raw_group_id = row.get::<i64, _>("id");
+    let id = GroupId::new(raw_group_id)
+        .ok_or_else(|| sqlx::Error::Protocol(format!("invalid group ID {raw_group_id}")))?;
+    Ok(GroupMetadata {
+        id,
+        version: row.get("version"),
+        name: row.get("name"),
+        description: row.get("description"),
+        url: row.get("url"),
+        group_type: row.get("type"),
+        library_reading: row.get("library_reading"),
+        library_editing: row.get("library_editing"),
+        file_editing: row.get("file_editing"),
+        owner: row.get("owner"),
+        role: row.get("role"),
+        admins: row.get("admins"),
+        members: row.get("members"),
+        created: row.get("created"),
+        last_modified: row.get("last_modified"),
+        num_items: row.get("num_items"),
+    })
+}
+
+const GROUP_METADATA_SELECT: &str = "\
+    select g.id, g.library_id, g.version, g.name, g.description, g.url, g.type, \
+           g.library_reading, g.library_editing, g.file_editing, \
+           g.owner_user_id as owner, membership.role, \
+           coalesce((select array_agg(gm.user_id order by gm.user_id) \
+                     from group_memberships gm \
+                     join users gu on gu.id = gm.user_id and gu.disabled_at is null \
+                     where gm.group_id = g.id and gm.role = 'admin'), '{}') as admins, \
+           coalesce((select array_agg(gm.user_id order by gm.user_id) \
+                     from group_memberships gm \
+                     join users gu on gu.id = gm.user_id and gu.disabled_at is null \
+                     where gm.group_id = g.id and gm.role = 'member'), '{}') as members, \
+           to_char(g.created_at at time zone 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"') as created, \
+           to_char(g.updated_at at time zone 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"') as last_modified, \
+           (select count(*) from object o \
+            where o.library_id = g.library_id and o.kind = 'item') as num_items \
+    from groups g \
+    join group_memberships target_membership \
+      on target_membership.group_id = g.id and target_membership.user_id = $1 \
+    join users target_user \
+      on target_user.id = target_membership.user_id and target_user.disabled_at is null \
+    join group_memberships membership \
+      on membership.group_id = g.id and membership.user_id = $2 \
+    join users member_user \
+      on member_user.id = membership.user_id and member_user.disabled_at is null \
+    join users owner_user \
+      on owner_user.id = g.owner_user_id and owner_user.disabled_at is null \
+    where ( \
+        $3::boolean \
+        or exists (select 1 from api_key_all_groups_permissions ag \
+                   where ag.api_key_id = $4 and ag.library) \
+        or exists (select 1 from api_key_group_permissions eg \
+                   where eg.api_key_id = $4 and eg.group_id = g.id and eg.library) \
+    )";
+
+pub async fn groups_for_user(
+    pool: &PgPool,
+    target_user_id: UserId,
+    requesting_user_id: UserId,
+    api_key_id: Option<ApiKeyId>,
+    static_library_access: bool,
+) -> sqlx::Result<Vec<GroupMetadata>> {
+    let query = format!("{GROUP_METADATA_SELECT} order by g.id");
+    let rows = sqlx::query(&query)
+        .bind(target_user_id.get())
+        .bind(requesting_user_id.get())
+        .bind(static_library_access)
+        .bind(api_key_id.map(ApiKeyId::get))
+        .fetch_all(pool)
+        .await?;
+    rows.iter().map(group_metadata_from_row).collect()
+}
+
+pub async fn active_user_exists(pool: &PgPool, user_id: UserId) -> sqlx::Result<bool> {
+    sqlx::query_scalar("select exists(select 1 from users where id = $1 and disabled_at is null)")
+        .bind(user_id.get())
+        .fetch_one(pool)
+        .await
+}
+
+pub async fn group_for_user(
+    pool: &PgPool,
+    group_id: GroupId,
+    user_id: UserId,
+    api_key_id: Option<ApiKeyId>,
+    static_library_access: bool,
+) -> sqlx::Result<Option<GroupMetadata>> {
+    let query = format!("{GROUP_METADATA_SELECT} and g.id = $5");
+    let row = sqlx::query(&query)
+        .bind(user_id.get())
+        .bind(user_id.get())
+        .bind(static_library_access)
+        .bind(api_key_id.map(ApiKeyId::get))
+        .bind(group_id.get())
+        .fetch_optional(pool)
+        .await?;
+    row.as_ref().map(group_metadata_from_row).transpose()
 }
 
 pub enum LoginSession {
@@ -467,6 +634,13 @@ pub async fn complete_login_session(
         "insert into api_key_user_permissions \
          (api_key_id, library, notes, write, files) \
          values ($1, true, true, true, true)",
+    )
+    .bind(api_key_id)
+    .execute(&mut *tx)
+    .await?;
+    sqlx::query(
+        "insert into api_key_all_groups_permissions (api_key_id, library, write) \
+         values ($1, true, true)",
     )
     .bind(api_key_id)
     .execute(&mut *tx)

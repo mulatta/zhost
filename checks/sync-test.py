@@ -57,6 +57,18 @@ machine.succeed("mc mb s3/zotero")
 
 with subtest("the module deploys a working service backed by postgres"):
     assert http_code(f"{base}/keys/current {auth}") == "200"
+    machine.succeed(
+        f"""curl -sf {base}/keys/current {auth} |
+        jq -e '.access.groups == {{
+          "all":{{"library":true,"write":true}}
+        }}'"""
+    )
+    machine.succeed(
+        f"""curl -sf {base}/keys/current {readonly} |
+        jq -e '.access.groups == {{
+          "all":{{"library":true,"write":false}}
+        }}'"""
+    )
 
 with subtest("bootstrap OIDC identity owns the default personal library"):
     assert (
@@ -161,9 +173,12 @@ with subtest("login session hands out the key only after authorization"):
           "userID":1,
           "username":"zhost",
           "displayName":"zhost",
-          "access":{{"user":{{
-            "library":true,"files":true,"notes":true,"write":true
-          }}}}
+          "access":{{
+            "user":{{
+              "library":true,"files":true,"notes":true,"write":true
+            }},
+            "groups":{{"all":{{"library":true,"write":true}}}}
+          }}
         }}'"""
     )
     assert http_code(f"-X DELETE {base}/keys/sessions/{token}") == "409"
@@ -182,8 +197,11 @@ with subtest("the login consent endpoint validates the session token"):
     assert http_code(f"-X POST {base}/login {oidc} -d 'session=nope'") == "404"
     assert http_code(f"{base}/keys/sessions/nope") == "404"
 
-with subtest("groups endpoint returns an empty set (single personal library)"):
-    machine.succeed(f"curl -sf {base}/users/1/groups {auth} | jq -e '. == {{}}'")
+with subtest("groups endpoint returns empty upstream listing shapes"):
+    machine.succeed(f"curl -sf {base}/users/1/groups {auth} | jq -e '. == []'")
+    machine.succeed(
+        f"curl -sf '{base}/users/1/groups?format=versions' {auth} | jq -e '. == {{}}'"
+    )
 
 with subtest("the api key is required off the bootstrap paths"):
     assert http_code(f"{base}/keys/current -H 'Zotero-API-Version: 3'") == "403"

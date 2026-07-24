@@ -28,6 +28,34 @@ impl UserId {
     }
 }
 
+/// Database identifier for one user-owned API key.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ApiKeyId(i64);
+
+impl ApiKeyId {
+    pub fn new(value: i64) -> Option<Self> {
+        (value > 0).then_some(Self(value))
+    }
+
+    pub fn get(self) -> i64 {
+        self.0
+    }
+}
+
+/// Public identifier for one Zotero group.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct GroupId(i64);
+
+impl GroupId {
+    pub fn new(value: i64) -> Option<Self> {
+        (value > 0).then_some(Self(value))
+    }
+
+    pub fn get(self) -> i64 {
+        self.0
+    }
+}
+
 /// Durable identity and personal-library ownership resolved for one request.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Principal {
@@ -67,11 +95,14 @@ pub struct RequestContext {
     pub presented_key: String,
     pub principal: Principal,
     pub permissions: Permissions,
+    /// Static recovery keys have no database row and therefore no explicit
+    /// per-group grants; their legacy permissions apply to all current groups.
+    pub api_key_id: Option<ApiKeyId>,
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{LibraryId, Permissions, UserId};
+    use super::{ApiKeyId, GroupId, LibraryId, Permissions, UserId};
 
     #[test]
     fn database_ids_are_positive() {
@@ -81,6 +112,10 @@ mod tests {
         assert_eq!(UserId::new(1).map(UserId::get), Some(1));
         assert_eq!(UserId::new(0), None);
         assert_eq!(UserId::new(-1), None);
+        assert_eq!(ApiKeyId::new(1).map(ApiKeyId::get), Some(1));
+        assert_eq!(ApiKeyId::new(0), None);
+        assert_eq!(GroupId::new(1).map(GroupId::get), Some(1));
+        assert_eq!(GroupId::new(0), None);
     }
 
     #[test]

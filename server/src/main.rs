@@ -27,7 +27,7 @@ use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
 use sqlx::PgPool;
 
-use crate::domain::{LibraryId, Permissions, RequestContext, UserId};
+use crate::domain::{GroupId, LibraryId, Permissions, RequestContext, UserId};
 
 struct Config {
     /// Static recovery token → access, loaded from secret files at boot.
@@ -154,7 +154,7 @@ fn valid_object_key(key: &str) -> bool {
 }
 
 /// Zotero omits false permission fields and empty access families.
-fn access_payload(permissions: Permissions) -> Value {
+fn access_payload(permissions: Permissions, group_grants: &[store::GroupGrant]) -> Value {
     let mut user = Map::new();
     for (name, allowed) in [
         ("library", permissions.library),
@@ -169,6 +169,18 @@ fn access_payload(permissions: Permissions) -> Value {
     let mut access = Map::new();
     if !user.is_empty() {
         access.insert("user".into(), Value::Object(user));
+    }
+    let mut groups = Map::new();
+    for grant in group_grants.iter().filter(|grant| grant.library) {
+        groups.insert(
+            grant
+                .group_id
+                .map_or_else(|| "all".to_string(), |id| id.get().to_string()),
+            json!({ "library": true, "write": grant.write }),
+        );
+    }
+    if !groups.is_empty() {
+        access.insert("groups".into(), Value::Object(groups));
     }
     Value::Object(access)
 }
@@ -196,6 +208,7 @@ async fn authenticate_request(
                     presented_key: token.to_owned(),
                     principal,
                     permissions,
+                    api_key_id: None,
                 }),
         );
     }
@@ -203,10 +216,11 @@ async fn authenticate_request(
     let digest = Sha256::digest(token.as_bytes());
     Ok(store::authenticate_api_key(&state.pool, digest.as_slice())
         .await?
-        .map(|(principal, permissions)| RequestContext {
+        .map(|(api_key_id, principal, permissions)| RequestContext {
             presented_key: token.to_owned(),
             principal,
             permissions,
+            api_key_id: Some(api_key_id),
         }))
 }
 
@@ -258,13 +272,28 @@ fn header_value(text: &str) -> axum::http::HeaderValue {
 
 // --- authentication & login session ---------------------------------------
 
-async fn key_current(Extension(context): Extension<RequestContext>) -> Response {
+async fn key_current(
+    State(state): State<AppState>,
+    Extension(context): Extension<RequestContext>,
+) -> Response {
+    let group_grants = match context.api_key_id {
+        Some(api_key_id) => match store::api_key_group_grants(&state.pool, api_key_id).await {
+            Ok(grants) => grants,
+            Err(error) => return server_error("read API key group grants", error),
+        },
+        None if context.permissions.library => vec![store::GroupGrant {
+            group_id: None,
+            library: true,
+            write: context.permissions.write,
+        }],
+        None => Vec::new(),
+    };
     Json(json!({
         "key": context.presented_key,
         "userID": context.principal.user_id.get(),
         "username": context.principal.username,
         "displayName": context.principal.display_name,
-        "access": access_payload(context.permissions),
+        "access": access_payload(context.permissions, &group_grants),
     }))
     .into_response()
 }
@@ -476,8 +505,126 @@ async fn login_authorize(
 
 // --- library data -----------------------------------------------------------
 
-async fn groups(State(state): State<AppState>) -> Response {
-    (current_headers(&state).await, Json(json!({}))).into_response()
+fn group_json(group: store::GroupMetadata, public_url: &str) -> Value {
+    let mut data = Map::new();
+    data.insert("id".into(), Value::from(group.id.get()));
+    data.insert("version".into(), Value::from(group.version));
+    data.insert("name".into(), Value::from(group.name));
+    data.insert("owner".into(), Value::from(group.owner));
+    data.insert("type".into(), Value::from(group.group_type));
+    data.insert("description".into(), Value::from(group.description));
+    data.insert("url".into(), Value::from(group.url));
+    data.insert("libraryEditing".into(), Value::from(group.library_editing));
+    data.insert("libraryReading".into(), Value::from(group.library_reading));
+    data.insert("fileEditing".into(), Value::from(group.file_editing));
+    if !group.admins.is_empty() {
+        data.insert("admins".into(), json!(group.admins));
+    }
+    if !group.members.is_empty() {
+        data.insert("members".into(), json!(group.members));
+    }
+    json!({
+        "id": group.id.get(),
+        "version": group.version,
+        "links": {
+            "self": {
+                "href": format!("{public_url}/groups/{}", group.id.get()),
+                "type": "application/json"
+            },
+            "alternate": {
+                "href": format!("https://www.zotero.org/groups/{}", group.id.get()),
+                "type": "text/html"
+            }
+        },
+        "meta": {
+            "created": group.created,
+            "lastModified": group.last_modified,
+            "numItems": group.num_items,
+            "isAdmin": matches!(group.role.as_str(), "owner" | "admin")
+        },
+        "data": Value::Object(data),
+    })
+}
+
+async fn groups(
+    State(state): State<AppState>,
+    Extension(context): Extension<RequestContext>,
+    Path(target_user_id): Path<i64>,
+    Query(params): Query<HashMap<String, String>>,
+) -> Response {
+    let Some(target_user_id) = UserId::new(target_user_id) else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    match store::active_user_exists(&state.pool, target_user_id).await {
+        Ok(true) => {}
+        Ok(false) => return StatusCode::NOT_FOUND.into_response(),
+        Err(error) => return server_error("read group-list user", error),
+    }
+    let groups = match store::groups_for_user(
+        &state.pool,
+        target_user_id,
+        context.principal.user_id,
+        context.api_key_id,
+        context.api_key_id.is_none() && context.permissions.library,
+    )
+    .await
+    {
+        Ok(groups) => groups,
+        Err(error) => return server_error("list groups", error),
+    };
+    let mut headers = HeaderMap::new();
+    headers.insert("total-results", header_value(&groups.len().to_string()));
+    headers.insert(
+        "link",
+        header_value(&format!(
+            "<{}/users/{}/groups>; rel=\"alternate\"",
+            state.config.public_url,
+            target_user_id.get()
+        )),
+    );
+    if params
+        .get("format")
+        .is_some_and(|format| format == "versions")
+    {
+        let versions = groups
+            .into_iter()
+            .map(|group| (group.id.get().to_string(), Value::from(group.version)))
+            .collect();
+        (headers, Json(Value::Object(versions))).into_response()
+    } else {
+        let values: Vec<_> = groups
+            .into_iter()
+            .map(|group| group_json(group, &state.config.public_url))
+            .collect();
+        (headers, Json(values)).into_response()
+    }
+}
+
+async fn group_get(
+    State(state): State<AppState>,
+    Extension(context): Extension<RequestContext>,
+    Path(group_id): Path<i64>,
+) -> Response {
+    let Some(group_id) = GroupId::new(group_id) else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    match store::group_for_user(
+        &state.pool,
+        group_id,
+        context.principal.user_id,
+        context.api_key_id,
+        context.api_key_id.is_none() && context.permissions.library,
+    )
+    .await
+    {
+        Ok(Some(group)) => (
+            version_headers(group.version),
+            Json(group_json(group, &state.config.public_url)),
+        )
+            .into_response(),
+        Ok(None) => StatusCode::NOT_FOUND.into_response(),
+        Err(error) => server_error("read group", error),
+    }
 }
 
 fn server_error(context: &str, error: sqlx::Error) -> Response {
@@ -1334,6 +1481,14 @@ fn request_log_path(path: &str) -> &str {
     }
 }
 
+fn is_group_discovery_path(path: &str) -> bool {
+    let segments: Vec<_> = path
+        .split('/')
+        .filter(|segment| !segment.is_empty())
+        .collect();
+    matches!(segments.as_slice(), ["groups", _] | ["users", _, "groups"])
+}
+
 /// Decode gzip write bodies, log safe routing metadata, and reject anything
 /// without the configured key except bootstrap endpoints. Query strings, form
 /// values, and content never enter logs because they can hold capability tokens
@@ -1397,11 +1552,13 @@ async fn log_and_auth(State(state): State<AppState>, req: Request, next: Next) -
             Ok(None) => return (StatusCode::FORBIDDEN, "invalid API key").into_response(),
             Err(error) => return server_error("API key authentication", error),
         };
-        if path != "/keys/current" && !context.permissions.library {
+        let is_group_discovery = is_group_discovery_path(&path);
+        if path != "/keys/current" && !is_group_discovery && !context.permissions.library {
             return (StatusCode::FORBIDDEN, "library access denied").into_response();
         }
         match path_user_id(&path) {
             Ok(Some(path_user_id)) if path_user_id == context.principal.user_id.get() => {}
+            Ok(Some(_)) if is_group_discovery => {}
             Ok(Some(_)) => return (StatusCode::FORBIDDEN, "user access denied").into_response(),
             Err(()) => return StatusCode::NOT_FOUND.into_response(),
             Ok(None) => {}
@@ -1491,6 +1648,7 @@ fn app(state: AppState) -> Router {
         )
         .route("/login", get(login_page).post(login_authorize))
         .route("/users/{id}/groups", get(groups))
+        .route("/groups/{id}", get(group_get).head(group_get))
         .route(
             "/users/{id}/settings",
             get(settings_read)
@@ -1721,4 +1879,17 @@ async fn main() {
         })
         .await
         .expect("server run");
+}
+
+#[cfg(test)]
+mod middleware_tests {
+    use super::is_group_discovery_path;
+
+    #[test]
+    fn group_permission_bypass_is_limited_to_discovery_routes() {
+        assert!(is_group_discovery_path("/groups/303"));
+        assert!(is_group_discovery_path("/users/101/groups"));
+        assert!(!is_group_discovery_path("/groups/303/items"));
+        assert!(!is_group_discovery_path("/admin/users/101/groups"));
+    }
 }
