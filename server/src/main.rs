@@ -26,7 +26,7 @@ use axum::{
     routing::{get, post},
     Extension, Json, Router,
 };
-use serde_json::{json, Map, Value};
+use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use sqlx::PgPool;
 
@@ -34,6 +34,7 @@ use crate::config::Config;
 use crate::domain::{LibraryAccess, LibraryId, Permissions, RequestContext};
 use crate::error::{s3_error, server_error};
 use crate::handlers::groups::{group_get, groups};
+use crate::handlers::keys::key_current;
 use crate::handlers::login::{
     cancel_session, check_session, create_session, login_authorize, login_page,
 };
@@ -79,71 +80,6 @@ pub(crate) fn upload_token() -> Option<String> {
     Some(buf.iter().map(|b| format!("{b:02x}")).collect())
 }
 
-/// Zotero omits false permission fields and empty access families.
-fn access_payload(permissions: Permissions, group_grants: &[store::GroupGrant]) -> Value {
-    let mut user = Map::new();
-    for (name, allowed) in [
-        ("library", permissions.library),
-        ("files", permissions.files),
-        ("notes", permissions.notes),
-        ("write", permissions.write),
-    ] {
-        if allowed {
-            user.insert(name.into(), Value::Bool(true));
-        }
-    }
-    let mut access = Map::new();
-    if !user.is_empty() {
-        access.insert("user".into(), Value::Object(user));
-    }
-    let mut groups = Map::new();
-    for grant in group_grants.iter().filter(|grant| grant.library) {
-        groups.insert(
-            grant
-                .group_id
-                .map_or_else(|| "all".to_string(), |id| id.get().to_string()),
-            json!({ "library": true, "write": grant.write }),
-        );
-    }
-    if !groups.is_empty() {
-        access.insert("groups".into(), Value::Object(groups));
-    }
-    Value::Object(access)
-}
-
-// --- authentication & login session ---------------------------------------
-
-async fn key_current(
-    State(state): State<AppState>,
-    Extension(context): Extension<RequestContext>,
-) -> Response {
-    let group_grants = match context.api_key_id {
-        Some(api_key_id) => match store::api_key_group_grants(&state.pool, api_key_id).await {
-            Ok(grants) => grants,
-            Err(error) => return server_error("read API key group grants", error),
-        },
-        None if context.permissions.library => vec![store::GroupGrant {
-            group_id: None,
-            library: true,
-            write: context.permissions.write,
-        }],
-        None => Vec::new(),
-    };
-    Json(json!({
-        "key": context.presented_key,
-        "userID": context.principal.user_id.get(),
-        "username": context.principal.username,
-        "displayName": context.principal.display_name,
-        "access": access_payload(context.permissions, &group_grants),
-    }))
-    .into_response()
-}
-
-/// Zotero's "Login" uses a browser-authorised session rather than credentials:
-/// the client opens `loginURL` in the user's browser, then polls the session
-/// until it reports `status: "completed"` with a key. Mint a pending session and
-/// point `loginURL` at our `/login` (which the user must pass an SSO gate to
-/// reach); the key is withheld until that authorises the session.
 // --- library data -----------------------------------------------------------
 
 /// `format=versions&since=N` returns the changed `{key: version}` map; otherwise
