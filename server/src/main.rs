@@ -5,6 +5,7 @@
 //! and `If-Unmodified-Since-Version` writes stay coherent. See SPEC.md for the
 //! protocol contract.
 
+mod domain;
 mod query;
 mod s3;
 mod store;
@@ -24,6 +25,8 @@ use axum::{
 use serde_json::{json, Value};
 use sqlx::PgPool;
 
+use crate::domain::LibraryId;
+
 /// What a key may do. Reads are always allowed; `write` gates mutations.
 #[derive(Clone, Copy)]
 struct Access {
@@ -37,6 +40,9 @@ struct Config {
     /// A read/write token handed to the app through the login session.
     login_key: String,
     user_id: u64,
+    /// Migration 0001 creates one legacy personal library with ID 1. Keeping its
+    /// scope in application state makes every storage call explicit.
+    library_id: LibraryId,
     bind: String,
     /// Client-facing base URL (e.g. the reverse-proxy address). Used for the
     /// login and upload URLs handed to the client, which must be reachable by it
@@ -158,7 +164,11 @@ fn version_headers(version: i64) -> HeaderMap {
 }
 
 async fn current_headers(state: &AppState) -> HeaderMap {
-    version_headers(store::current_version(&state.pool).await.unwrap_or(0))
+    version_headers(
+        store::current_version(&state.pool, state.config.library_id)
+            .await
+            .unwrap_or(0),
+    )
 }
 
 /// For a since/versions read: the current library version, and whether the
@@ -167,7 +177,9 @@ async fn current_headers(state: &AppState) -> HeaderMap {
 /// 304 it. One DB read, so the caller reuses `current` for the response's
 /// `Last-Modified-Version` instead of querying it again.
 async fn since_check(state: &AppState, since: i64) -> (i64, bool) {
-    let current = store::current_version(&state.pool).await.unwrap_or(0);
+    let current = store::current_version(&state.pool, state.config.library_id)
+        .await
+        .unwrap_or(0);
     (current, since > 0 && since >= current)
 }
 
@@ -407,14 +419,16 @@ async fn read(state: &AppState, kind: &str, params: HashMap<String, String>) -> 
         // 304 as "no data", which then mismatches its library-version check and
         // makes it restart the sync forever. 304 is only for the header path
         // (settings), not for `?since=` versions reads.
-        let current = store::current_version(&state.pool).await.unwrap_or(0);
-        return match store::versions(&state.pool, kind, since).await {
+        let current = store::current_version(&state.pool, state.config.library_id)
+            .await
+            .unwrap_or(0);
+        return match store::versions(&state.pool, state.config.library_id, kind, since).await {
             Ok(value) => (version_headers(current), Json(value)).into_response(),
             Err(error) => server_error("read", error),
         };
     }
     let keys = csv_of(&params, &format!("{kind}Key"));
-    match store::objects(&state.pool, kind, &keys).await {
+    match store::objects(&state.pool, state.config.library_id, kind, &keys).await {
         Ok(value) => (current_headers(state).await, Json(value)).into_response(),
         Err(error) => server_error("read", error),
     }
@@ -431,11 +445,13 @@ async fn item_sync_read(state: &AppState, params: &query::Params, top: bool) -> 
             .and_then(|s| s.parse().ok())
             .unwrap_or(0);
         // Always 200 + map (never 304); see `read` — a 304 here loops the client.
-        let current = store::current_version(&state.pool).await.unwrap_or(0);
+        let current = store::current_version(&state.pool, state.config.library_id)
+            .await
+            .unwrap_or(0);
         let result = if top {
-            store::top_versions(&state.pool, since).await
+            store::top_versions(&state.pool, state.config.library_id, since).await
         } else {
-            store::versions(&state.pool, "item", since).await
+            store::versions(&state.pool, state.config.library_id, "item", since).await
         };
         return Some(match result {
             Ok(value) => (version_headers(current), Json(value)).into_response(),
@@ -444,10 +460,12 @@ async fn item_sync_read(state: &AppState, params: &query::Params, top: bool) -> 
     }
     if let Some(csv) = params.get("itemKey") {
         let keys: Vec<String> = csv.split(',').map(String::from).collect();
-        return Some(match store::objects(&state.pool, "item", &keys).await {
-            Ok(value) => (current_headers(state).await, Json(value)).into_response(),
-            Err(error) => server_error("items batch", error),
-        });
+        return Some(
+            match store::objects(&state.pool, state.config.library_id, "item", &keys).await {
+                Ok(value) => (current_headers(state).await, Json(value)).into_response(),
+                Err(error) => server_error("items batch", error),
+            },
+        );
     }
     None
 }
@@ -461,7 +479,7 @@ async fn item_listing(
     raw: Option<&str>,
     q: &query::ItemQuery,
 ) -> Response {
-    match store::query_items(&state.pool, q).await {
+    match store::query_items(&state.pool, state.config.library_id, q).await {
         Ok((items, total)) => {
             let mut headers = current_headers(state).await;
             headers.insert("total-results", total.to_string().parse().unwrap());
@@ -498,12 +516,14 @@ async fn item_keys_response(
     if params.get("format") != Some("keys") {
         return None;
     }
-    Some(match store::item_keys(&state.pool, q).await {
-        // A `String` body sets `Content-Type: text/plain`, which is what the
-        // client expects; current_headers adds `Last-Modified-Version`.
-        Ok(keys) => (current_headers(state).await, keys.join("\n")).into_response(),
-        Err(error) => server_error("item keys", error),
-    })
+    Some(
+        match store::item_keys(&state.pool, state.config.library_id, q).await {
+            // A `String` body sets `Content-Type: text/plain`, which is what the
+            // client expects; current_headers adds `Last-Modified-Version`.
+            Ok(keys) => (current_headers(state).await, keys.join("\n")).into_response(),
+            Err(error) => server_error("item keys", error),
+        },
+    )
 }
 
 /// `GET /users/<id>/items`: the two sync reads, or the CLI query when neither.
@@ -616,7 +636,7 @@ async fn collection_items_top(
 
 /// `GET /users/<id>/tags`: distinct tags with item counts.
 async fn tags_get(State(state): State<AppState>) -> Response {
-    match store::tags(&state.pool).await {
+    match store::tags(&state.pool, state.config.library_id).await {
         Ok(value) => (current_headers(&state).await, Json(value)).into_response(),
         Err(error) => server_error("tags", error),
     }
@@ -646,7 +666,7 @@ async fn tags_delete(
                 .collect()
         })
         .unwrap_or_default();
-    match store::delete_tags(&state.pool, &tags, Some(expected)).await {
+    match store::delete_tags(&state.pool, state.config.library_id, &tags, Some(expected)).await {
         Ok(store::Outcome::Done(version)) => {
             (StatusCode::NO_CONTENT, version_headers(version)).into_response()
         }
@@ -684,7 +704,15 @@ async fn write(state: &AppState, kind: &str, headers: HeaderMap, body: Bytes) ->
         Ok(v) => v,
         Err(resp) => return resp,
     };
-    match store::write(&state.pool, kind, batch, Some(expected)).await {
+    match store::write(
+        &state.pool,
+        state.config.library_id,
+        kind,
+        batch,
+        Some(expected),
+    )
+    .await
+    {
         Ok(store::Outcome::Done((version, successful))) => (
             version_headers(version),
             Json(json!({
@@ -711,7 +739,15 @@ async fn delete(
         Err(resp) => return resp,
     };
     let keys = csv_of(&params, &format!("{kind}Key"));
-    match store::delete(&state.pool, kind, &keys, Some(expected)).await {
+    match store::delete(
+        &state.pool,
+        state.config.library_id,
+        kind,
+        &keys,
+        Some(expected),
+    )
+    .await
+    {
         Ok(store::Outcome::Done(version)) => {
             (StatusCode::NO_CONTENT, version_headers(version)).into_response()
         }
@@ -732,7 +768,7 @@ async fn settings_read(
     if fresh {
         return (StatusCode::NOT_MODIFIED, version_headers(current)).into_response();
     }
-    match store::settings(&state.pool).await {
+    match store::settings(&state.pool, state.config.library_id).await {
         Ok(value) => (version_headers(current), Json(value)).into_response(),
         Err(error) => server_error("settings", error),
     }
@@ -748,7 +784,7 @@ async fn settings_write(
         Err(resp) => return resp,
     };
     let value: Value = serde_json::from_slice(&body).unwrap_or_else(|_| json!({}));
-    match store::write_settings(&state.pool, value, Some(expected)).await {
+    match store::write_settings(&state.pool, state.config.library_id, value, Some(expected)).await {
         Ok(store::Outcome::Done(version)) => {
             (StatusCode::NO_CONTENT, version_headers(version)).into_response()
         }
@@ -771,7 +807,8 @@ async fn settings_delete(
         Err(resp) => return resp,
     };
     let keys = csv_of(&params, "settingKey");
-    match store::delete_settings(&state.pool, &keys, Some(expected)).await {
+    match store::delete_settings(&state.pool, state.config.library_id, &keys, Some(expected)).await
+    {
         Ok(store::Outcome::Done(version)) => {
             (StatusCode::NO_CONTENT, version_headers(version)).into_response()
         }
@@ -785,7 +822,7 @@ async fn deleted(
     Query(params): Query<HashMap<String, String>>,
 ) -> Response {
     let since = since_of(&params);
-    match store::deleted(&state.pool, since).await {
+    match store::deleted(&state.pool, state.config.library_id, since).await {
         Ok(value) => (current_headers(&state).await, Json(value)).into_response(),
         Err(error) => server_error("deleted", error),
     }
@@ -799,8 +836,10 @@ async fn fulltext_versions(
 ) -> Response {
     let since = since_of(&params);
     // Always 200 + map (never 304); see `read` — a 304 here loops the client.
-    let current = store::current_version(&state.pool).await.unwrap_or(0);
-    match store::fulltext_versions(&state.pool, since).await {
+    let current = store::current_version(&state.pool, state.config.library_id)
+        .await
+        .unwrap_or(0);
+    match store::fulltext_versions(&state.pool, state.config.library_id, since).await {
         Ok(value) => (version_headers(current), Json(value)).into_response(),
         Err(error) => server_error("fulltext versions", error),
     }
@@ -812,7 +851,7 @@ async fn fulltext_item(
     State(state): State<AppState>,
     Path((_id, key)): Path<(String, String)>,
 ) -> Response {
-    match store::fulltext_item(&state.pool, &key).await {
+    match store::fulltext_item(&state.pool, state.config.library_id, &key).await {
         Ok(Some((version, data))) => (version_headers(version), Json(data)).into_response(),
         Ok(None) => StatusCode::NOT_FOUND.into_response(),
         Err(error) => server_error("fulltext item", error),
@@ -837,7 +876,7 @@ async fn fulltext_write(
         Ok(v) => v,
         Err(resp) => return resp,
     };
-    match store::write_fulltext(&state.pool, batch, Some(expected)).await {
+    match store::write_fulltext(&state.pool, state.config.library_id, batch, Some(expected)).await {
         Ok(store::Outcome::Done((version, successful))) => (
             version_headers(version),
             Json(json!({
@@ -880,6 +919,7 @@ async fn file_post(
         }
         return match store::register_file(
             &state.pool,
+            state.config.library_id,
             &key,
             &upload.md5,
             &upload.filename,
@@ -913,7 +953,7 @@ async fn file_post(
     }
 
     let md5 = form.get("md5").cloned().unwrap_or_default();
-    let stored_md5 = match store::file_meta(&state.pool, &key).await {
+    let stored_md5 = match store::file_meta(&state.pool, state.config.library_id, &key).await {
         Ok(meta) => meta.map(|(m, _)| m),
         Err(error) => return server_error("file auth", error),
     };
@@ -928,7 +968,11 @@ async fn file_post(
                 return (current_headers(&state).await, Json(json!({ "exists": 1 })))
                     .into_response();
             }
-            return conflict(store::current_version(&state.pool).await.unwrap_or(0));
+            return conflict(
+                store::current_version(&state.pool, state.config.library_id)
+                    .await
+                    .unwrap_or(0),
+            );
         }
     } else if let Some(want) = &if_match {
         // "Only if the current md5 matches." Otherwise → conflict.
@@ -936,7 +980,11 @@ async fn file_post(
             .as_deref()
             .is_some_and(|m| m.eq_ignore_ascii_case(want))
         {
-            return conflict(store::current_version(&state.pool).await.unwrap_or(0));
+            return conflict(
+                store::current_version(&state.pool, state.config.library_id)
+                    .await
+                    .unwrap_or(0),
+            );
         }
     }
 
@@ -1030,7 +1078,7 @@ async fn file_get(
     if !valid_key(&key) {
         return StatusCode::NOT_FOUND.into_response();
     }
-    let (md5, mtime) = match store::file_meta(&state.pool, &key).await {
+    let (md5, mtime) = match store::file_meta(&state.pool, state.config.library_id, &key).await {
         Ok(Some(meta)) => meta,
         Ok(None) => return StatusCode::NOT_FOUND.into_response(),
         Err(error) => return server_error("file meta", error),
@@ -1331,6 +1379,7 @@ async fn main() {
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(1),
+        library_id: LibraryId::new(1).expect("legacy library ID is positive"),
         public_url: std::env::var("ZHOST_PUBLIC_URL").unwrap_or_else(|_| format!("http://{bind}")),
         bind,
         database_url: std::env::var("ZHOST_DATABASE_URL")

@@ -9,6 +9,7 @@ use serde_json::{Map, Value};
 use sqlx::postgres::PgRow;
 use sqlx::{PgPool, Postgres, QueryBuilder, Row};
 
+use crate::domain::LibraryId;
 use crate::query::{ItemQuery, QMode};
 
 /// `{<key_col>: version}` map from version-listing rows (the `format=versions`
@@ -29,9 +30,6 @@ fn object_json(row: PgRow) -> Value {
         "data": order_fields(row.get::<Value, _>("data")),
     })
 }
-
-/// Single user, single personal library.
-const LIBRARY_ID: i64 = 1;
 
 /// Zotero's `fromJSON` processes fields in object order and requires a
 /// discriminator field first: an attachment needs `linkMode` before
@@ -86,10 +84,11 @@ pub enum Outcome<T> {
 /// next one. Serializing on the row also prevents concurrent writes from racing.
 async fn guarded_version(
     conn: &mut sqlx::PgConnection,
+    library_id: LibraryId,
     expected: Option<i64>,
 ) -> sqlx::Result<Outcome<i64>> {
     let current: i64 = sqlx::query("select version from library where id = $1 for update")
-        .bind(LIBRARY_ID)
+        .bind(library_id.get())
         .fetch_one(&mut *conn)
         .await?
         .get("version");
@@ -98,7 +97,7 @@ async fn guarded_version(
     }
     let version = current + 1;
     sqlx::query("update library set version = $2 where id = $1")
-        .bind(LIBRARY_ID)
+        .bind(library_id.get())
         .bind(version)
         .execute(&mut *conn)
         .await?;
@@ -115,29 +114,38 @@ pub async fn connect(url: &str) -> sqlx::Result<PgPool> {
 /// current version, or a conflict if the client's expectation is already stale,
 /// without bumping the version — a no-op must not churn the counter and make
 /// every other client think the library changed.
-async fn no_change(pool: &PgPool, expected: Option<i64>) -> sqlx::Result<Outcome<i64>> {
-    let current = current_version(pool).await?;
+async fn no_change(
+    pool: &PgPool,
+    library_id: LibraryId,
+    expected: Option<i64>,
+) -> sqlx::Result<Outcome<i64>> {
+    let current = current_version(pool, library_id).await?;
     Ok(match expected {
         Some(v) if v != current => Outcome::Conflict(current),
         _ => Outcome::Done(current),
     })
 }
 
-pub async fn current_version(pool: &PgPool) -> sqlx::Result<i64> {
+pub async fn current_version(pool: &PgPool, library_id: LibraryId) -> sqlx::Result<i64> {
     let row = sqlx::query("select version from library where id = $1")
-        .bind(LIBRARY_ID)
+        .bind(library_id.get())
         .fetch_one(pool)
         .await?;
     Ok(row.get("version"))
 }
 
 /// `{key: version}` for objects of `kind` changed after `since`.
-pub async fn versions(pool: &PgPool, kind: &str, since: i64) -> sqlx::Result<Value> {
+pub async fn versions(
+    pool: &PgPool,
+    library_id: LibraryId,
+    kind: &str,
+    since: i64,
+) -> sqlx::Result<Value> {
     let rows = sqlx::query(
         "select key, version from object \
          where library_id = $1 and kind = $2 and version > $3",
     )
-    .bind(LIBRARY_ID)
+    .bind(library_id.get())
     .bind(kind)
     .bind(since)
     .fetch_all(pool)
@@ -147,13 +155,13 @@ pub async fn versions(pool: &PgPool, kind: &str, since: i64) -> sqlx::Result<Val
 
 /// `{key: version}` for top-level items changed after `since`. The client's
 /// sync fetches top-level items first (a parent-first phase), so this is the
-/// top-filtered counterpart of `versions(pool, "item", since)`.
-pub async fn top_versions(pool: &PgPool, since: i64) -> sqlx::Result<Value> {
+/// top-filtered counterpart of `versions(pool, library_id, "item", since)`.
+pub async fn top_versions(pool: &PgPool, library_id: LibraryId, since: i64) -> sqlx::Result<Value> {
     let rows = sqlx::query(
         "select key, version from object \
          where library_id = $1 and kind = 'item' and is_top and version > $2",
     )
-    .bind(LIBRARY_ID)
+    .bind(library_id.get())
     .bind(since)
     .fetch_all(pool)
     .await?;
@@ -161,12 +169,17 @@ pub async fn top_versions(pool: &PgPool, since: i64) -> sqlx::Result<Value> {
 }
 
 /// `[{key, version, data}]` for the requested keys.
-pub async fn objects(pool: &PgPool, kind: &str, keys: &[String]) -> sqlx::Result<Value> {
+pub async fn objects(
+    pool: &PgPool,
+    library_id: LibraryId,
+    kind: &str,
+    keys: &[String],
+) -> sqlx::Result<Value> {
     let rows = sqlx::query(
         "select key, version, data from object \
          where library_id = $1 and kind = $2 and key = any($3)",
     )
-    .bind(LIBRARY_ID)
+    .bind(library_id.get())
     .bind(kind)
     .bind(keys)
     .fetch_all(pool)
@@ -187,9 +200,9 @@ fn escape_like(term: &str) -> String {
 /// they always filter identically. Filters compare the generated columns from
 /// migration 0006 (item_type/is_top/deleted/search_text/tag_names/…), so they
 /// are plain indexed comparisons rather than jsonb digging.
-fn push_item_filters(sql: &mut QueryBuilder<Postgres>, q: &ItemQuery) {
+fn push_item_filters(sql: &mut QueryBuilder<Postgres>, library_id: LibraryId, q: &ItemQuery) {
     sql.push("library_id = ")
-        .push_bind(LIBRARY_ID)
+        .push_bind(library_id.get())
         .push(" and kind = 'item'");
 
     // Trash handling: /items/trash returns only trashed items; otherwise trashed
@@ -253,14 +266,18 @@ fn push_item_filters(sql: &mut QueryBuilder<Postgres>, q: &ItemQuery) {
 /// items. Returns `([{key, version, data}], total)`, where `total` is the full
 /// match count. It is counted separately from the page so it stays correct even
 /// when `start` runs past the end (a window count would vanish with the rows).
-pub async fn query_items(pool: &PgPool, q: &ItemQuery) -> sqlx::Result<(Vec<Value>, i64)> {
+pub async fn query_items(
+    pool: &PgPool,
+    library_id: LibraryId,
+    q: &ItemQuery,
+) -> sqlx::Result<(Vec<Value>, i64)> {
     let mut count: QueryBuilder<Postgres> = QueryBuilder::new("select count(*) from object where ");
-    push_item_filters(&mut count, q);
+    push_item_filters(&mut count, library_id, q);
     let total: i64 = count.build().fetch_one(pool).await?.get(0);
 
     let mut sql: QueryBuilder<Postgres> =
         QueryBuilder::new("select key, version, data from object where ");
-    push_item_filters(&mut sql, q);
+    push_item_filters(&mut sql, library_id, q);
     // order_expr/sql() are fixed strings (no user input), so pushing them raw is
     // safe; nulls sort last so items missing the sort field don't lead.
     sql.push(" order by ")
@@ -286,9 +303,13 @@ pub async fn query_items(pool: &PgPool, q: &ItemQuery) -> sqlx::Result<(Vec<Valu
 /// list the sync client's `getKeys()` consumes (e.g. the top-level items of a
 /// restored collection). Shares `push_item_filters`, so `format=keys` honours
 /// the same filters as the JSON listing.
-pub async fn item_keys(pool: &PgPool, q: &ItemQuery) -> sqlx::Result<Vec<String>> {
+pub async fn item_keys(
+    pool: &PgPool,
+    library_id: LibraryId,
+    q: &ItemQuery,
+) -> sqlx::Result<Vec<String>> {
     let mut sql: QueryBuilder<Postgres> = QueryBuilder::new("select key from object where ");
-    push_item_filters(&mut sql, q);
+    push_item_filters(&mut sql, library_id, q);
     sql.push(" order by key");
     let keys = sql
         .build()
@@ -302,7 +323,7 @@ pub async fn item_keys(pool: &PgPool, q: &ItemQuery) -> sqlx::Result<Vec<String>
 
 /// Distinct tags across non-trashed items with their item counts, as
 /// `[{tag, numItems}]` ordered by tag. Backs the CLI-facing `/tags` listing.
-pub async fn tags(pool: &PgPool) -> sqlx::Result<Value> {
+pub async fn tags(pool: &PgPool, library_id: LibraryId) -> sqlx::Result<Value> {
     // Unnest the generated tag_names column (already guards malformed data).
     let rows = sqlx::query(
         "select tag, count(*) as num \
@@ -311,7 +332,7 @@ pub async fn tags(pool: &PgPool) -> sqlx::Result<Value> {
          group by tag \
          order by tag",
     )
-    .bind(LIBRARY_ID)
+    .bind(library_id.get())
     .fetch_all(pool)
     .await?;
     let array = rows
@@ -336,18 +357,19 @@ pub async fn tags(pool: &PgPool) -> sqlx::Result<Value> {
 /// and corrupt the object. Returns `(new_version, successful_map)` keyed by index.
 pub async fn write(
     pool: &PgPool,
+    library_id: LibraryId,
     kind: &str,
     batch: Vec<Value>,
     expected: Option<i64>,
 ) -> sqlx::Result<Outcome<(i64, Value)>> {
     if batch.is_empty() {
-        return Ok(match no_change(pool, expected).await? {
+        return Ok(match no_change(pool, library_id, expected).await? {
             Outcome::Done(version) => Outcome::Done((version, Value::Object(Map::new()))),
             Outcome::Conflict(current) => Outcome::Conflict(current),
         });
     }
     let mut tx = pool.begin().await?;
-    let version = match guarded_version(&mut tx, expected).await? {
+    let version = match guarded_version(&mut tx, library_id, expected).await? {
         Outcome::Done(version) => version,
         Outcome::Conflict(current) => return Ok(Outcome::Conflict(current)),
     };
@@ -364,7 +386,7 @@ pub async fn write(
         // nothing to merge into, so the provided object is stored as-is.
         let existing =
             sqlx::query("select data from object where library_id = $1 and kind = $2 and key = $3")
-                .bind(LIBRARY_ID)
+                .bind(library_id.get())
                 .bind(kind)
                 .bind(&key)
                 .fetch_optional(&mut *tx)
@@ -389,7 +411,7 @@ pub async fn write(
              on conflict (library_id, kind, key) \
              do update set version = $4, data = $5",
         )
-        .bind(LIBRARY_ID)
+        .bind(library_id.get())
         .bind(kind)
         .bind(&key)
         .bind(version)
@@ -397,7 +419,7 @@ pub async fn write(
         .execute(&mut *tx)
         .await?;
         sqlx::query("delete from deletion where library_id = $1 and kind = $2 and key = $3")
-            .bind(LIBRARY_ID)
+            .bind(library_id.get())
             .bind(kind)
             .bind(&key)
             .execute(&mut *tx)
@@ -414,21 +436,22 @@ pub async fn write(
 /// Delete objects of `kind`, recording them in the deletion log.
 pub async fn delete(
     pool: &PgPool,
+    library_id: LibraryId,
     kind: &str,
     keys: &[String],
     expected: Option<i64>,
 ) -> sqlx::Result<Outcome<i64>> {
     if keys.is_empty() {
-        return no_change(pool, expected).await;
+        return no_change(pool, library_id, expected).await;
     }
     let mut tx = pool.begin().await?;
-    let version = match guarded_version(&mut tx, expected).await? {
+    let version = match guarded_version(&mut tx, library_id, expected).await? {
         Outcome::Done(version) => version,
         Outcome::Conflict(current) => return Ok(Outcome::Conflict(current)),
     };
     for key in keys {
         sqlx::query("delete from object where library_id = $1 and kind = $2 and key = $3")
-            .bind(LIBRARY_ID)
+            .bind(library_id.get())
             .bind(kind)
             .bind(key)
             .execute(&mut *tx)
@@ -437,7 +460,7 @@ pub async fn delete(
             "insert into deletion (library_id, kind, key, version) values ($1, $2, $3, $4) \
              on conflict (library_id, kind, key) do update set version = $4",
         )
-        .bind(LIBRARY_ID)
+        .bind(library_id.get())
         .bind(kind)
         .bind(key)
         .bind(version)
@@ -449,9 +472,9 @@ pub async fn delete(
 }
 
 /// All settings as `{key: {value, version}}`.
-pub async fn settings(pool: &PgPool) -> sqlx::Result<Value> {
+pub async fn settings(pool: &PgPool, library_id: LibraryId) -> sqlx::Result<Value> {
     let rows = sqlx::query("select key, version, value from setting where library_id = $1")
-        .bind(LIBRARY_ID)
+        .bind(library_id.get())
         .fetch_all(pool)
         .await?;
     let mut map = Map::new();
@@ -468,14 +491,15 @@ pub async fn settings(pool: &PgPool) -> sqlx::Result<Value> {
 /// Store a `{key: {value}}` settings object.
 pub async fn write_settings(
     pool: &PgPool,
+    library_id: LibraryId,
     body: Value,
     expected: Option<i64>,
 ) -> sqlx::Result<Outcome<i64>> {
     if body.as_object().is_none_or(|m| m.is_empty()) {
-        return no_change(pool, expected).await;
+        return no_change(pool, library_id, expected).await;
     }
     let mut tx = pool.begin().await?;
-    let version = match guarded_version(&mut tx, expected).await? {
+    let version = match guarded_version(&mut tx, library_id, expected).await? {
         Outcome::Done(version) => version,
         Outcome::Conflict(current) => return Ok(Outcome::Conflict(current)),
     };
@@ -486,7 +510,7 @@ pub async fn write_settings(
                 "insert into setting (library_id, key, version, value) values ($1, $2, $3, $4) \
                  on conflict (library_id, key) do update set version = $3, value = $4",
             )
-            .bind(LIBRARY_ID)
+            .bind(library_id.get())
             .bind(&key)
             .bind(version)
             .bind(&value)
@@ -502,20 +526,21 @@ pub async fn write_settings(
 /// can propagate the removal. Returns the new library version or a conflict.
 pub async fn delete_settings(
     pool: &PgPool,
+    library_id: LibraryId,
     keys: &[String],
     expected: Option<i64>,
 ) -> sqlx::Result<Outcome<i64>> {
     if keys.is_empty() {
-        return no_change(pool, expected).await;
+        return no_change(pool, library_id, expected).await;
     }
     let mut tx = pool.begin().await?;
-    let version = match guarded_version(&mut tx, expected).await? {
+    let version = match guarded_version(&mut tx, library_id, expected).await? {
         Outcome::Done(version) => version,
         Outcome::Conflict(current) => return Ok(Outcome::Conflict(current)),
     };
     for key in keys {
         sqlx::query("delete from setting where library_id = $1 and key = $2")
-            .bind(LIBRARY_ID)
+            .bind(library_id.get())
             .bind(key)
             .execute(&mut *tx)
             .await?;
@@ -523,7 +548,7 @@ pub async fn delete_settings(
             "insert into deletion (library_id, kind, key, version) values ($1, 'setting', $2, $3) \
              on conflict (library_id, kind, key) do update set version = $3",
         )
-        .bind(LIBRARY_ID)
+        .bind(library_id.get())
         .bind(key)
         .bind(version)
         .execute(&mut *tx)
@@ -541,14 +566,15 @@ pub async fn delete_settings(
 /// Returns the new library version or a conflict.
 pub async fn delete_tags(
     pool: &PgPool,
+    library_id: LibraryId,
     tags: &[String],
     expected: Option<i64>,
 ) -> sqlx::Result<Outcome<i64>> {
     if tags.is_empty() {
-        return no_change(pool, expected).await;
+        return no_change(pool, library_id, expected).await;
     }
     let mut tx = pool.begin().await?;
-    let version = match guarded_version(&mut tx, expected).await? {
+    let version = match guarded_version(&mut tx, library_id, expected).await? {
         Outcome::Done(version) => version,
         Outcome::Conflict(current) => return Ok(Outcome::Conflict(current)),
     };
@@ -563,7 +589,7 @@ pub async fn delete_tags(
              ), '[]'::jsonb)) \
              where library_id = $1 and kind = 'item' and tag_names @> array[$2]",
         )
-        .bind(LIBRARY_ID)
+        .bind(library_id.get())
         .bind(tag)
         .bind(version)
         .execute(&mut *tx)
@@ -572,7 +598,7 @@ pub async fn delete_tags(
             "insert into deletion (library_id, kind, key, version) values ($1, 'tag', $2, $3) \
              on conflict (library_id, kind, key) do update set version = $3",
         )
-        .bind(LIBRARY_ID)
+        .bind(library_id.get())
         .bind(tag)
         .bind(version)
         .execute(&mut *tx)
@@ -584,9 +610,13 @@ pub async fn delete_tags(
 
 /// md5 and mtime for an attachment file, if registered (the client reads these
 /// from the download response headers).
-pub async fn file_meta(pool: &PgPool, item_key: &str) -> sqlx::Result<Option<(String, i64)>> {
+pub async fn file_meta(
+    pool: &PgPool,
+    library_id: LibraryId,
+    item_key: &str,
+) -> sqlx::Result<Option<(String, i64)>> {
     let row = sqlx::query("select md5, mtime from file where library_id = $1 and item_key = $2")
-        .bind(LIBRARY_ID)
+        .bind(library_id.get())
         .bind(item_key)
         .fetch_optional(pool)
         .await?;
@@ -596,6 +626,7 @@ pub async fn file_meta(pool: &PgPool, item_key: &str) -> sqlx::Result<Option<(St
 /// Register an uploaded attachment file, bumping the library version.
 pub async fn register_file(
     pool: &PgPool,
+    library_id: LibraryId,
     item_key: &str,
     md5: &str,
     filename: &str,
@@ -605,7 +636,7 @@ pub async fn register_file(
     let mut tx = pool.begin().await?;
     // A file registration always changes the library; bump via the shared
     // guarded path (no precondition, so it never conflicts) rather than ad-hoc SQL.
-    let version = match guarded_version(&mut tx, None).await? {
+    let version = match guarded_version(&mut tx, library_id, None).await? {
         Outcome::Done(version) => version,
         Outcome::Conflict(current) => return Ok(current),
     };
@@ -615,7 +646,7 @@ pub async fn register_file(
          on conflict (library_id, item_key) \
          do update set md5 = $3, filename = $4, filesize = $5, mtime = $6, version = $7",
     )
-    .bind(LIBRARY_ID)
+    .bind(library_id.get())
     .bind(item_key)
     .bind(md5)
     .bind(filename)
@@ -632,7 +663,7 @@ pub async fn register_file(
          data = data || jsonb_build_object('md5', $4::text, 'mtime', $5::bigint, 'version', $3) \
          where library_id = $1 and kind = 'item' and key = $2",
     )
-    .bind(LIBRARY_ID)
+    .bind(library_id.get())
     .bind(item_key)
     .bind(version)
     .bind(md5)
@@ -647,11 +678,15 @@ pub async fn register_file(
 /// is the row's own (the library version at which it last changed), so it equals
 /// the per-item download's `Last-Modified-Version` and the client skips
 /// re-downloading content it already holds.
-pub async fn fulltext_versions(pool: &PgPool, since: i64) -> sqlx::Result<Value> {
+pub async fn fulltext_versions(
+    pool: &PgPool,
+    library_id: LibraryId,
+    since: i64,
+) -> sqlx::Result<Value> {
     let rows = sqlx::query(
         "select item_key, version from fulltext where library_id = $1 and version > $2",
     )
-    .bind(LIBRARY_ID)
+    .bind(library_id.get())
     .bind(since)
     .fetch_all(pool)
     .await?;
@@ -659,12 +694,16 @@ pub async fn fulltext_versions(pool: &PgPool, since: i64) -> sqlx::Result<Value>
 }
 
 /// Full-text content for one item as `(row_version, {content, indexedChars, …})`.
-pub async fn fulltext_item(pool: &PgPool, item_key: &str) -> sqlx::Result<Option<(i64, Value)>> {
+pub async fn fulltext_item(
+    pool: &PgPool,
+    library_id: LibraryId,
+    item_key: &str,
+) -> sqlx::Result<Option<(i64, Value)>> {
     let row = sqlx::query(
         "select content, indexed_chars, total_chars, indexed_pages, total_pages, version \
          from fulltext where library_id = $1 and item_key = $2",
     )
-    .bind(LIBRARY_ID)
+    .bind(library_id.get())
     .bind(item_key)
     .fetch_optional(pool)
     .await?;
@@ -685,17 +724,18 @@ pub async fn fulltext_item(pool: &PgPool, item_key: &str) -> sqlx::Result<Option
 /// value carries the item `key` the client matches against to mark it synced.
 pub async fn write_fulltext(
     pool: &PgPool,
+    library_id: LibraryId,
     batch: Vec<Value>,
     expected: Option<i64>,
 ) -> sqlx::Result<Outcome<(i64, Value)>> {
     if batch.is_empty() {
-        return Ok(match no_change(pool, expected).await? {
+        return Ok(match no_change(pool, library_id, expected).await? {
             Outcome::Done(version) => Outcome::Done((version, Value::Object(Map::new()))),
             Outcome::Conflict(current) => Outcome::Conflict(current),
         });
     }
     let mut tx = pool.begin().await?;
-    let version = match guarded_version(&mut tx, expected).await? {
+    let version = match guarded_version(&mut tx, library_id, expected).await? {
         Outcome::Done(version) => version,
         Outcome::Conflict(current) => return Ok(Outcome::Conflict(current)),
     };
@@ -720,7 +760,7 @@ pub async fn write_fulltext(
              do update set content = $3, indexed_chars = $4, total_chars = $5, \
                 indexed_pages = $6, total_pages = $7, version = $8",
         )
-        .bind(LIBRARY_ID)
+        .bind(library_id.get())
         .bind(&key)
         .bind(content)
         .bind(count("indexedChars"))
@@ -737,9 +777,9 @@ pub async fn write_fulltext(
 }
 
 /// Deleted object keys after `since`, grouped by kind for the /deleted endpoint.
-pub async fn deleted(pool: &PgPool, since: i64) -> sqlx::Result<Value> {
+pub async fn deleted(pool: &PgPool, library_id: LibraryId, since: i64) -> sqlx::Result<Value> {
     let rows = sqlx::query("select kind, key from deletion where library_id = $1 and version > $2")
-        .bind(LIBRARY_ID)
+        .bind(library_id.get())
         .bind(since)
         .fetch_all(pool)
         .await?;
