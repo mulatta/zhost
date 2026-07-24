@@ -486,13 +486,13 @@ async fn read(
         let current = store::current_version(&state.pool, library_id)
             .await
             .unwrap_or(0);
-        return match store::versions(&state.pool, library_id, kind, since).await {
+        return match store::versions(&state.pool, library_id, kind, since, true).await {
             Ok(value) => (version_headers(current), Json(value)).into_response(),
             Err(error) => server_error("read", error),
         };
     }
     let keys = csv_of(&params, &format!("{kind}Key"));
-    match store::objects(&state.pool, library_id, kind, &keys).await {
+    match store::objects(&state.pool, library_id, kind, &keys, true).await {
         Ok(value) => (current_headers(state, library_id).await, Json(value)).into_response(),
         Err(error) => server_error("read", error),
     }
@@ -505,6 +505,7 @@ async fn read(
 async fn item_sync_read(
     state: &AppState,
     library_id: LibraryId,
+    permissions: Permissions,
     params: &query::Params,
     top: bool,
 ) -> Option<Response> {
@@ -518,9 +519,9 @@ async fn item_sync_read(
             .await
             .unwrap_or(0);
         let result = if top {
-            store::top_versions(&state.pool, library_id, since).await
+            store::top_versions(&state.pool, library_id, since, permissions.notes).await
         } else {
-            store::versions(&state.pool, library_id, "item", since).await
+            store::versions(&state.pool, library_id, "item", since, permissions.notes).await
         };
         return Some(match result {
             Ok(value) => (version_headers(current), Json(value)).into_response(),
@@ -530,7 +531,7 @@ async fn item_sync_read(
     if let Some(csv) = params.get("itemKey") {
         let keys: Vec<String> = csv.split(',').map(String::from).collect();
         return Some(
-            match store::objects(&state.pool, library_id, "item", &keys).await {
+            match store::objects(&state.pool, library_id, "item", &keys, permissions.notes).await {
                 Ok(value) => {
                     (current_headers(state, library_id).await, Json(value)).into_response()
                 }
@@ -547,11 +548,12 @@ async fn item_sync_read(
 async fn item_listing(
     state: &AppState,
     library_id: LibraryId,
+    permissions: Permissions,
     path: &str,
     raw: Option<&str>,
     q: &query::ItemQuery,
 ) -> Response {
-    match store::query_items(&state.pool, library_id, q).await {
+    match store::query_items(&state.pool, library_id, q, permissions.notes).await {
         Ok((items, total)) => {
             let mut headers = current_headers(state, library_id).await;
             headers.insert("total-results", total.to_string().parse().unwrap());
@@ -583,18 +585,21 @@ fn next_link(config: &Config, path: &str, raw: Option<&str>, start: i64) -> Stri
 async fn item_keys_response(
     state: &AppState,
     library_id: LibraryId,
+    permissions: Permissions,
     params: &query::Params,
     q: &query::ItemQuery,
 ) -> Option<Response> {
     if params.get("format") != Some("keys") {
         return None;
     }
-    Some(match store::item_keys(&state.pool, library_id, q).await {
-        // A `String` body sets `Content-Type: text/plain`, which is what the
-        // client expects; current_headers adds `Last-Modified-Version`.
-        Ok(keys) => (current_headers(state, library_id).await, keys.join("\n")).into_response(),
-        Err(error) => server_error("item keys", error),
-    })
+    Some(
+        match store::item_keys(&state.pool, library_id, q, permissions.notes).await {
+            // A `String` body sets `Content-Type: text/plain`, which is what the
+            // client expects; current_headers adds `Last-Modified-Version`.
+            Ok(keys) => (current_headers(state, library_id).await, keys.join("\n")).into_response(),
+            Err(error) => server_error("item keys", error),
+        },
+    )
 }
 
 /// `GET /users/<id>/items`: the two sync reads, or the CLI query when neither.
@@ -605,17 +610,33 @@ async fn items_get(
     RawQuery(raw): RawQuery,
 ) -> Response {
     let params = query::Params::parse(raw.as_deref());
-    if let Some(resp) = item_sync_read(&state, context.principal.library_id, &params, false).await {
+    if let Some(resp) = item_sync_read(
+        &state,
+        context.principal.library_id,
+        context.permissions,
+        &params,
+        false,
+    )
+    .await
+    {
         return resp;
     }
     let q = query::ItemQuery::from_params(&params);
-    if let Some(resp) = item_keys_response(&state, context.principal.library_id, &params, &q).await
+    if let Some(resp) = item_keys_response(
+        &state,
+        context.principal.library_id,
+        context.permissions,
+        &params,
+        &q,
+    )
+    .await
     {
         return resp;
     }
     item_listing(
         &state,
         context.principal.library_id,
+        context.permissions,
         &format!("/users/{id}/items"),
         raw.as_deref(),
         &q,
@@ -632,18 +653,34 @@ async fn items_top(
     RawQuery(raw): RawQuery,
 ) -> Response {
     let params = query::Params::parse(raw.as_deref());
-    if let Some(resp) = item_sync_read(&state, context.principal.library_id, &params, true).await {
+    if let Some(resp) = item_sync_read(
+        &state,
+        context.principal.library_id,
+        context.permissions,
+        &params,
+        true,
+    )
+    .await
+    {
         return resp;
     }
     let mut q = query::ItemQuery::from_params(&params);
     q.top = true;
-    if let Some(resp) = item_keys_response(&state, context.principal.library_id, &params, &q).await
+    if let Some(resp) = item_keys_response(
+        &state,
+        context.principal.library_id,
+        context.permissions,
+        &params,
+        &q,
+    )
+    .await
     {
         return resp;
     }
     item_listing(
         &state,
         context.principal.library_id,
+        context.permissions,
         &format!("/users/{id}/items/top"),
         raw.as_deref(),
         &q,
@@ -661,13 +698,21 @@ async fn items_trash(
     let params = query::Params::parse(raw.as_deref());
     let mut q = query::ItemQuery::from_params(&params);
     q.only_trashed = true;
-    if let Some(resp) = item_keys_response(&state, context.principal.library_id, &params, &q).await
+    if let Some(resp) = item_keys_response(
+        &state,
+        context.principal.library_id,
+        context.permissions,
+        &params,
+        &q,
+    )
+    .await
     {
         return resp;
     }
     item_listing(
         &state,
         context.principal.library_id,
+        context.permissions,
         &format!("/users/{id}/items/trash"),
         raw.as_deref(),
         &q,
@@ -685,13 +730,21 @@ async fn collection_items(
     let params = query::Params::parse(raw.as_deref());
     let mut q = query::ItemQuery::from_params(&params);
     q.collection = Some(key.clone());
-    if let Some(resp) = item_keys_response(&state, context.principal.library_id, &params, &q).await
+    if let Some(resp) = item_keys_response(
+        &state,
+        context.principal.library_id,
+        context.permissions,
+        &params,
+        &q,
+    )
+    .await
     {
         return resp;
     }
     item_listing(
         &state,
         context.principal.library_id,
+        context.permissions,
         &format!("/users/{id}/collections/{key}/items"),
         raw.as_deref(),
         &q,
@@ -712,13 +765,21 @@ async fn collection_items_top(
     let mut q = query::ItemQuery::from_params(&params);
     q.collection = Some(key.clone());
     q.top = true;
-    if let Some(resp) = item_keys_response(&state, context.principal.library_id, &params, &q).await
+    if let Some(resp) = item_keys_response(
+        &state,
+        context.principal.library_id,
+        context.permissions,
+        &params,
+        &q,
+    )
+    .await
     {
         return resp;
     }
     item_listing(
         &state,
         context.principal.library_id,
+        context.permissions,
         &format!("/users/{id}/collections/{key}/items/top"),
         raw.as_deref(),
         &q,
@@ -1332,11 +1393,6 @@ async fn log_and_auth(State(state): State<AppState>, req: Request, next: Next) -
         };
         if path != "/keys/current" && !context.permissions.library {
             return (StatusCode::FORBIDDEN, "library access denied").into_response();
-        }
-        // Note/annotation filtering is a separate store contract. Until that
-        // resolver lands, fail closed for keys that explicitly omit notes.
-        if path.starts_with("/users/") && !context.permissions.notes {
-            return (StatusCode::FORBIDDEN, "notes access denied").into_response();
         }
         match path_user_id(path) {
             Ok(Some(path_user_id)) if path_user_id == context.principal.user_id.get() => {}
