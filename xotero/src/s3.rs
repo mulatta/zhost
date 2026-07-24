@@ -75,6 +75,20 @@ impl Storage {
         Ok(())
     }
 
+    /// Delete an abandoned immutable candidate. S3 deletion is idempotent, so
+    /// retrying cleanup after a crash is safe.
+    pub async fn delete(&self, key: &str) -> Result<(), S3Error> {
+        let response = self.bucket.delete_object(key).await?;
+        let code = response.status_code();
+        if !(200..300).contains(&code) {
+            return Err(S3Error::HttpFailWithBody(
+                code,
+                String::from_utf8_lossy(response.bytes()).into_owned(),
+            ));
+        }
+        Ok(())
+    }
+
     /// A pre-signed GET URL the client can follow directly to the bucket.
     pub async fn presign_get(&self, key: &str) -> Result<String, S3Error> {
         self.bucket.presign_get(key, self.presign_ttl, None).await
