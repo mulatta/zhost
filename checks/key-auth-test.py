@@ -11,6 +11,7 @@ bob = "BobKeyAB23456789CdEfGhJk"
 bob_ro = "BobROAB23456789CdEfGhJKL"
 bob_full = "BobFllAB23456789CdEfGhJK"
 bob_notes_write = "BobNwrtAB23456789CdEfGh"
+bob_group_rw = "BobGrpRW23456789AbCdEfGh"
 revoked = "RevokedK23456789AbCdEfGh"
 api_headers = "-H 'Zotero-API-Version: 3' -H 'Zotero-Schema-Version: 42'"
 oidc_issuer = "https://id.example.test"
@@ -627,6 +628,165 @@ with subtest("group data routes resolve the authorized group library"):
     assert all(not values for values in deleted.values())
     assert http_code("/groups/303/items?format=versions", bob_full) == "403"
     assert http_code("/groups/999/items?format=versions", alice) == "404"
+
+with subtest("group mutations enforce key grants, role policy and file policy"):
+    assert (
+        http_code(
+            "/groups/303/items",
+            bob,
+            method="POST",
+            body='[{"key":"DENIED22","itemType":"book"}]',
+            version=17,
+        )
+        == "403"
+    )
+    psql(
+        f"""insert into api_keys (id, user_id, name, token_hash)
+            values
+            (1008, 202, 'Bob explicit group writer',
+             decode('{sha256_hex(bob_group_rw)}', 'hex'))"""
+    )
+    psql(
+        """insert into api_key_user_permissions
+           (api_key_id, library, notes, write, files)
+           values (1008, false, false, false, false)"""
+    )
+    psql(
+        """insert into api_key_group_permissions
+           (api_key_id, user_id, group_id, library, write)
+           values (1008, 202, 303, true, true)"""
+    )
+    assert (
+        http_code(
+            "/groups/303/items",
+            bob_group_rw,
+            method="POST",
+            body='[{"key":"EXPRW222","itemType":"book","title":"explicit write"}]',
+            version=17,
+        )
+        == "200"
+    )
+    psql(
+        """insert into object (library_id, kind, key, version, data)
+           values
+           (33, 'item', 'XLDATT22', 18,
+            '{"key":"XLDATT22","version":18,"itemType":"attachment",
+              "linkMode":"imported_file","filename":"existing.pdf"}')"""
+    )
+    assert (
+        http_code(
+            "/groups/303/items",
+            bob_group_rw,
+            method="POST",
+            body=(
+                '[{"key":"GRPATT22","itemType":"attachment",'
+                '"linkMode":"imported_file","filename":"private.pdf"}]'
+            ),
+            version=18,
+        )
+        == "403"
+    )
+    assert (
+        http_code(
+            "/groups/303/items",
+            bob_group_rw,
+            method="POST",
+            body=(
+                '[{"key":"RLLBCK22","itemType":"book"},'
+                '{"key":"XLDATT22","itemType":"book"}]'
+            ),
+            version=18,
+        )
+        == "403"
+    )
+    assert (
+        get_json("/groups/303/items?itemKey=RLLBCK22&format=json", bob_group_rw)
+        == []
+    )
+    assert (
+        http_code(
+            "/groups/303/items?itemKey=XLDATT22",
+            bob_group_rw,
+            method="DELETE",
+            version=18,
+        )
+        == "403"
+    )
+    assert (
+        get_json("/groups/303/items?itemKey=XLDATT22&format=json", bob_group_rw)[0][
+            "data"
+        ]["itemType"]
+        == "attachment"
+    )
+    assert psql("select version from library where id = 33") == "18"
+    assert (
+        http_code(
+            "/groups/303/settings",
+            bob_group_rw,
+            method="POST",
+            body='{"attachmentRenameTemplate":{"value":"{{ title }}"}}',
+            version=18,
+        )
+        == "403"
+    )
+    assert (
+        http_code(
+            "/groups/303/settings",
+            bob_group_rw,
+            method="POST",
+            body='{"memberSetting":{"value":"allowed"}}',
+            version=18,
+        )
+        == "204"
+    )
+    assert (
+        http_code(
+            "/groups/303/settings",
+            alice,
+            method="POST",
+            body='{"attachmentRenameTemplate":{"value":"{{ title }}"}}',
+            version=19,
+        )
+        == "204"
+    )
+    assert (
+        http_code(
+            "/groups/303/settings?settingKey=attachmentRenameTemplate",
+            bob_group_rw,
+            method="DELETE",
+            version=20,
+        )
+        == "403"
+    )
+
+    psql(
+        """insert into api_key_all_groups_permissions (api_key_id, library, write)
+           values (1005, true, true)"""
+    )
+    assert (
+        http_code(
+            "/groups/303/items",
+            bob_full,
+            method="POST",
+            body='[{"key":"ALLRW222","itemType":"book"}]',
+            version=20,
+        )
+        == "403"
+    )
+    psql("update groups set library_editing = 'members' where id = 303")
+    assert (
+        http_code(
+            "/groups/303/items",
+            bob_full,
+            method="POST",
+            body='[{"key":"ALLRW222","itemType":"book"}]',
+            version=20,
+        )
+        == "200"
+    )
+    psql("update groups set library_editing = 'admins' where id = 303")
+    psql("delete from api_key_all_groups_permissions where api_key_id = 1005")
+    psql("delete from api_keys where id = 1008")
 
 with subtest("static recovery key remains bound to the bootstrap user"):
     machine.succeed(

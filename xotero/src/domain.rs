@@ -90,7 +90,10 @@ impl Permissions {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct LibraryAccess {
     pub library_id: LibraryId,
+    pub group_id: Option<GroupId>,
     pub permissions: Permissions,
+    pub is_admin: bool,
+    pub file_write: bool,
 }
 
 /// Authentication result inserted into Axum request extensions.
