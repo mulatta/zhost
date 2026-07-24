@@ -78,7 +78,7 @@ with subtest("the api key is required off the bootstrap paths"):
 
 with subtest("a read-only key reads but cannot write"):
     assert http_code(f"'{base}/users/1/items?format=versions&since=0' {readonly}") == "200"
-    machine.succeed(f"curl -sf {base}/keys/current {readonly} | jq -e '.access.user.write == false'")
+    machine.succeed(f"curl -sf {base}/keys/current {readonly} | jq -e '.access.user.write == null'")
     machine.succeed(f"curl -sf {base}/keys/current {auth} | jq -e '.access.user.write == true'")
     assert (
         http_code(
