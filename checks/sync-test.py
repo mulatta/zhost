@@ -474,6 +474,14 @@ with subtest("a file authorization without a precondition header is 428"):
 with subtest("uploading bytes that do not match the declared md5 is rejected"):
     # Verification happens at the upload step now (the bytes go straight to S3),
     # so a mismatch is refused there rather than at registration.
+    version = library_version()
+    psql(
+        f"""insert into object (library_id, kind, key, version, data)
+            values (1, 'item', 'BADHASH2', {version},
+                    '{{"key":"BADHASH2","version":{version},
+                       "itemType":"attachment","linkMode":"imported_file",
+                       "filename":"b"}}')"""
+    )
     bad = machine.succeed(
         f"curl -sf -X POST {base}/users/1/items/BADHASH2/file {auth} "
         f"-H 'If-None-Match: *' -d 'md5=00000000000000000000000000000000&filename=b&filesize=5&mtime=1' "
@@ -484,10 +492,19 @@ with subtest("uploading bytes that do not match the declared md5 is rejected"):
         f"-X POST {base}/uploads/{bad} --data-binary @-"
     ).strip()
     assert code == "400", code
+    psql("delete from object where library_id = 1 and key = 'BADHASH2'")
 
 with subtest("registering without a prior upload is rejected"):
     # Authorize but never PUT the bytes, then try to register: the object was
     # never stored, so registration must refuse rather than commit metadata.
+    version = library_version()
+    psql(
+        f"""insert into object (library_id, kind, key, version, data)
+            values (1, 'item', 'NQUPLQAD', {version},
+                    '{{"key":"NQUPLQAD","version":{version},
+                       "itemType":"attachment","linkMode":"imported_file",
+                       "filename":"n"}}')"""
+    )
     tok = machine.succeed(
         f"curl -sf -X POST {base}/users/1/items/NQUPLQAD/file {auth} "
         f"-H 'If-None-Match: *' -d 'md5=5d41402abc4b2a76b9719d911017c592&filename=n&filesize=5&mtime=1' "
@@ -500,6 +517,7 @@ with subtest("registering without a prior upload is rejected"):
         )
         == "400"
     )
+    psql("delete from object where library_id = 1 and key = 'NQUPLQAD'")
 
 with subtest("non-alphanumeric keys are rejected from the file endpoint"):
     # The item key becomes an object key in the bucket and a path component in
@@ -971,6 +989,14 @@ with subtest("request journal keeps routing evidence without secrets or content"
         f"curl -sf {base}/keys/sessions/{session_token} | jq -e '.status == \"completed\"'"
     )
 
+    version = library_version()
+    psql(
+        f"""insert into object (library_id, kind, key, version, data)
+            values (1, 'item', 'LOGSEC22', {version},
+                    '{{"key":"LOGSEC22","version":{version},
+                       "itemType":"attachment","linkMode":"imported_file",
+                       "filename":"journal.bin"}}')"""
+    )
     upload_token = machine.succeed(
         f"curl -sf -X POST {base}/users/1/items/LOGSEC22/file {auth} "
         f"-H 'If-None-Match: *' "
