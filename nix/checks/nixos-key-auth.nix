@@ -9,13 +9,13 @@ let
         inherit path;
       })
       [
-        ../xotero/migrations/0001_init.sql
-        ../xotero/migrations/0002_files.sql
-        ../xotero/migrations/0003_fulltext.sql
-        ../xotero/migrations/0004_fulltext_search.sql
-        ../xotero/migrations/0005_item_search.sql
-        ../xotero/migrations/0006_item_columns.sql
-        ../xotero/migrations/0007_item_columns_fixes.sql
+        ../../xotero/migrations/0001_init.sql
+        ../../xotero/migrations/0002_files.sql
+        ../../xotero/migrations/0003_fulltext.sql
+        ../../xotero/migrations/0004_fulltext_search.sql
+        ../../xotero/migrations/0005_item_search.sql
+        ../../xotero/migrations/0006_item_columns.sql
+        ../../xotero/migrations/0007_item_columns_fixes.sql
       ]
   );
 in
@@ -70,5 +70,5 @@ testPkgs.testers.runNixOSTest {
     ];
   };
 
-  testScript = builtins.readFile ./key-auth-test.py;
+  testScript = builtins.readFile ../../checks/key-auth-test.py;
 }

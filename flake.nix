@@ -56,30 +56,30 @@
       # bases on prev.zotero, so passing it explicitly avoids infinite recursion.
       # Consumers inject their server with pkgs.zotero.override { apiUrl = ...; }.
       overlays.default = _final: prev: {
-        zotero = prev.callPackage ./pkgs/zotero { inherit (prev) zotero; };
-        xotero = prev.callPackage ./pkgs/xotero { };
+        zotero = prev.callPackage ./nix/packages/zotero { inherit (prev) zotero; };
+        xotero = prev.callPackage ./nix/packages/xotero { };
       };
 
       # programs.zotero — install + configure + (darwin) sign-on-activation. The
-      # module builds its own patched zotero from pkgs/zotero, so consumers just
+      # module builds its own patched zotero from nix/packages/zotero, so consumers just
       # set the endpoints; applying overlays.default is not required. Curried
       # with this flake's nixpkgs so the base Zotero release is pinned here,
       # independent of the consumer's (possibly newer) nixpkgs.
-      homeModules.zotero = import ./homeModules/zotero.nix { xoteropkgs = nixpkgs; };
+      homeModules.zotero = import ./nix/modules/home-manager/zotero.nix { xoteropkgs = nixpkgs; };
       homeModules.default = self.homeModules.zotero;
 
       # malt deployment: systemd service + local postgres + credential-loaded key.
       # The host wires the sops secret, wg bind and reverse proxy.
-      nixosModules.xotero = ./nixosModules/xotero.nix;
-      nixosModules.default = ./nixosModules/xotero.nix;
+      nixosModules.xotero = ./nix/modules/nixos/xotero.nix;
+      nixosModules.default = ./nix/modules/nixos/xotero.nix;
 
       packages = eachSystem (
         { pkgs, ... }:
         {
           # Default build keeps upstream endpoints; consumers override the URLs.
           # Useful for `nix build`/eval smoke tests.
-          zotero = pkgs.callPackage ./pkgs/zotero { };
-          xotero = pkgs.callPackage ./pkgs/xotero { };
+          zotero = pkgs.callPackage ./nix/packages/zotero { };
+          xotero = pkgs.callPackage ./nix/packages/xotero { };
         }
       );
 
@@ -90,8 +90,8 @@
         }
         # nixosTest needs a linux VM, so wire it only on linux systems.
         // lib.optionalAttrs pkgs.stdenv.hostPlatform.isLinux {
-          nixos-key-auth = import ./checks/nixos-key-auth.nix { inherit pkgs self; };
-          nixos-sync = import ./checks/nixos-sync.nix { inherit pkgs self; };
+          nixos-key-auth = import ./nix/checks/nixos-key-auth.nix { inherit pkgs self; };
+          nixos-sync = import ./nix/checks/nixos-sync.nix { inherit pkgs self; };
         }
       );
 
