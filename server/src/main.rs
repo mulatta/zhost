@@ -20,26 +20,22 @@ use axum::{
     middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::{get, post},
-    Json, Router,
+    Extension, Json, Router,
 };
-use serde_json::{json, Value};
+use serde_json::{json, Map, Value};
+use sha2::{Digest, Sha256};
 use sqlx::PgPool;
 
-use crate::domain::LibraryId;
-
-/// What a key may do. Reads are always allowed; `write` gates mutations.
-#[derive(Clone, Copy)]
-struct Access {
-    write: bool,
-}
+use crate::domain::{LibraryId, Permissions, RequestContext, UserId};
 
 struct Config {
-    /// Bearer token → access. Provisioned out of band, loaded from secret files
-    /// at boot; never minted by the server or stored in the database.
-    keys: HashMap<String, Access>,
+    /// Static recovery token → access, loaded from secret files at boot.
+    keys: HashMap<String, Permissions>,
     /// A read/write token handed to the app through the login session.
     login_key: String,
-    user_id: u64,
+    user_id: UserId,
+    username: String,
+    display_name: String,
     /// Migration 0001 creates one legacy personal library with ID 1. Keeping its
     /// scope in application state makes every storage call explicit.
     library_id: LibraryId,
@@ -61,6 +57,16 @@ struct AppState {
     config: Arc<Config>,
     pool: PgPool,
     storage: Arc<s3::Storage>,
+}
+
+fn storage_key(library_id: LibraryId, item_key: &str) -> String {
+    // Preserve existing single-user blobs at bare keys. New personal/group
+    // libraries use a namespace so equal Zotero keys cannot collide.
+    if library_id.get() == 1 {
+        item_key.to_owned()
+    } else {
+        format!("libraries/{}/{}", library_id.get(), item_key)
+    }
 }
 
 /// In-flight file uploads, keyed by an unguessable upload token (not the item
@@ -89,6 +95,12 @@ struct LoginSession {
 
 #[derive(Clone)]
 struct PendingUpload {
+    /// Library that authorized the upload token.
+    library_id: LibraryId,
+    /// DB key digest, when a user-owned key authorized this upload. Static
+    /// recovery keys have no digest and are checked through bootstrap identity.
+    api_key_hash: Option<Vec<u8>>,
+    bootstrap_user_id: Option<UserId>,
     /// The attachment item the bytes belong to (and the object key in the bucket).
     item_key: String,
     md5: String,
@@ -137,21 +149,61 @@ fn valid_object_key(key: &str) -> bool {
             .all(|b| b"23456789ABCDEFGHIJKLMNPQRSTUVWXYZ".contains(&b))
 }
 
-/// Access descriptor for the single configured user; no groups. `write` reflects
-/// the requesting key, so a read-only key reports `write: false`.
-fn access_payload(write: bool) -> Value {
-    json!({
-        "user": { "library": true, "files": true, "notes": true, "write": write },
-        "groups": {}
-    })
+/// Zotero omits false permission fields and empty access families.
+fn access_payload(permissions: Permissions) -> Value {
+    let mut user = Map::new();
+    for (name, allowed) in [
+        ("library", permissions.library),
+        ("files", permissions.files),
+        ("notes", permissions.notes),
+        ("write", permissions.write),
+    ] {
+        if allowed {
+            user.insert(name.into(), Value::Bool(true));
+        }
+    }
+    let mut access = Map::new();
+    if !user.is_empty() {
+        access.insert("user".into(), Value::Object(user));
+    }
+    Value::Object(access)
 }
 
-/// The access the request's key carries, if it presents a known one.
-fn key_access(config: &Config, headers: &HeaderMap) -> Option<Access> {
-    headers
+/// Resolve static recovery keys and database-owned keys against live identity
+/// state. Database errors remain errors so an outage cannot masquerade as a bad
+/// credential.
+async fn authenticate_request(
+    state: &AppState,
+    headers: &HeaderMap,
+) -> sqlx::Result<Option<RequestContext>> {
+    let Some(token) = headers
         .get("zotero-api-key")
         .and_then(|v| v.to_str().ok())
-        .and_then(|token| config.keys.get(token).copied())
+        .filter(|token| !token.is_empty())
+    else {
+        return Ok(None);
+    };
+
+    if let Some(permissions) = state.config.keys.get(token).copied() {
+        return Ok(
+            store::bootstrap_principal(&state.pool, state.config.user_id)
+                .await?
+                .map(|principal| RequestContext {
+                    presented_key: token.to_owned(),
+                    principal,
+                    permissions,
+                }),
+        );
+    }
+
+    let digest = Sha256::digest(token.as_bytes());
+    Ok(store::authenticate_api_key(&state.pool, digest.as_slice())
+        .await?
+        .map(|(principal, permissions)| RequestContext {
+            presented_key: token.to_owned(),
+            principal,
+            permissions,
+        }))
 }
 
 fn version_headers(version: i64) -> HeaderMap {
@@ -163,9 +215,9 @@ fn version_headers(version: i64) -> HeaderMap {
     headers
 }
 
-async fn current_headers(state: &AppState) -> HeaderMap {
+async fn current_headers(state: &AppState, library_id: LibraryId) -> HeaderMap {
     version_headers(
-        store::current_version(&state.pool, state.config.library_id)
+        store::current_version(&state.pool, library_id)
             .await
             .unwrap_or(0),
     )
@@ -176,8 +228,8 @@ async fn current_headers(state: &AppState) -> HeaderMap {
 /// version greater than `since`). `since == 0` is the initial pull, so never
 /// 304 it. One DB read, so the caller reuses `current` for the response's
 /// `Last-Modified-Version` instead of querying it again.
-async fn since_check(state: &AppState, since: i64) -> (i64, bool) {
-    let current = store::current_version(&state.pool, state.config.library_id)
+async fn since_check(state: &AppState, library_id: LibraryId, since: i64) -> (i64, bool) {
+    let current = store::current_version(&state.pool, library_id)
         .await
         .unwrap_or(0);
     (current, since > 0 && since >= current)
@@ -202,13 +254,13 @@ fn header_value(text: &str) -> axum::http::HeaderValue {
 
 // --- authentication & login session ---------------------------------------
 
-async fn key_current(State(state): State<AppState>, headers: HeaderMap) -> Response {
-    let write = key_access(&state.config, &headers).is_some_and(|a| a.write);
+async fn key_current(Extension(context): Extension<RequestContext>) -> Response {
     Json(json!({
-        "userID": state.config.user_id,
-        "username": "zhost",
-        "displayName": "zhost",
-        "access": access_payload(write),
+        "key": context.presented_key,
+        "userID": context.principal.user_id.get(),
+        "username": context.principal.username,
+        "displayName": context.principal.display_name,
+        "access": access_payload(context.permissions),
     }))
     .into_response()
 }
@@ -257,8 +309,8 @@ async fn check_session(State(state): State<AppState>, Path(token): Path<String>)
         Json(json!({
             "status": "completed",
             "apiKey": state.config.login_key,
-            "userID": state.config.user_id,
-            "username": "zhost",
+            "userID": state.config.user_id.get(),
+            "username": state.config.username,
         }))
         .into_response()
     } else {
@@ -350,8 +402,15 @@ async fn login_authorize(
 
 // --- library data -----------------------------------------------------------
 
-async fn groups(State(state): State<AppState>) -> Response {
-    (current_headers(&state).await, Json(json!({}))).into_response()
+async fn groups(
+    State(state): State<AppState>,
+    Extension(context): Extension<RequestContext>,
+) -> Response {
+    (
+        current_headers(&state, context.principal.library_id).await,
+        Json(json!({})),
+    )
+        .into_response()
 }
 
 fn server_error(context: &str, error: sqlx::Error) -> Response {
@@ -411,7 +470,12 @@ fn csv_of(params: &HashMap<String, String>, key: &str) -> Vec<String> {
 
 /// `format=versions&since=N` returns the changed `{key: version}` map; otherwise
 /// `?<kind>Key=a,b&format=json` returns the full `[{key, version, data}]`.
-async fn read(state: &AppState, kind: &str, params: HashMap<String, String>) -> Response {
+async fn read(
+    state: &AppState,
+    library_id: LibraryId,
+    kind: &str,
+    params: HashMap<String, String>,
+) -> Response {
     if params.get("format").map(String::as_str) == Some("versions") {
         let since = since_of(&params);
         // Always 200 with the (possibly empty) versions map. The client's
@@ -419,17 +483,17 @@ async fn read(state: &AppState, kind: &str, params: HashMap<String, String>) -> 
         // 304 as "no data", which then mismatches its library-version check and
         // makes it restart the sync forever. 304 is only for the header path
         // (settings), not for `?since=` versions reads.
-        let current = store::current_version(&state.pool, state.config.library_id)
+        let current = store::current_version(&state.pool, library_id)
             .await
             .unwrap_or(0);
-        return match store::versions(&state.pool, state.config.library_id, kind, since).await {
+        return match store::versions(&state.pool, library_id, kind, since).await {
             Ok(value) => (version_headers(current), Json(value)).into_response(),
             Err(error) => server_error("read", error),
         };
     }
     let keys = csv_of(&params, &format!("{kind}Key"));
-    match store::objects(&state.pool, state.config.library_id, kind, &keys).await {
-        Ok(value) => (current_headers(state).await, Json(value)).into_response(),
+    match store::objects(&state.pool, library_id, kind, &keys).await {
+        Ok(value) => (current_headers(state, library_id).await, Json(value)).into_response(),
         Err(error) => server_error("read", error),
     }
 }
@@ -438,20 +502,25 @@ async fn read(state: &AppState, kind: &str, params: HashMap<String, String>) -> 
 /// map and the `?itemKey=…` batch. With `top`, the versions map is restricted to
 /// top-level items (the client's parent-first phase). Returns `None` when the
 /// request carries neither, i.e. it is a CLI query rather than a sync read.
-async fn item_sync_read(state: &AppState, params: &query::Params, top: bool) -> Option<Response> {
+async fn item_sync_read(
+    state: &AppState,
+    library_id: LibraryId,
+    params: &query::Params,
+    top: bool,
+) -> Option<Response> {
     if params.get("format") == Some("versions") {
         let since = params
             .get("since")
             .and_then(|s| s.parse().ok())
             .unwrap_or(0);
         // Always 200 + map (never 304); see `read` — a 304 here loops the client.
-        let current = store::current_version(&state.pool, state.config.library_id)
+        let current = store::current_version(&state.pool, library_id)
             .await
             .unwrap_or(0);
         let result = if top {
-            store::top_versions(&state.pool, state.config.library_id, since).await
+            store::top_versions(&state.pool, library_id, since).await
         } else {
-            store::versions(&state.pool, state.config.library_id, "item", since).await
+            store::versions(&state.pool, library_id, "item", since).await
         };
         return Some(match result {
             Ok(value) => (version_headers(current), Json(value)).into_response(),
@@ -461,8 +530,10 @@ async fn item_sync_read(state: &AppState, params: &query::Params, top: bool) -> 
     if let Some(csv) = params.get("itemKey") {
         let keys: Vec<String> = csv.split(',').map(String::from).collect();
         return Some(
-            match store::objects(&state.pool, state.config.library_id, "item", &keys).await {
-                Ok(value) => (current_headers(state).await, Json(value)).into_response(),
+            match store::objects(&state.pool, library_id, "item", &keys).await {
+                Ok(value) => {
+                    (current_headers(state, library_id).await, Json(value)).into_response()
+                }
                 Err(error) => server_error("items batch", error),
             },
         );
@@ -475,13 +546,14 @@ async fn item_sync_read(state: &AppState, params: &query::Params, top: bool) -> 
 /// rel="next"` built against `path` (the public-URL endpoint).
 async fn item_listing(
     state: &AppState,
+    library_id: LibraryId,
     path: &str,
     raw: Option<&str>,
     q: &query::ItemQuery,
 ) -> Response {
-    match store::query_items(&state.pool, state.config.library_id, q).await {
+    match store::query_items(&state.pool, library_id, q).await {
         Ok((items, total)) => {
-            let mut headers = current_headers(state).await;
+            let mut headers = current_headers(state, library_id).await;
             headers.insert("total-results", total.to_string().parse().unwrap());
             if q.start + q.limit < total {
                 let link = next_link(&state.config, path, raw, q.start + q.limit);
@@ -510,57 +582,68 @@ fn next_link(config: &Config, path: &str, raw: Option<&str>, start: i64) -> Stri
 /// `responseText.split('\n')`). Returns `None` for any other format.
 async fn item_keys_response(
     state: &AppState,
+    library_id: LibraryId,
     params: &query::Params,
     q: &query::ItemQuery,
 ) -> Option<Response> {
     if params.get("format") != Some("keys") {
         return None;
     }
-    Some(
-        match store::item_keys(&state.pool, state.config.library_id, q).await {
-            // A `String` body sets `Content-Type: text/plain`, which is what the
-            // client expects; current_headers adds `Last-Modified-Version`.
-            Ok(keys) => (current_headers(state).await, keys.join("\n")).into_response(),
-            Err(error) => server_error("item keys", error),
-        },
-    )
+    Some(match store::item_keys(&state.pool, library_id, q).await {
+        // A `String` body sets `Content-Type: text/plain`, which is what the
+        // client expects; current_headers adds `Last-Modified-Version`.
+        Ok(keys) => (current_headers(state, library_id).await, keys.join("\n")).into_response(),
+        Err(error) => server_error("item keys", error),
+    })
 }
 
 /// `GET /users/<id>/items`: the two sync reads, or the CLI query when neither.
 async fn items_get(
     State(state): State<AppState>,
+    Extension(context): Extension<RequestContext>,
     Path(id): Path<String>,
     RawQuery(raw): RawQuery,
 ) -> Response {
     let params = query::Params::parse(raw.as_deref());
-    if let Some(resp) = item_sync_read(&state, &params, false).await {
+    if let Some(resp) = item_sync_read(&state, context.principal.library_id, &params, false).await {
         return resp;
     }
     let q = query::ItemQuery::from_params(&params);
-    if let Some(resp) = item_keys_response(&state, &params, &q).await {
+    if let Some(resp) = item_keys_response(&state, context.principal.library_id, &params, &q).await
+    {
         return resp;
     }
-    item_listing(&state, &format!("/users/{id}/items"), raw.as_deref(), &q).await
+    item_listing(
+        &state,
+        context.principal.library_id,
+        &format!("/users/{id}/items"),
+        raw.as_deref(),
+        &q,
+    )
+    .await
 }
 
 /// `GET /users/<id>/items/top`: top-level items (no `parentItem`). Also answers
 /// the sync `format=versions` (top-filtered) and `itemKey` reads sent here.
 async fn items_top(
     State(state): State<AppState>,
+    Extension(context): Extension<RequestContext>,
     Path(id): Path<String>,
     RawQuery(raw): RawQuery,
 ) -> Response {
     let params = query::Params::parse(raw.as_deref());
-    if let Some(resp) = item_sync_read(&state, &params, true).await {
+    if let Some(resp) = item_sync_read(&state, context.principal.library_id, &params, true).await {
         return resp;
     }
     let mut q = query::ItemQuery::from_params(&params);
     q.top = true;
-    if let Some(resp) = item_keys_response(&state, &params, &q).await {
+    if let Some(resp) = item_keys_response(&state, context.principal.library_id, &params, &q).await
+    {
         return resp;
     }
     item_listing(
         &state,
+        context.principal.library_id,
         &format!("/users/{id}/items/top"),
         raw.as_deref(),
         &q,
@@ -571,17 +654,20 @@ async fn items_top(
 /// `GET /users/<id>/items/trash`: only trashed items (`data.deleted`).
 async fn items_trash(
     State(state): State<AppState>,
+    Extension(context): Extension<RequestContext>,
     Path(id): Path<String>,
     RawQuery(raw): RawQuery,
 ) -> Response {
     let params = query::Params::parse(raw.as_deref());
     let mut q = query::ItemQuery::from_params(&params);
     q.only_trashed = true;
-    if let Some(resp) = item_keys_response(&state, &params, &q).await {
+    if let Some(resp) = item_keys_response(&state, context.principal.library_id, &params, &q).await
+    {
         return resp;
     }
     item_listing(
         &state,
+        context.principal.library_id,
         &format!("/users/{id}/items/trash"),
         raw.as_deref(),
         &q,
@@ -592,17 +678,20 @@ async fn items_trash(
 /// `GET /users/<id>/collections/<key>/items`: items in the given collection.
 async fn collection_items(
     State(state): State<AppState>,
+    Extension(context): Extension<RequestContext>,
     Path((id, key)): Path<(String, String)>,
     RawQuery(raw): RawQuery,
 ) -> Response {
     let params = query::Params::parse(raw.as_deref());
     let mut q = query::ItemQuery::from_params(&params);
     q.collection = Some(key.clone());
-    if let Some(resp) = item_keys_response(&state, &params, &q).await {
+    if let Some(resp) = item_keys_response(&state, context.principal.library_id, &params, &q).await
+    {
         return resp;
     }
     item_listing(
         &state,
+        context.principal.library_id,
         &format!("/users/{id}/collections/{key}/items"),
         raw.as_deref(),
         &q,
@@ -615,6 +704,7 @@ async fn collection_items(
 /// previously-deleted collection (syncEngine.js `_restoreRestoredCollectionItems`).
 async fn collection_items_top(
     State(state): State<AppState>,
+    Extension(context): Extension<RequestContext>,
     Path((id, key)): Path<(String, String)>,
     RawQuery(raw): RawQuery,
 ) -> Response {
@@ -622,11 +712,13 @@ async fn collection_items_top(
     let mut q = query::ItemQuery::from_params(&params);
     q.collection = Some(key.clone());
     q.top = true;
-    if let Some(resp) = item_keys_response(&state, &params, &q).await {
+    if let Some(resp) = item_keys_response(&state, context.principal.library_id, &params, &q).await
+    {
         return resp;
     }
     item_listing(
         &state,
+        context.principal.library_id,
         &format!("/users/{id}/collections/{key}/items/top"),
         raw.as_deref(),
         &q,
@@ -635,9 +727,16 @@ async fn collection_items_top(
 }
 
 /// `GET /users/<id>/tags`: distinct tags with item counts.
-async fn tags_get(State(state): State<AppState>) -> Response {
-    match store::tags(&state.pool, state.config.library_id).await {
-        Ok(value) => (current_headers(&state).await, Json(value)).into_response(),
+async fn tags_get(
+    State(state): State<AppState>,
+    Extension(context): Extension<RequestContext>,
+) -> Response {
+    match store::tags(&state.pool, context.principal.library_id).await {
+        Ok(value) => (
+            current_headers(&state, context.principal.library_id).await,
+            Json(value),
+        )
+            .into_response(),
         Err(error) => server_error("tags", error),
     }
 }
@@ -649,6 +748,7 @@ async fn tags_get(State(state): State<AppState>) -> Response {
 /// `tag`, so accept either.
 async fn tags_delete(
     State(state): State<AppState>,
+    Extension(context): Extension<RequestContext>,
     headers: HeaderMap,
     Query(params): Query<HashMap<String, String>>,
 ) -> Response {
@@ -666,7 +766,14 @@ async fn tags_delete(
                 .collect()
         })
         .unwrap_or_default();
-    match store::delete_tags(&state.pool, state.config.library_id, &tags, Some(expected)).await {
+    match store::delete_tags(
+        &state.pool,
+        context.principal.library_id,
+        &tags,
+        Some(expected),
+    )
+    .await
+    {
         Ok(store::Outcome::Done(version)) => {
             (StatusCode::NO_CONTENT, version_headers(version)).into_response()
         }
@@ -678,7 +785,13 @@ async fn tags_delete(
 /// Both POST and PATCH create-or-update with merge semantics (see `store::write`):
 /// the Zotero client uploads only an existing object's changed fields, so omitted
 /// fields must be preserved.
-async fn write(state: &AppState, kind: &str, headers: HeaderMap, body: Bytes) -> Response {
+async fn write(
+    state: &AppState,
+    library_id: LibraryId,
+    kind: &str,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
     let batch: Vec<Value> = match serde_json::from_slice(&body) {
         Ok(batch) => batch,
         Err(error) => {
@@ -704,15 +817,7 @@ async fn write(state: &AppState, kind: &str, headers: HeaderMap, body: Bytes) ->
         Ok(v) => v,
         Err(resp) => return resp,
     };
-    match store::write(
-        &state.pool,
-        state.config.library_id,
-        kind,
-        batch,
-        Some(expected),
-    )
-    .await
-    {
+    match store::write(&state.pool, library_id, kind, batch, Some(expected)).await {
         Ok(store::Outcome::Done((version, successful))) => (
             version_headers(version),
             Json(json!({
@@ -730,6 +835,7 @@ async fn write(state: &AppState, kind: &str, headers: HeaderMap, body: Bytes) ->
 
 async fn delete(
     state: &AppState,
+    library_id: LibraryId,
     kind: &str,
     headers: HeaderMap,
     params: HashMap<String, String>,
@@ -739,15 +845,7 @@ async fn delete(
         Err(resp) => return resp,
     };
     let keys = csv_of(&params, &format!("{kind}Key"));
-    match store::delete(
-        &state.pool,
-        state.config.library_id,
-        kind,
-        &keys,
-        Some(expected),
-    )
-    .await
-    {
+    match store::delete(&state.pool, library_id, kind, &keys, Some(expected)).await {
         Ok(store::Outcome::Done(version)) => {
             (StatusCode::NO_CONTENT, version_headers(version)).into_response()
         }
@@ -758,17 +856,18 @@ async fn delete(
 
 async fn settings_read(
     State(state): State<AppState>,
+    Extension(context): Extension<RequestContext>,
     headers: HeaderMap,
     Query(params): Query<HashMap<String, String>>,
 ) -> Response {
     // The client may send the cursor as ?since= or the If-Modified-Since-Version
     // header; honour whichever is higher.
     let since = since_of(&params).max(if_modified_since(&headers));
-    let (current, fresh) = since_check(&state, since).await;
+    let (current, fresh) = since_check(&state, context.principal.library_id, since).await;
     if fresh {
         return (StatusCode::NOT_MODIFIED, version_headers(current)).into_response();
     }
-    match store::settings(&state.pool, state.config.library_id).await {
+    match store::settings(&state.pool, context.principal.library_id).await {
         Ok(value) => (version_headers(current), Json(value)).into_response(),
         Err(error) => server_error("settings", error),
     }
@@ -776,6 +875,7 @@ async fn settings_read(
 
 async fn settings_write(
     State(state): State<AppState>,
+    Extension(context): Extension<RequestContext>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
@@ -784,7 +884,14 @@ async fn settings_write(
         Err(resp) => return resp,
     };
     let value: Value = serde_json::from_slice(&body).unwrap_or_else(|_| json!({}));
-    match store::write_settings(&state.pool, state.config.library_id, value, Some(expected)).await {
+    match store::write_settings(
+        &state.pool,
+        context.principal.library_id,
+        value,
+        Some(expected),
+    )
+    .await
+    {
         Ok(store::Outcome::Done(version)) => {
             (StatusCode::NO_CONTENT, version_headers(version)).into_response()
         }
@@ -799,6 +906,7 @@ async fn settings_write(
 /// 204 and the setting persisted.)
 async fn settings_delete(
     State(state): State<AppState>,
+    Extension(context): Extension<RequestContext>,
     headers: HeaderMap,
     Query(params): Query<HashMap<String, String>>,
 ) -> Response {
@@ -807,7 +915,13 @@ async fn settings_delete(
         Err(resp) => return resp,
     };
     let keys = csv_of(&params, "settingKey");
-    match store::delete_settings(&state.pool, state.config.library_id, &keys, Some(expected)).await
+    match store::delete_settings(
+        &state.pool,
+        context.principal.library_id,
+        &keys,
+        Some(expected),
+    )
+    .await
     {
         Ok(store::Outcome::Done(version)) => {
             (StatusCode::NO_CONTENT, version_headers(version)).into_response()
@@ -819,11 +933,16 @@ async fn settings_delete(
 
 async fn deleted(
     State(state): State<AppState>,
+    Extension(context): Extension<RequestContext>,
     Query(params): Query<HashMap<String, String>>,
 ) -> Response {
     let since = since_of(&params);
-    match store::deleted(&state.pool, state.config.library_id, since).await {
-        Ok(value) => (current_headers(&state).await, Json(value)).into_response(),
+    match store::deleted(&state.pool, context.principal.library_id, since).await {
+        Ok(value) => (
+            current_headers(&state, context.principal.library_id).await,
+            Json(value),
+        )
+            .into_response(),
         Err(error) => server_error("deleted", error),
     }
 }
@@ -832,14 +951,15 @@ async fn deleted(
 /// changed after `since`, so the client downloads only what it lacks.
 async fn fulltext_versions(
     State(state): State<AppState>,
+    Extension(context): Extension<RequestContext>,
     Query(params): Query<HashMap<String, String>>,
 ) -> Response {
     let since = since_of(&params);
     // Always 200 + map (never 304); see `read` — a 304 here loops the client.
-    let current = store::current_version(&state.pool, state.config.library_id)
+    let current = store::current_version(&state.pool, context.principal.library_id)
         .await
         .unwrap_or(0);
-    match store::fulltext_versions(&state.pool, state.config.library_id, since).await {
+    match store::fulltext_versions(&state.pool, context.principal.library_id, since).await {
         Ok(value) => (version_headers(current), Json(value)).into_response(),
         Err(error) => server_error("fulltext versions", error),
     }
@@ -849,9 +969,10 @@ async fn fulltext_versions(
 /// version in `Last-Modified-Version` (the client stores it to skip re-fetching).
 async fn fulltext_item(
     State(state): State<AppState>,
+    Extension(context): Extension<RequestContext>,
     Path((_id, key)): Path<(String, String)>,
 ) -> Response {
-    match store::fulltext_item(&state.pool, state.config.library_id, &key).await {
+    match store::fulltext_item(&state.pool, context.principal.library_id, &key).await {
         Ok(Some((version, data))) => (version_headers(version), Json(data)).into_response(),
         Ok(None) => StatusCode::NOT_FOUND.into_response(),
         Err(error) => server_error("fulltext item", error),
@@ -862,6 +983,7 @@ async fn fulltext_item(
 /// result map the client reads to mark each item synced (or `412` if stale).
 async fn fulltext_write(
     State(state): State<AppState>,
+    Extension(context): Extension<RequestContext>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
@@ -876,7 +998,14 @@ async fn fulltext_write(
         Ok(v) => v,
         Err(resp) => return resp,
     };
-    match store::write_fulltext(&state.pool, state.config.library_id, batch, Some(expected)).await {
+    match store::write_fulltext(
+        &state.pool,
+        context.principal.library_id,
+        batch,
+        Some(expected),
+    )
+    .await
+    {
         Ok(store::Outcome::Done((version, successful))) => (
             version_headers(version),
             Json(json!({
@@ -897,6 +1026,7 @@ async fn fulltext_write(
 /// (`upload` form, after the bytes have been PUT to the upload URL).
 async fn file_post(
     State(state): State<AppState>,
+    Extension(context): Extension<RequestContext>,
     Path((_id, key)): Path<(String, String)>,
     headers: HeaderMap,
     Form(form): Form<HashMap<String, String>>,
@@ -914,12 +1044,15 @@ async fn file_post(
         if upload.item_key != key {
             return (StatusCode::BAD_REQUEST, "upload token does not match item").into_response();
         }
+        if upload.library_id != context.principal.library_id {
+            return (StatusCode::FORBIDDEN, "upload token library mismatch").into_response();
+        }
         if !upload.uploaded {
             return (StatusCode::BAD_REQUEST, "no uploaded bytes").into_response();
         }
         return match store::register_file(
             &state.pool,
-            state.config.library_id,
+            context.principal.library_id,
             &key,
             &upload.md5,
             &upload.filename,
@@ -953,7 +1086,7 @@ async fn file_post(
     }
 
     let md5 = form.get("md5").cloned().unwrap_or_default();
-    let stored_md5 = match store::file_meta(&state.pool, state.config.library_id, &key).await {
+    let stored_md5 = match store::file_meta(&state.pool, context.principal.library_id, &key).await {
         Ok(meta) => meta.map(|(m, _)| m),
         Err(error) => return server_error("file auth", error),
     };
@@ -965,11 +1098,14 @@ async fn file_post(
         // different existing file → conflict.
         if let Some(existing) = &stored_md5 {
             if existing.eq_ignore_ascii_case(&md5) {
-                return (current_headers(&state).await, Json(json!({ "exists": 1 })))
+                return (
+                    current_headers(&state, context.principal.library_id).await,
+                    Json(json!({ "exists": 1 })),
+                )
                     .into_response();
             }
             return conflict(
-                store::current_version(&state.pool, state.config.library_id)
+                store::current_version(&state.pool, context.principal.library_id)
                     .await
                     .unwrap_or(0),
             );
@@ -981,7 +1117,7 @@ async fn file_post(
             .is_some_and(|m| m.eq_ignore_ascii_case(want))
         {
             return conflict(
-                store::current_version(&state.pool, state.config.library_id)
+                store::current_version(&state.pool, context.principal.library_id)
                     .await
                     .unwrap_or(0),
             );
@@ -999,6 +1135,17 @@ async fn file_post(
         pending.insert(
             token.clone(),
             PendingUpload {
+                library_id: context.principal.library_id,
+                api_key_hash: if state.config.keys.contains_key(&context.presented_key) {
+                    None
+                } else {
+                    Some(Sha256::digest(context.presented_key.as_bytes()).to_vec())
+                },
+                bootstrap_user_id: state
+                    .config
+                    .keys
+                    .contains_key(&context.presented_key)
+                    .then_some(context.principal.user_id),
                 item_key: key.clone(),
                 md5,
                 filename: form.get("filename").cloned().unwrap_or_default(),
@@ -1036,6 +1183,19 @@ async fn upload_put(
     let Some(upload) = pending else {
         return (StatusCode::BAD_REQUEST, "unknown upload token").into_response();
     };
+    if let Some(token_hash) = &upload.api_key_hash {
+        match store::api_key_active(&state.pool, token_hash, upload.library_id).await {
+            Ok(true) => {}
+            Ok(false) => return (StatusCode::FORBIDDEN, "API key revoked").into_response(),
+            Err(error) => return server_error("upload authorization", error),
+        }
+    } else if let Some(user_id) = upload.bootstrap_user_id {
+        match store::bootstrap_principal(&state.pool, user_id).await {
+            Ok(Some(_)) => {}
+            Ok(None) => return (StatusCode::FORBIDDEN, "bootstrap user disabled").into_response(),
+            Err(error) => return server_error("upload authorization", error),
+        }
+    }
     let actual_md5 = {
         use md5::{Digest, Md5};
         format!("{:x}", Md5::new().chain_update(&body).finalize())
@@ -1055,7 +1215,11 @@ async fn upload_put(
     }
     if let Err(error) = state
         .storage
-        .put(&upload.item_key, &body, "application/octet-stream")
+        .put(
+            &storage_key(upload.library_id, &upload.item_key),
+            &body,
+            "application/octet-stream",
+        )
         .await
     {
         return s3_error("store file", error);
@@ -1073,17 +1237,23 @@ async fn upload_put(
 /// an unguessable, expiring capability the client follows without an API key).
 async fn file_get(
     State(state): State<AppState>,
+    Extension(context): Extension<RequestContext>,
     Path((_id, key)): Path<(String, String)>,
 ) -> Response {
     if !valid_key(&key) {
         return StatusCode::NOT_FOUND.into_response();
     }
-    let (md5, mtime) = match store::file_meta(&state.pool, state.config.library_id, &key).await {
+    let (md5, mtime) = match store::file_meta(&state.pool, context.principal.library_id, &key).await
+    {
         Ok(Some(meta)) => meta,
         Ok(None) => return StatusCode::NOT_FOUND.into_response(),
         Err(error) => return server_error("file meta", error),
     };
-    let url = match state.storage.presign_get(&key).await {
+    let url = match state
+        .storage
+        .presign_get(&storage_key(context.principal.library_id, &key))
+        .await
+    {
         Ok(url) => url,
         Err(error) => return s3_error("presign download", error),
     };
@@ -1155,26 +1325,54 @@ async fn log_and_auth(State(state): State<AppState>, req: Request, next: Next) -
     let is_bootstrap =
         path.starts_with("/keys/sessions") || path.starts_with("/uploads") || path == "/login";
     if !is_bootstrap {
-        let Some(access) = key_access(&state.config, &parts.headers) else {
-            return (StatusCode::FORBIDDEN, "invalid API key").into_response();
+        let context = match authenticate_request(&state, &parts.headers).await {
+            Ok(Some(context)) => context,
+            Ok(None) => return (StatusCode::FORBIDDEN, "invalid API key").into_response(),
+            Err(error) => return server_error("API key authentication", error),
         };
+        if path != "/keys/current" && !context.permissions.library {
+            return (StatusCode::FORBIDDEN, "library access denied").into_response();
+        }
+        // Note/annotation filtering is a separate store contract. Until that
+        // resolver lands, fail closed for keys that explicitly omit notes.
+        if path.starts_with("/users/") && !context.permissions.notes {
+            return (StatusCode::FORBIDDEN, "notes access denied").into_response();
+        }
+        match path_user_id(path) {
+            Ok(Some(path_user_id)) if path_user_id == context.principal.user_id.get() => {}
+            Ok(Some(_)) => return (StatusCode::FORBIDDEN, "user access denied").into_response(),
+            Err(()) => return StatusCode::NOT_FOUND.into_response(),
+            Ok(None) => {}
+        }
+        if path.contains("/file") && !context.permissions.files {
+            return (StatusCode::FORBIDDEN, "file access denied").into_response();
+        }
         let mutating = matches!(
             parts.method,
             axum::http::Method::POST | axum::http::Method::PATCH | axum::http::Method::DELETE
         );
-        if mutating && !access.write {
+        if mutating && !context.permissions.write {
             return (StatusCode::FORBIDDEN, "read-only API key").into_response();
         }
+        parts.extensions.insert(context);
     }
 
-    let response = next
-        .run(Request::from_parts(parts, Body::from(bytes)))
-        .await;
+    let request = Request::from_parts(parts, Body::from(bytes));
+    let response = next.run(request).await;
     let status = response.status();
     if status.is_client_error() || status.is_server_error() {
         tracing::warn!(%method, %uri, status = status.as_u16(), "response error");
     }
     response
+}
+
+fn path_user_id(path: &str) -> Result<Option<i64>, ()> {
+    let mut segments = path.split('/');
+    if segments.next() != Some("") || segments.next() != Some("users") {
+        return Ok(None);
+    }
+    let id = segments.next().ok_or(())?.parse().map_err(|_| ())?;
+    Ok(Some(id))
 }
 
 fn app(state: AppState) -> Router {
@@ -1183,27 +1381,35 @@ fn app(state: AppState) -> Router {
     let objects = |kind: &'static str| {
         get(
             move |State(state): State<AppState>,
+                  Extension(context): Extension<RequestContext>,
                   Query(p): Query<HashMap<String, String>>| async move {
-                read(&state, kind, p).await
+                read(&state, context.principal.library_id, kind, p).await
             },
         )
         .post(
-            move |State(state): State<AppState>, headers: HeaderMap, body: Bytes| async move {
-                write(&state, kind, headers, body).await
+            move |State(state): State<AppState>,
+                  Extension(context): Extension<RequestContext>,
+                  headers: HeaderMap,
+                  body: Bytes| async move {
+                write(&state, context.principal.library_id, kind, headers, body).await
             },
         )
         .patch(
-            move |State(state): State<AppState>, headers: HeaderMap, body: Bytes| async move {
-                write(&state, kind, headers, body).await
+            move |State(state): State<AppState>,
+                  Extension(context): Extension<RequestContext>,
+                  headers: HeaderMap,
+                  body: Bytes| async move {
+                write(&state, context.principal.library_id, kind, headers, body).await
             },
         )
-            .delete(
-                move |State(state): State<AppState>,
-                      headers: HeaderMap,
-                      Query(p): Query<HashMap<String, String>>| async move {
-                    delete(&state, kind, headers, p).await
-                },
-            )
+        .delete(
+            move |State(state): State<AppState>,
+                  Extension(context): Extension<RequestContext>,
+                  headers: HeaderMap,
+                  Query(p): Query<HashMap<String, String>>| async move {
+                delete(&state, context.principal.library_id, kind, headers, p).await
+            },
+        )
     };
 
     Router::new()
@@ -1237,23 +1443,26 @@ fn app(state: AppState) -> Router {
             get(items_get)
                 .post(
                     move |State(state): State<AppState>,
+                          Extension(context): Extension<RequestContext>,
                           headers: HeaderMap,
                           body: Bytes| async move {
-                        write(&state, "item", headers, body).await
+                        write(&state, context.principal.library_id, "item", headers, body).await
                     },
                 )
                 .patch(
                     move |State(state): State<AppState>,
+                          Extension(context): Extension<RequestContext>,
                           headers: HeaderMap,
                           body: Bytes| async move {
-                        write(&state, "item", headers, body).await
+                        write(&state, context.principal.library_id, "item", headers, body).await
                     },
                 )
                 .delete(
                     move |State(state): State<AppState>,
+                          Extension(context): Extension<RequestContext>,
                           headers: HeaderMap,
                           Query(p): Query<HashMap<String, String>>| async move {
-                        delete(&state, "item", headers, p).await
+                        delete(&state, context.principal.library_id, "item", headers, p).await
                     },
                 ),
         )
@@ -1274,10 +1483,7 @@ fn app(state: AppState) -> Router {
         // Attachment uploads exceed the default 2 MiB extractor limit; raise it
         // to MAX_BODY (the middleware enforces the same bound while buffering).
         .layer(DefaultBodyLimit::max(MAX_BODY))
-        .layer(middleware::from_fn_with_state(
-            state.clone(),
-            log_and_auth,
-        ))
+        .layer(middleware::from_fn_with_state(state.clone(), log_and_auth))
         .with_state(state)
 }
 
@@ -1288,7 +1494,7 @@ fn app(state: AppState) -> Router {
 /// `ZHOST_API_KEY` for simple deployments. Returns the map and a read/write
 /// token to hand the app through the login session. Prefer files over the env,
 /// which is visible in /proc.
-fn load_keys() -> (HashMap<String, Access>, String) {
+fn load_keys() -> (HashMap<String, Permissions>, String) {
     let read_token = |path: &str| {
         std::fs::read_to_string(path)
             .unwrap_or_else(|e| panic!("read key file {path}: {e}"))
@@ -1308,7 +1514,7 @@ fn load_keys() -> (HashMap<String, Access>, String) {
             if write && login_key.is_none() {
                 login_key = Some(token.clone());
             }
-            keys.insert(token, Access { write });
+            keys.insert(token, Permissions::recovery(write));
         }
     } else {
         let token = match std::env::var("ZHOST_API_KEY_FILE") {
@@ -1316,7 +1522,7 @@ fn load_keys() -> (HashMap<String, Access>, String) {
             Err(_) => std::env::var("ZHOST_API_KEY").unwrap_or_else(|_| "zhost-dev-key".into()),
         };
         login_key = Some(token.clone());
-        keys.insert(token, Access { write: true });
+        keys.insert(token, Permissions::recovery(true));
     }
 
     (
@@ -1372,14 +1578,21 @@ async fn main() {
 
     let (keys, login_key) = load_keys();
     let bind = std::env::var("ZHOST_BIND").unwrap_or_else(|_| "127.0.0.1:8189".into());
+    let user_id = std::env::var("ZHOST_USER_ID")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .and_then(UserId::new)
+        .unwrap_or_else(|| UserId::new(1).expect("default user ID is positive"));
+    let username = std::env::var("ZHOST_USERNAME").unwrap_or_else(|_| "zhost".into());
+    let display_name = std::env::var("ZHOST_DISPLAY_NAME").unwrap_or_else(|_| "zhost".into());
+    let library_id = LibraryId::new(1).expect("legacy library ID is positive");
     let config = Arc::new(Config {
         keys,
         login_key,
-        user_id: std::env::var("ZHOST_USER_ID")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(1),
-        library_id: LibraryId::new(1).expect("legacy library ID is positive"),
+        user_id,
+        username: username.clone(),
+        display_name: display_name.clone(),
+        library_id,
         public_url: std::env::var("ZHOST_PUBLIC_URL").unwrap_or_else(|_| format!("http://{bind}")),
         bind,
         database_url: std::env::var("ZHOST_DATABASE_URL")
@@ -1394,6 +1607,15 @@ async fn main() {
     let pool = store::connect(&config.database_url)
         .await
         .expect("connect to database");
+    store::bootstrap_identity(
+        &pool,
+        config.user_id,
+        &config.username,
+        &config.display_name,
+        config.library_id,
+    )
+    .await
+    .expect("bootstrap identity");
     let storage = Arc::new(s3::Storage::new(&config.s3).expect("init object storage"));
     let state = AppState {
         config,

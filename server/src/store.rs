@@ -9,7 +9,7 @@ use serde_json::{Map, Value};
 use sqlx::postgres::PgRow;
 use sqlx::{PgPool, Postgres, QueryBuilder, Row};
 
-use crate::domain::LibraryId;
+use crate::domain::{LibraryId, Permissions, Principal, UserId};
 use crate::query::{ItemQuery, QMode};
 
 /// `{<key_col>: version}` map from version-listing rows (the `format=versions`
@@ -108,6 +108,192 @@ pub async fn connect(url: &str) -> sqlx::Result<PgPool> {
     let pool = PgPool::connect(url).await?;
     sqlx::migrate!("./migrations").run(&pool).await?;
     Ok(pool)
+}
+
+fn principal_from_row(row: &PgRow) -> sqlx::Result<Principal> {
+    let raw_user_id = row.get::<i64, _>("user_id");
+    let user_id = UserId::new(raw_user_id)
+        .ok_or_else(|| sqlx::Error::Protocol(format!("invalid user ID {raw_user_id}")))?;
+    let raw_library_id = row.get::<i64, _>("library_id");
+    let library_id = LibraryId::new(raw_library_id)
+        .ok_or_else(|| sqlx::Error::Protocol(format!("invalid library ID {raw_library_id}")))?;
+    Ok(Principal {
+        user_id,
+        username: row.get("username"),
+        display_name: row.get("display_name"),
+        library_id,
+    })
+}
+
+/// Bind the populated-v7 library to one configured bootstrap user.
+///
+/// Startup takes a transaction-scoped advisory lock and validates existing
+/// rows after conflict-tolerant inserts. A changed user tuple or ownership
+/// mapping therefore fails closed instead of silently rewriting identity data.
+pub async fn bootstrap_identity(
+    pool: &PgPool,
+    user_id: UserId,
+    username: &str,
+    display_name: &str,
+    library_id: LibraryId,
+) -> sqlx::Result<()> {
+    let mut tx = pool.begin().await?;
+    sqlx::query("select pg_advisory_xact_lock($1)")
+        .bind(0x007a_686f_7374_i64)
+        .fetch_one(&mut *tx)
+        .await?;
+
+    let library_kind: String = sqlx::query("select kind from library where id = $1 for update")
+        .bind(library_id.get())
+        .fetch_one(&mut *tx)
+        .await?
+        .get("kind");
+    if library_kind != "personal" {
+        return Err(sqlx::Error::Protocol(format!(
+            "bootstrap library {} is {library_kind}, not personal",
+            library_id.get()
+        )));
+    }
+
+    sqlx::query(
+        "insert into users (id, username, display_name) values ($1, $2, $3) \
+         on conflict (id) do nothing",
+    )
+    .bind(user_id.get())
+    .bind(username)
+    .bind(display_name)
+    .execute(&mut *tx)
+    .await?;
+
+    let user = sqlx::query("select username, display_name from users where id = $1 for update")
+        .bind(user_id.get())
+        .fetch_one(&mut *tx)
+        .await?;
+    let stored_username = user.get::<String, _>("username");
+    let stored_display_name = user.get::<String, _>("display_name");
+    if stored_username != username || stored_display_name != display_name {
+        return Err(sqlx::Error::Protocol(format!(
+            "bootstrap user {} does not match configured identity",
+            user_id.get()
+        )));
+    }
+
+    sqlx::query(
+        "insert into personal_libraries (user_id, library_id) values ($1, $2) \
+         on conflict (user_id) do nothing",
+    )
+    .bind(user_id.get())
+    .bind(library_id.get())
+    .execute(&mut *tx)
+    .await?;
+
+    let mapped_library_id: i64 =
+        sqlx::query("select library_id from personal_libraries where user_id = $1 for update")
+            .bind(user_id.get())
+            .fetch_one(&mut *tx)
+            .await?
+            .get("library_id");
+    if mapped_library_id != library_id.get() {
+        return Err(sqlx::Error::Protocol(format!(
+            "bootstrap user {} already owns library {mapped_library_id}",
+            user_id.get()
+        )));
+    }
+
+    // Explicit bootstrap IDs do not advance an identity sequence. Never move a
+    // sequence backwards if higher generated IDs were later deleted.
+    sqlx::query(
+        "select setval( \
+             pg_get_serial_sequence('users', 'id'), \
+             greatest( \
+                 (select coalesce(max(id), 1) from users), \
+                 (select last_value from users_id_seq) \
+             ), \
+             true \
+         )",
+    )
+    .fetch_one(&mut *tx)
+    .await?;
+
+    tx.commit().await
+}
+
+/// Resolve the bootstrap principal on every static-key request so disabling the
+/// user takes effect immediately.
+pub async fn bootstrap_principal(
+    pool: &PgPool,
+    user_id: UserId,
+) -> sqlx::Result<Option<Principal>> {
+    let row = sqlx::query(
+        "select u.id as user_id, u.username, u.display_name, pl.library_id \
+         from users u \
+         join personal_libraries pl on pl.user_id = u.id \
+         join library l on l.id = pl.library_id and l.kind = pl.library_kind \
+         where u.id = $1 and u.disabled_at is null and l.kind = 'personal'",
+    )
+    .bind(user_id.get())
+    .fetch_optional(pool)
+    .await?;
+    row.as_ref().map(principal_from_row).transpose()
+}
+
+/// Resolve a user-owned key from its SHA-256 digest. No positive result is
+/// cached: revocation and user disablement apply on the next request.
+pub async fn authenticate_api_key(
+    pool: &PgPool,
+    token_hash: &[u8],
+) -> sqlx::Result<Option<(Principal, Permissions)>> {
+    let row = sqlx::query(
+        "select u.id as user_id, u.username, u.display_name, pl.library_id, \
+                p.library, p.notes, p.write, p.files \
+         from api_keys k \
+         join users u on u.id = k.user_id \
+         join personal_libraries pl on pl.user_id = u.id \
+         join library l on l.id = pl.library_id and l.kind = pl.library_kind \
+         join api_key_user_permissions p on p.api_key_id = k.id \
+         where k.token_hash = $1 and k.revoked_at is null \
+           and u.disabled_at is null and l.kind = 'personal'",
+    )
+    .bind(token_hash)
+    .fetch_optional(pool)
+    .await?;
+    row.as_ref()
+        .map(|row| {
+            Ok((
+                principal_from_row(row)?,
+                Permissions {
+                    library: row.get("library"),
+                    notes: row.get("notes"),
+                    write: row.get("write"),
+                    files: row.get("files"),
+                },
+            ))
+        })
+        .transpose()
+}
+
+pub async fn api_key_active(
+    pool: &PgPool,
+    token_hash: &[u8],
+    library_id: LibraryId,
+) -> sqlx::Result<bool> {
+    let exists = sqlx::query_scalar::<_, bool>(
+        "select exists ( \
+           select 1
+           from api_keys k
+           join users u on u.id = k.user_id
+           join personal_libraries pl on pl.user_id = u.id
+           join library l on l.id = pl.library_id and l.kind = pl.library_kind
+           join api_key_user_permissions p on p.api_key_id = k.id
+           where k.token_hash = $1 and k.revoked_at is null
+             and u.disabled_at is null and pl.library_id = $2
+             and p.library and p.write and p.files )",
+    )
+    .bind(token_hash)
+    .bind(library_id.get())
+    .fetch_one(pool)
+    .await?;
+    Ok(exists)
 }
 
 /// A write that changes nothing (empty batch / no matching keys): report the

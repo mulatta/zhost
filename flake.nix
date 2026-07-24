@@ -90,6 +90,7 @@
         }
         # nixosTest needs a linux VM, so wire it only on linux systems.
         // lib.optionalAttrs pkgs.stdenv.hostPlatform.isLinux {
+          nixos-key-auth = import ./checks/nixos-key-auth.nix { inherit pkgs self; };
           nixos-sync = import ./checks/nixos-sync.nix { inherit pkgs self; };
         }
       );
