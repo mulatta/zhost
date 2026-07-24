@@ -31,17 +31,20 @@ use sha2::{Digest, Sha256};
 use sqlx::PgPool;
 
 use crate::config::Config;
-use crate::domain::{LibraryAccess, LibraryId, Permissions, RequestContext};
+use crate::domain::{LibraryId, Permissions, RequestContext};
 use crate::error::{s3_error, server_error};
+use crate::handlers::fulltext::{fulltext_item, fulltext_versions, fulltext_write};
 use crate::handlers::groups::{group_get, groups};
 use crate::handlers::keys::key_current;
 use crate::handlers::login::{
     cancel_session, check_session, create_session, login_authorize, login_page,
 };
+use crate::handlers::settings::{deleted, settings_delete, settings_read, settings_write};
+use crate::handlers::tags::{tags_delete, tags_get};
 use crate::http::access::{request_access, request_library, request_permissions};
 use crate::http::headers::{
-    conflict, csv_of, current_headers, header_value, if_modified_since, next_link, precondition,
-    since_check, since_of, version_headers,
+    conflict, csv_of, current_headers, header_value, next_link, precondition, since_of,
+    version_headers,
 };
 use crate::http::middleware::{log_and_auth, MAX_BODY};
 use crate::http::validation::{valid_key, valid_object_key};
@@ -308,47 +311,6 @@ async fn collection_items_top(
     item_listing(&state, uri.path(), raw.as_deref(), &q).await
 }
 
-/// `GET /users/<id>/tags`: distinct tags with item counts.
-async fn tags_get(State(state): State<AppState>) -> Response {
-    match store::tags(&state.pool, request_library()).await {
-        Ok(value) => (current_headers(&state).await, Json(value)).into_response(),
-        Err(error) => server_error("tags", error),
-    }
-}
-
-/// `DELETE /tags?tags=a || b` — remove tags library-wide under the version
-/// guard: strip them from every item and record each in the deletion log. Tags
-/// are not objects (no key), so they are addressed by name and split on the
-/// Zotero `||` separator. The sync client sends `tags`; the public API documents
-/// `tag`, so accept either.
-async fn tags_delete(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    Query(params): Query<HashMap<String, String>>,
-) -> Response {
-    let expected = match precondition(&headers) {
-        Ok(v) => v,
-        Err(resp) => return resp,
-    };
-    let tags: Vec<String> = params
-        .get("tags")
-        .or_else(|| params.get("tag"))
-        .map(|raw| {
-            raw.split("||")
-                .map(|t| t.trim().to_string())
-                .filter(|t| !t.is_empty())
-                .collect()
-        })
-        .unwrap_or_default();
-    match store::delete_tags(&state.pool, request_library(), &tags, Some(expected)).await {
-        Ok(store::Outcome::Done(version)) => {
-            (StatusCode::NO_CONTENT, version_headers(version)).into_response()
-        }
-        Ok(store::Outcome::Conflict(current)) => conflict(current),
-        Err(error) => server_error("tags delete", error),
-    }
-}
-
 /// Both POST and PATCH create-or-update with merge semantics (see `store::write`):
 /// the Zotero client uploads only an existing object's changed fields, so omitted
 /// fields must be preserved.
@@ -439,167 +401,6 @@ async fn delete(
             (StatusCode::FORBIDDEN, "group file editing denied").into_response()
         }
         Err(error) => server_error("delete", error),
-    }
-}
-
-async fn settings_read(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    Query(params): Query<HashMap<String, String>>,
-) -> Response {
-    // The client may send the cursor as ?since= or the If-Modified-Since-Version
-    // header; honour whichever is higher.
-    let since = since_of(&params).max(if_modified_since(&headers));
-    let (current, fresh) = since_check(&state, since).await;
-    if fresh {
-        return (StatusCode::NOT_MODIFIED, version_headers(current)).into_response();
-    }
-    match store::settings(&state.pool, request_library()).await {
-        Ok(value) => (version_headers(current), Json(value)).into_response(),
-        Err(error) => server_error("settings", error),
-    }
-}
-
-fn group_admin_setting_denied<'a>(
-    access: LibraryAccess,
-    keys: impl Iterator<Item = &'a str>,
-) -> bool {
-    const ADMIN_ONLY: [&str; 3] = [
-        "attachmentRenameTemplate",
-        "autoRenameFiles",
-        "autoRenameFilesFileTypes",
-    ];
-    access.group_id.is_some()
-        && !access.is_admin
-        && keys.into_iter().any(|key| ADMIN_ONLY.contains(&key))
-}
-
-async fn settings_write(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    body: Bytes,
-) -> Response {
-    let expected = match precondition(&headers) {
-        Ok(v) => v,
-        Err(resp) => return resp,
-    };
-    let value: Value = serde_json::from_slice(&body).unwrap_or_else(|_| json!({}));
-    if group_admin_setting_denied(
-        request_access(),
-        value
-            .as_object()
-            .into_iter()
-            .flat_map(|settings| settings.keys().map(String::as_str)),
-    ) {
-        return (StatusCode::FORBIDDEN, "group admin setting denied").into_response();
-    }
-    match store::write_settings(&state.pool, request_library(), value, Some(expected)).await {
-        Ok(store::Outcome::Done(version)) => {
-            (StatusCode::NO_CONTENT, version_headers(version)).into_response()
-        }
-        Ok(store::Outcome::Conflict(current)) => conflict(current),
-        Err(error) => server_error("settings write", error),
-    }
-}
-
-/// `DELETE /settings?settingKey=k1,k2` — remove the named settings under the
-/// version guard and record them in the deletion log. (Reusing settings_write
-/// here was a no-op: a DELETE has no body, so it deleted nothing yet returned
-/// 204 and the setting persisted.)
-async fn settings_delete(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    Query(params): Query<HashMap<String, String>>,
-) -> Response {
-    let expected = match precondition(&headers) {
-        Ok(v) => v,
-        Err(resp) => return resp,
-    };
-    let keys = csv_of(&params, "settingKey");
-    if group_admin_setting_denied(request_access(), keys.iter().map(String::as_str)) {
-        return (StatusCode::FORBIDDEN, "group admin setting denied").into_response();
-    }
-    match store::delete_settings(&state.pool, request_library(), &keys, Some(expected)).await {
-        Ok(store::Outcome::Done(version)) => {
-            (StatusCode::NO_CONTENT, version_headers(version)).into_response()
-        }
-        Ok(store::Outcome::Conflict(current)) => conflict(current),
-        Err(error) => server_error("settings delete", error),
-    }
-}
-
-async fn deleted(
-    State(state): State<AppState>,
-    Query(params): Query<HashMap<String, String>>,
-) -> Response {
-    let since = since_of(&params);
-    match store::deleted(&state.pool, request_library(), since).await {
-        Ok(value) => (current_headers(&state).await, Json(value)).into_response(),
-        Err(error) => server_error("deleted", error),
-    }
-}
-
-/// `GET /fulltext?format=versions&since=N` → `{itemKey: version}` for content
-/// changed after `since`, so the client downloads only what it lacks.
-async fn fulltext_versions(
-    State(state): State<AppState>,
-    Query(params): Query<HashMap<String, String>>,
-) -> Response {
-    let since = since_of(&params);
-    // Always 200 + map (never 304); see `read` — a 304 here loops the client.
-    let current = store::current_version(&state.pool, request_library())
-        .await
-        .unwrap_or(0);
-    match store::fulltext_versions(&state.pool, request_library(), since).await {
-        Ok(value) => (version_headers(current), Json(value)).into_response(),
-        Err(error) => server_error("fulltext versions", error),
-    }
-}
-
-/// `GET /items/<key>/fulltext` → the item's content object, with the row's
-/// version in `Last-Modified-Version` (the client stores it to skip re-fetching).
-async fn fulltext_item(
-    State(state): State<AppState>,
-    Path((_id, key)): Path<(String, String)>,
-) -> Response {
-    match store::fulltext_item(&state.pool, request_library(), &key).await {
-        Ok(Some((version, data))) => (version_headers(version), Json(data)).into_response(),
-        Ok(None) => StatusCode::NOT_FOUND.into_response(),
-        Err(error) => server_error("fulltext item", error),
-    }
-}
-
-/// `POST /fulltext` — store a batch of extracted content, returning the per-index
-/// result map the client reads to mark each item synced (or `412` if stale).
-async fn fulltext_write(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    body: Bytes,
-) -> Response {
-    let batch: Vec<Value> = match serde_json::from_slice(&body) {
-        Ok(batch) => batch,
-        Err(error) => {
-            tracing::warn!(%error, "malformed fulltext body");
-            return StatusCode::BAD_REQUEST.into_response();
-        }
-    };
-    let expected = match precondition(&headers) {
-        Ok(v) => v,
-        Err(resp) => return resp,
-    };
-    match store::write_fulltext(&state.pool, request_library(), batch, Some(expected)).await {
-        Ok(store::Outcome::Done((version, successful))) => (
-            version_headers(version),
-            Json(json!({
-                "successful": successful,
-                "success": {},
-                "unchanged": {},
-                "failed": {},
-            })),
-        )
-            .into_response(),
-        Ok(store::Outcome::Conflict(current)) => conflict(current),
-        Err(error) => server_error("fulltext write", error),
     }
 }
 
