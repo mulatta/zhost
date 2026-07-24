@@ -822,50 +822,76 @@ pub async fn delete_tags(
     Ok(Outcome::Done(version))
 }
 
-/// md5 and mtime for an attachment file, if registered (the client reads these
-/// from the download response headers).
+/// md5, mtime, and immutable object pointer for a registered attachment file.
 pub async fn file_meta(
     pool: &PgPool,
     library_id: LibraryId,
     item_key: &str,
-) -> sqlx::Result<Option<(String, i64)>> {
-    let row = sqlx::query("select md5, mtime from file where library_id = $1 and item_key = $2")
-        .bind(library_id.get())
-        .bind(item_key)
-        .fetch_optional(pool)
-        .await?;
-    Ok(row.map(|r| (r.get("md5"), r.get("mtime"))))
+) -> sqlx::Result<Option<(String, i64, String)>> {
+    let row = sqlx::query(
+        "select md5, mtime, blob_key from file where library_id = $1 and item_key = $2",
+    )
+    .bind(library_id.get())
+    .bind(item_key)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.map(|r| (r.get("md5"), r.get("mtime"), r.get("blob_key"))))
 }
 
-/// Register an uploaded attachment file, bumping the library version.
+pub struct FileRegistration<'a> {
+    pub expected_md5: Option<&'a str>,
+    pub blob_key: &'a str,
+    pub md5: &'a str,
+    pub filename: &'a str,
+    pub filesize: i64,
+    pub mtime: i64,
+}
+
+/// Atomically make one immutable candidate the registered attachment.
 pub async fn register_file(
     pool: &PgPool,
     library_id: LibraryId,
     item_key: &str,
-    md5: &str,
-    filename: &str,
-    filesize: i64,
-    mtime: i64,
-) -> sqlx::Result<i64> {
+    registration: FileRegistration<'_>,
+) -> sqlx::Result<Outcome<i64>> {
     let mut tx = pool.begin().await?;
-    // A file registration always changes the library; bump via the shared
-    // guarded path (no precondition, so it never conflicts) rather than ad-hoc SQL.
+    // Serializing on the library row makes the file CAS safe for both existing
+    // rows and two concurrent first uploads, where PostgreSQL has no row to lock.
     let version = match guarded_version(&mut tx, library_id, None).await? {
         Outcome::Done(version) => version,
-        Outcome::Conflict(current) => return Ok(current),
+        Outcome::Conflict(current) => return Ok(Outcome::Conflict(current)),
     };
-    sqlx::query(
-        "insert into file (library_id, item_key, md5, filename, filesize, mtime, version) \
-         values ($1, $2, $3, $4, $5, $6, $7) \
-         on conflict (library_id, item_key) \
-         do update set md5 = $3, filename = $4, filesize = $5, mtime = $6, version = $7",
+    let current_md5 = sqlx::query_scalar::<_, String>(
+        "select md5 from file where library_id = $1 and item_key = $2",
     )
     .bind(library_id.get())
     .bind(item_key)
-    .bind(md5)
-    .bind(filename)
-    .bind(filesize)
-    .bind(mtime)
+    .fetch_optional(&mut *tx)
+    .await?;
+    let precondition_matches = match (registration.expected_md5, current_md5.as_deref()) {
+        (None, None) => true,
+        (Some(expected), Some(current)) => expected.eq_ignore_ascii_case(current),
+        _ => false,
+    };
+    if !precondition_matches {
+        // Dropping this transaction rolls back the tentative version bump.
+        return Ok(Outcome::Conflict(version - 1));
+    }
+    sqlx::query(
+        "insert into file \
+         (library_id, item_key, blob_key, md5, filename, filesize, mtime, version) \
+         values ($1, $2, $3, $4, $5, $6, $7, $8) \
+         on conflict (library_id, item_key) \
+         do update set blob_key = $3, md5 = $4, filename = $5, filesize = $6, \
+                       mtime = $7, version = $8",
+    )
+    .bind(library_id.get())
+    .bind(item_key)
+    .bind(registration.blob_key)
+    .bind(registration.md5)
+    .bind(registration.filename)
+    .bind(registration.filesize)
+    .bind(registration.mtime)
     .bind(version)
     .execute(&mut *tx)
     .await?;
@@ -880,12 +906,12 @@ pub async fn register_file(
     .bind(library_id.get())
     .bind(item_key)
     .bind(version)
-    .bind(md5)
-    .bind(mtime)
+    .bind(registration.md5)
+    .bind(registration.mtime)
     .execute(&mut *tx)
     .await?;
     tx.commit().await?;
-    Ok(version)
+    Ok(Outcome::Done(version))
 }
 
 /// `{itemKey: version}` for full-text content changed after `since`. The version

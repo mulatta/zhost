@@ -18,6 +18,20 @@ def library_version():
     ).strip()
 
 
+def assert_attachment(item_key, expected_md5, expected_body, scratch):
+    headers = f"/tmp/{scratch}.headers"
+    machine.succeed(
+        f"curl -sf -D {headers} -o /dev/null "
+        f"{base}/users/1/items/{item_key}/file {auth}"
+    )
+    machine.succeed(f"grep -iq 'zotero-file-md5: {expected_md5}' {headers}")
+    location = machine.succeed(
+        f"grep -i '^location:' {headers} | tr -d '\\r' | awk '{{print $2}}'"
+    ).strip()
+    actual_body = machine.succeed(f"curl -sf '{location}'").strip()
+    assert actual_body == expected_body, (expected_body, actual_body)
+
+
 machine.wait_for_unit("postgresql.service")
 machine.wait_for_unit("rustfs.service")
 machine.wait_for_open_port(9000)
@@ -203,6 +217,134 @@ with subtest("re-authorizing the same file returns exists:1 (dedup)"):
         f"-d 'md5=5d41402abc4b2a76b9719d911017c592&filename=t.pdf&filesize=5&mtime=1700000000000' "
         f"| jq -e '.exists == 1'"
     )
+
+with subtest("an unregistered replacement cannot change the live attachment"):
+    old_md5 = "5d41402abc4b2a76b9719d911017c592"
+    world_md5 = "7d793037a0760186574b0282f2f435e7"
+    abandoned = machine.succeed(
+        f"curl -sf -X POST {base}/users/1/items/ATTACH22/file {auth} "
+        f"-H 'If-Match: {old_md5}' "
+        f"-d 'md5={world_md5}&filename=t.pdf&filesize=5&mtime=1700000000001' "
+        f"| jq -r .uploadKey"
+    ).strip()
+    machine.succeed(
+        f"printf world | curl -sf -X POST {base}/uploads/{abandoned} --data-binary @-"
+    )
+    assert (
+        http_code(
+            f"-X POST {base}/uploads/{abandoned} --data-binary 'world'"
+        )
+        == "409"
+    )
+
+    # Uploaded bytes are an immutable candidate. Until registration commits its
+    # DB pointer, readers must still receive the old metadata and old bytes.
+    assert_attachment("ATTACH22", old_md5, "hello", "replacement-before-restart")
+
+    # Losing the in-memory pending token must abandon only the candidate, not
+    # corrupt the registered attachment.
+    machine.succeed("systemctl restart zhost.service")
+    machine.wait_for_unit("zhost.service")
+    machine.wait_for_open_port(8189)
+    assert_attachment("ATTACH22", old_md5, "hello", "replacement-after-restart")
+    assert (
+        http_code(
+            f"-X POST {base}/users/1/items/ATTACH22/file {auth} "
+            f"-H 'If-Match: {old_md5}' -d 'upload={abandoned}'"
+        )
+        == "400"
+    )
+
+    replacement = machine.succeed(
+        f"curl -sf -X POST {base}/users/1/items/ATTACH22/file {auth} "
+        f"-H 'If-Match: {old_md5}' "
+        f"-d 'md5={world_md5}&filename=t.pdf&filesize=5&mtime=1700000000001' "
+        f"| jq -r .uploadKey"
+    ).strip()
+    machine.succeed(
+        f"printf world | curl -sf -X POST {base}/uploads/{replacement} --data-binary @-"
+    )
+    assert (
+        http_code(
+            f"-X POST {base}/users/1/items/ATTACH22/file {auth} "
+            f"-H 'If-Match: {old_md5}' -d 'upload={replacement}'"
+        )
+        == "204"
+    )
+    assert_attachment("ATTACH22", world_md5, "world", "replacement-registered")
+
+with subtest("concurrent replacements compare-and-swap the registered md5"):
+    world_md5 = "7d793037a0760186574b0282f2f435e7"
+    first_md5 = "8b04d5e3775d298e78455efc5ca404d5"
+    other_md5 = "795f3202b17cb6bc3d4b771d8c6c9eaf"
+    version_before = int(library_version())
+
+    first_token = machine.succeed(
+        f"curl -sf -X POST {base}/users/1/items/ATTACH22/file {auth} "
+        f"-H 'If-Match: {world_md5}' "
+        f"-d 'md5={first_md5}&filename=t.pdf&filesize=5&mtime=1700000000002' "
+        f"| jq -r .uploadKey"
+    ).strip()
+    other_token = machine.succeed(
+        f"curl -sf -X POST {base}/users/1/items/ATTACH22/file {auth} "
+        f"-H 'If-Match: {world_md5}' "
+        f"-d 'md5={other_md5}&filename=t.pdf&filesize=5&mtime=1700000000003' "
+        f"| jq -r .uploadKey"
+    ).strip()
+    machine.succeed(
+        f"printf first | curl -sf -X POST {base}/uploads/{first_token} --data-binary @-"
+    )
+    machine.succeed(
+        f"printf other | curl -sf -X POST {base}/uploads/{other_token} --data-binary @-"
+    )
+
+    assert (
+        http_code(
+            f"-X POST {base}/users/1/items/ATTACH22/file {auth} "
+            f"-H 'If-Match: {world_md5}' -d 'upload={first_token}'"
+        )
+        == "204"
+    )
+    version_after_first = int(library_version())
+    assert version_after_first == version_before + 1
+
+    stale_code = machine.succeed(
+        f"curl -s -D /tmp/stale-registration.headers -o /dev/null "
+        f"-w '%{{http_code}}' -X POST "
+        f"{base}/users/1/items/ATTACH22/file {auth} "
+        f"-H 'If-Match: {world_md5}' -d 'upload={other_token}'"
+    ).strip()
+    assert stale_code == "412", stale_code
+    machine.succeed(
+        "grep -i '^last-modified-version:' /tmp/stale-registration.headers "
+        f"| tr -d '\\r' | awk '{{print $2}}' | grep -qx '{version_after_first}'"
+    )
+    assert int(library_version()) == version_after_first
+    assert (
+        http_code(
+            f"-X POST {base}/users/1/items/ATTACH22/file {auth} "
+            f"-H 'If-Match: {world_md5}' -d 'upload={other_token}'"
+        )
+        == "400"
+    )
+    assert int(library_version()) == version_after_first
+    assert_attachment("ATTACH22", first_md5, "first", "replacement-race-winner")
+    machine.succeed(
+        f"curl -sf '{base}/users/1/items?itemKey=ATTACH22&format=json' {auth} "
+        f"| jq -e '.[0].data.md5 == \"{first_md5}\" "
+        f"and .[0].data.version == {version_after_first}'"
+    )
+
+    # Registration tokens are single-use. Upstream returns 400 after removing
+    # a completed upload key.
+    assert (
+        http_code(
+            f"-X POST {base}/users/1/items/ATTACH22/file {auth} "
+            f"-H 'If-Match: {world_md5}' -d 'upload={first_token}'"
+        )
+        == "400"
+    )
+    assert int(library_version()) == version_after_first
 
 with subtest("a file authorization without a precondition header is 428"):
     assert (
