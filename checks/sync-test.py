@@ -836,3 +836,78 @@ with subtest("deletes are recorded in the deletion log"):
     machine.succeed(
         f"curl -sf '{base}/users/1/deleted?since=0' {auth} | jq -e '.items | index(\"ITEM2223\")'"
     )
+
+with subtest("request journal keeps routing evidence without secrets or content"):
+    form_marker = "ZHOST_JOURNAL_FORM_SECRET_9A6C1D"
+    upload_marker = "ZHOST_JOURNAL_UPLOAD_SECRET_7F3C9A"
+    json_marker = "ZHOST_JOURNAL_JSON_SECRET_4D8E2B"
+
+    machine.succeed(f"curl -sf -X POST {base}/keys/sessions -d '{{}}' > /tmp/journal-session")
+    session_token = machine.succeed("jq -r .sessionToken /tmp/journal-session").strip()
+    login_url = machine.succeed("jq -r .loginURL /tmp/journal-session").strip()
+    machine.succeed(f"curl -sf -o /dev/null '{login_url}'")
+    machine.succeed(
+        f"curl -sf -o /dev/null -X POST {base}/login {sso} "
+        f"--data-urlencode 'session={session_token}' "
+        f"--data-urlencode 'marker={form_marker}'"
+    )
+    machine.succeed(
+        f"curl -sf {base}/keys/sessions/{session_token} | jq -e '.status == \"completed\"'"
+    )
+
+    upload_token = machine.succeed(
+        f"curl -sf -X POST {base}/users/1/items/LOGSEC22/file {auth} "
+        f"-H 'If-None-Match: *' "
+        f"-d 'md5=b08aa6d1650e7bc5b03e9fac83121b8f"
+        f"&filename=journal.bin&filesize=34&mtime=1700000000010' "
+        f"| jq -r .uploadKey"
+    ).strip()
+    machine.succeed(
+        f"printf '%s' '{upload_marker}' | "
+        f"curl -sf -X POST {base}/uploads/{upload_token} --data-binary @-"
+    )
+
+    machine.succeed(
+        f"curl -sf -X POST {base}/users/1/items {auth} "
+        f"-H 'Content-Type: application/json' "
+        f"-H 'If-Unmodified-Since-Version: {library_version()}' "
+        f"--data '[{{\"key\":\"LGSEC223\",\"itemType\":\"book\","
+        f"\"title\":\"{json_marker}\"}}]' | jq -e .successful"
+    )
+
+    machine.succeed("journalctl --sync")
+    journal = machine.succeed("journalctl -u zhost.service --no-pager")
+    leaked = [
+        label
+        for label, secret in (
+            ("session token", session_token),
+            ("upload token", upload_token),
+            ("login form", form_marker),
+            ("attachment body", upload_marker),
+            ("JSON body", json_marker),
+            ("API key", "testtoken"),
+        )
+        if secret in journal
+    ]
+    assert not leaked, leaked
+    leaked_fields = [field for field in ("want_md5", "got_md5") if field in journal]
+    assert not leaked_fields, leaked_fields
+    journal_lines = journal.splitlines()
+    assert any(
+        "request" in line
+        and "method=POST" in line
+        and "path=/users/1/items/LOGSEC22/file" in line
+        for line in journal_lines
+    )
+    assert any(
+        "request" in line
+        and "method=GET" in line
+        and "path=/keys/sessions/{token}" in line
+        for line in journal_lines
+    )
+    assert any(
+        "request" in line
+        and "method=POST" in line
+        and "path=/uploads/{token}" in line
+        for line in journal_lines
+    )

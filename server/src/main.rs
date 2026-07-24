@@ -1196,12 +1196,7 @@ async fn upload_put(
         format!("{:x}", Md5::new().chain_update(&body).finalize())
     };
     if body.len() as i64 != upload.filesize || actual_md5 != upload.md5.to_lowercase() {
-        tracing::warn!(
-            key = upload.item_key,
-            want_md5 = upload.md5,
-            got_md5 = actual_md5,
-            "uploaded bytes do not match authorization"
-        );
+        tracing::warn!("uploaded bytes do not match authorization");
         return (
             StatusCode::BAD_REQUEST,
             "uploaded bytes do not match md5/filesize",
@@ -1277,8 +1272,20 @@ async fn file_get(
 
 // --- middleware -------------------------------------------------------------
 
-/// Decode gzip write bodies, log the request, and reject anything without the
-/// configured key except the bootstrap (key/session creation, login) endpoints.
+fn request_log_path(path: &str) -> &str {
+    if path.starts_with("/uploads/") {
+        "/uploads/{token}"
+    } else if path.starts_with("/keys/sessions/") {
+        "/keys/sessions/{token}"
+    } else {
+        path
+    }
+}
+
+/// Decode gzip write bodies, log safe routing metadata, and reject anything
+/// without the configured key except bootstrap endpoints. Query strings, form
+/// values, and content never enter logs because they can hold capability tokens
+/// and private library data.
 async fn log_and_auth(State(state): State<AppState>, req: Request, next: Next) -> Response {
     let (mut parts, body) = req.into_parts();
     let raw = match axum::body::to_bytes(body, MAX_BODY).await {
@@ -1318,17 +1325,17 @@ async fn log_and_auth(State(state): State<AppState>, req: Request, next: Next) -
             .to_string()
     };
     let method = parts.method.clone();
-    let uri = parts.uri.clone();
+    let path = parts.uri.path().to_owned();
+    let log_path = request_log_path(&path).to_owned();
     tracing::info!(
         %method,
-        %uri,
+        path = %log_path,
         api_version = %header("zotero-api-version"),
         if_unmod = %header("if-unmodified-since-version"),
-        body = %String::from_utf8_lossy(&bytes).chars().take(400).collect::<String>(),
+        body_bytes = bytes.len(),
         "request"
     );
 
-    let path = parts.uri.path();
     let mut selected_library = None;
     let is_bootstrap =
         path.starts_with("/keys/sessions") || path.starts_with("/uploads") || path == "/login";
@@ -1341,7 +1348,7 @@ async fn log_and_auth(State(state): State<AppState>, req: Request, next: Next) -
         if path != "/keys/current" && !context.permissions.library {
             return (StatusCode::FORBIDDEN, "library access denied").into_response();
         }
-        match path_user_id(path) {
+        match path_user_id(&path) {
             Ok(Some(path_user_id)) if path_user_id == context.principal.user_id.get() => {}
             Ok(Some(_)) => return (StatusCode::FORBIDDEN, "user access denied").into_response(),
             Err(()) => return StatusCode::NOT_FOUND.into_response(),
@@ -1375,7 +1382,12 @@ async fn log_and_auth(State(state): State<AppState>, req: Request, next: Next) -
     };
     let status = response.status();
     if status.is_client_error() || status.is_server_error() {
-        tracing::warn!(%method, %uri, status = status.as_u16(), "response error");
+        tracing::warn!(
+            %method,
+            path = %log_path,
+            status = status.as_u16(),
+            "response error"
+        );
     }
     response
 }
