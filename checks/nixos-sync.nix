@@ -24,9 +24,8 @@ testPkgs.testers.runNixOSTest {
           readOnly = true;
         };
       };
-      # Only this SSO identity (as forwarded by the front proxy) may authorize a
-      # login; the test simulates the proxy by sending the header directly.
-      loginAuthorizedUser = "owner@mulatta.io";
+      bootstrapOidcIssuer = "https://id.example.test";
+      bootstrapOidcSubject = "owner-subject";
       loginKdfKeyFile = testPkgs.writeText "zhost-login-kdf-key" "0123456789abcdef0123456789abcdef";
       # Attachment bytes go to the local RustFS standing in for S3/R2.
       s3 = {
@@ -56,6 +55,7 @@ testPkgs.testers.runNixOSTest {
       testPkgs.curl
       testPkgs.jq
       testPkgs.gzip
+      testPkgs.postgresql
       # `mc` creates the bucket before the upload subtest.
       testPkgs.minio-client
     ];

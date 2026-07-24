@@ -47,10 +47,6 @@ struct Config {
     public_url: String,
     database_url: String,
     s3: s3::Config,
-    /// If set, `POST /login` requires the front proxy to forward a matching
-    /// authenticated identity (`X-Auth-Request-Email`/`-User`). Unset on a
-    /// private network, where reachability is the gate.
-    login_authorized_user: Option<String>,
 }
 
 #[derive(Clone)]
@@ -431,24 +427,22 @@ async fn login_authorize(
             return (StatusCode::FORBIDDEN, "bad origin").into_response();
         }
     }
-    // When an authorized user is configured, the front SSO proxy must forward a
-    // matching identity. This ties the approval to a proven identity and guards
-    // against a misconfigured/bypassed proxy; unset (a private network) means the
-    // network is the gate. oauth2-proxy forwards the identity differently per
-    // mode: as a reverse proxy (the usual setup) it sets X-Forwarded-Email/-User
-    // on the upstream request (pass-user-headers); in nginx auth_request mode it
-    // sets X-Auth-Request-*. Accept either so the gate works behind both.
-    if let Some(want) = &state.config.login_authorized_user {
-        let identity = headers
-            .get("x-auth-request-email")
-            .or_else(|| headers.get("x-forwarded-email"))
-            .or_else(|| headers.get("x-auth-request-user"))
-            .or_else(|| headers.get("x-forwarded-user"))
-            .and_then(|v| v.to_str().ok());
-        if !identity.is_some_and(|got| got.eq_ignore_ascii_case(want)) {
-            return (StatusCode::FORBIDDEN, "not an authorized user").into_response();
-        }
-    }
+    // Trusted reverse proxy must strip caller-supplied copies and overwrite both
+    // headers from verified OIDC claims. Email/user headers are never identity
+    // keys: only an exact issuer+subject row can approve enrollment.
+    let claim = |name| {
+        let mut values = headers.get_all(name).iter();
+        let value = values
+            .next()?
+            .to_str()
+            .ok()
+            .filter(|value| !value.is_empty())?;
+        values.next().is_none().then_some(value)
+    };
+    let claims = claim("x-zhost-oidc-issuer").zip(claim("x-zhost-oidc-subject"));
+    let Some((issuer, subject)) = claims else {
+        return (StatusCode::FORBIDDEN, "missing verified OIDC identity").into_response();
+    };
     let Some(token) = form.get("session") else {
         return (StatusCode::BAD_REQUEST, "missing session").into_response();
     };
@@ -464,7 +458,8 @@ async fn login_authorize(
         &state.pool,
         &token_hash(token),
         &token_hash(&api_key),
-        state.config.user_id,
+        issuer,
+        subject,
     )
     .await
     {
@@ -1657,6 +1652,12 @@ async fn main() {
 
     let keys = load_keys();
     let bind = std::env::var("ZHOST_BIND").unwrap_or_else(|_| "127.0.0.1:8189".into());
+    let bind_address: std::net::SocketAddr =
+        bind.parse().expect("ZHOST_BIND must be a socket address");
+    assert!(
+        bind_address.ip().is_loopback(),
+        "ZHOST_BIND must be loopback so only the trusted local proxy can set OIDC headers"
+    );
     let user_id = std::env::var("ZHOST_USER_ID")
         .ok()
         .and_then(|v| v.parse().ok())
@@ -1678,9 +1679,6 @@ async fn main() {
             .or_else(|_| std::env::var("DATABASE_URL"))
             .unwrap_or_else(|_| "postgres://localhost/zhost".into()),
         s3: load_s3(),
-        login_authorized_user: std::env::var("ZHOST_LOGIN_AUTHORIZED_USER")
-            .ok()
-            .filter(|s| !s.is_empty()),
     });
 
     let pool = store::connect(&config.database_url)
@@ -1695,6 +1693,17 @@ async fn main() {
     )
     .await
     .expect("bootstrap identity");
+    let bootstrap_oidc_issuer = std::env::var("ZHOST_BOOTSTRAP_OIDC_ISSUER").ok();
+    let bootstrap_oidc_subject = std::env::var("ZHOST_BOOTSTRAP_OIDC_SUBJECT").ok();
+    match (bootstrap_oidc_issuer, bootstrap_oidc_subject) {
+        (Some(issuer), Some(subject)) if !issuer.is_empty() && !subject.is_empty() => {
+            store::bootstrap_external_identity(&pool, &issuer, &subject, config.user_id)
+                .await
+                .expect("bootstrap external identity");
+        }
+        (None, None) => {}
+        _ => panic!("bootstrap OIDC issuer and subject must both be nonempty"),
+    }
     let storage = Arc::new(s3::Storage::new(&config.s3).expect("init object storage"));
     let state = AppState {
         config,

@@ -5,10 +5,23 @@ each run boots a VM."""
 base = "http://localhost:8189"
 auth = "-H 'Zotero-API-Key: testtoken' -H 'Zotero-API-Version: 3'"
 readonly = "-H 'Zotero-API-Key: readonlytoken' -H 'Zotero-API-Version: 3'"
+oidc_issuer = "https://id.example.test"
+oidc_subject = "owner-subject"
+oidc = (
+    f"-H 'X-Zhost-OIDC-Issuer: {oidc_issuer}' "
+    f"-H 'X-Zhost-OIDC-Subject: {oidc_subject}'"
+)
 
 
 def http_code(args):
     return machine.succeed(f"curl -s -o /dev/null -w '%{{http_code}}' {args}").strip()
+
+
+def psql(sql):
+    escaped = sql.replace("'", "'\"'\"'")
+    return machine.succeed(
+        f"sudo -u zhost psql -v ON_ERROR_STOP=1 -At -d zhost -c '{escaped}'"
+    ).strip()
 
 
 def library_version():
@@ -45,9 +58,24 @@ machine.succeed("mc mb s3/zotero")
 with subtest("the module deploys a working service backed by postgres"):
     assert http_code(f"{base}/keys/current {auth}") == "200"
 
-# The front SSO proxy (oauth2-proxy/kanidm) forwards this header; loginAuthorizedUser
-# is set to it, so the consent POST must carry it to authorize.
-sso = "-H 'X-Auth-Request-Email: owner@mulatta.io'"
+with subtest("bootstrap OIDC identity owns the default personal library"):
+    assert (
+        psql(
+            f"""select user_id = 1
+                from external_identities
+                where issuer = '{oidc_issuer}' and subject = '{oidc_subject}'"""
+        )
+        == "t"
+    )
+    assert (
+        psql(
+            """select count(*) = 1
+               from external_identities
+               where user_id = 1"""
+        )
+        == "t"
+    )
+    assert psql("select library_id from personal_libraries where user_id = 1") == "1"
 
 with subtest("login session hands out the key only after authorization"):
     machine.succeed(f"curl -sf -X POST {base}/keys/sessions -d '{{}}' > /tmp/sess")
@@ -65,18 +93,48 @@ with subtest("login session hands out the key only after authorization"):
     machine.succeed(f"curl -sf {base}/keys/sessions/{token} | jq -e '.status == \"pending\"'")
     # A cross-site form POST (foreign Origin) is refused even with a valid identity.
     assert (
-        http_code(f"-X POST {base}/login -H 'Origin: https://evil.example' {sso} -d 'session={token}'")
+        http_code(f"-X POST {base}/login -H 'Origin: https://evil.example' {oidc} -d 'session={token}'")
         == "403"
     )
-    # Without the SSO identity the front proxy forwards, the POST is refused.
-    assert http_code(f"-X POST {base}/login -d 'session={token}'") == "403"
-    # A non-authorized identity is refused.
-    assert (
-        http_code(f"-X POST {base}/login -H 'X-Auth-Request-Email: someone@else' -d 'session={token}'")
-        == "403"
+    # Authorization requires both stable OIDC claims and their exact configured pair.
+    rejected_identities = (
+        "",
+        f"-H 'X-Zhost-OIDC-Issuer: {oidc_issuer}'",
+        f"-H 'X-Zhost-OIDC-Subject: {oidc_subject}'",
+        (
+            f"-H 'X-Zhost-OIDC-Issuer: {oidc_issuer}' "
+            f"-H 'X-Zhost-OIDC-Issuer: {oidc_issuer}' "
+            f"-H 'X-Zhost-OIDC-Subject: {oidc_subject}'"
+        ),
+        (
+            f"-H 'X-Zhost-OIDC-Issuer: {oidc_issuer}' "
+            f"-H 'X-Zhost-OIDC-Subject: {oidc_subject}' "
+            f"-H 'X-Zhost-OIDC-Subject: {oidc_subject}'"
+        ),
+        "-H 'X-Auth-Request-Email: owner@mulatta.io'",
+        (
+            f"-H 'X-Zhost-OIDC-Issuer: {oidc_issuer}' "
+            "-H 'X-Zhost-OIDC-Subject: unknown-subject'"
+        ),
+        (
+            "-H 'X-Zhost-OIDC-Issuer: https://other-id.example.test' "
+            f"-H 'X-Zhost-OIDC-Subject: {oidc_subject}'"
+        ),
     )
-    # The consent POST (Approve) with the authorized identity completes the flow.
-    machine.succeed(f"curl -sf -X POST {base}/login {sso} -d 'session={token}'")
+    for identity_headers in rejected_identities:
+        assert (
+            http_code(
+                f"-X POST {base}/login {identity_headers} -d 'session={token}'"
+            )
+            == "403"
+        )
+        machine.succeed(
+            f"curl -sf {base}/keys/sessions/{token} "
+            "| jq -e '.status == \"pending\" and .apiKey == null'"
+        )
+
+    # The consent POST (Approve) with the exact identity completes the flow.
+    machine.succeed(f"curl -sf -X POST {base}/login {oidc} -d 'session={token}'")
     machine.succeed(f"curl -sf {base}/keys/sessions/{token} > /tmp/completed-session")
     login_key = machine.succeed("jq -r .apiKey /tmp/completed-session").strip()
     assert len(login_key) == 24
@@ -121,7 +179,7 @@ with subtest("login session hands out the key only after authorization"):
 with subtest("the login consent endpoint validates the session token"):
     assert http_code(f"{base}/login") == "400"  # missing ?session
     assert http_code(f"{base}/login?session=nope") == "404"  # unknown session
-    assert http_code(f"-X POST {base}/login {sso} -d 'session=nope'") == "404"
+    assert http_code(f"-X POST {base}/login {oidc} -d 'session=nope'") == "404"
     assert http_code(f"{base}/keys/sessions/nope") == "404"
 
 with subtest("groups endpoint returns an empty set (single personal library)"):
@@ -887,7 +945,7 @@ with subtest("request journal keeps routing evidence without secrets or content"
     login_url = machine.succeed("jq -r .loginURL /tmp/journal-session").strip()
     machine.succeed(f"curl -sf -o /dev/null '{login_url}'")
     machine.succeed(
-        f"curl -sf -o /dev/null -X POST {base}/login {sso} "
+        f"curl -sf -o /dev/null -X POST {base}/login {oidc} "
         f"--data-urlencode 'session={session_token}' "
         f"--data-urlencode 'marker={form_marker}'"
     )

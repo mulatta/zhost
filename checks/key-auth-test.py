@@ -13,7 +13,17 @@ bob_full = "BobFllAB23456789CdEfGhJK"
 bob_notes_write = "BobNwrtAB23456789CdEfGh"
 revoked = "RevokedK23456789AbCdEfGh"
 api_headers = "-H 'Zotero-API-Version: 3' -H 'Zotero-Schema-Version: 42'"
-sso = "-H 'X-Auth-Request-Email: owner@mulatta.io'"
+oidc_issuer = "https://id.example.test"
+oidc_subject = "alice-subject"
+oidc_bob_subject = "bob-subject"
+oidc = (
+    f"-H 'X-Zhost-OIDC-Issuer: {oidc_issuer}' "
+    f"-H 'X-Zhost-OIDC-Subject: {oidc_subject}'"
+)
+oidc_bob = (
+    f"-H 'X-Zhost-OIDC-Issuer: {oidc_issuer}' "
+    f"-H 'X-Zhost-OIDC-Subject: {oidc_bob_subject}'"
+)
 
 
 def psql(sql):
@@ -46,10 +56,11 @@ def create_login_session():
     )["sessionToken"]
 
 
-def approve_login_session(token):
+def approve_login_session(token, identity_headers=None):
+    headers = oidc if identity_headers is None else identity_headers
     return machine.succeed(
         f"curl -s -o /dev/null -w '%{{http_code}}' -X POST "
-        f"{base}/login {sso} -d 'session={token}'"
+        f"{base}/login {headers} -d 'session={token}'"
     ).strip()
 
 
@@ -167,6 +178,35 @@ with subtest("bootstrap identity owns the legacy personal library"):
     assert psql("select display_name from users where id = 101") == "Alice"
     assert psql("select library_id from personal_libraries where user_id = 101") == "1"
     assert psql("select kind from library where id = 1") == "personal"
+    assert (
+        psql(
+            f"""select user_id = 101
+                from external_identities
+                where issuer = '{oidc_issuer}' and subject = '{oidc_subject}'"""
+        )
+        == "t"
+    )
+    assert (
+        psql(
+            """select count(*) = 1
+               from external_identities
+               where user_id = 101"""
+        )
+        == "t"
+    )
+
+with subtest("bootstrap OIDC identity remains unique across restarts"):
+    machine.succeed("systemctl restart zhost.service")
+    machine.wait_for_unit("zhost.service")
+    machine.wait_for_open_port(8189)
+    assert (
+        psql(
+            f"""select count(*) = 1 and min(user_id) = 101
+                from external_identities
+                where issuer = '{oidc_issuer}' and subject = '{oidc_subject}'"""
+        )
+        == "t"
+    )
 
 # Seed two DB-owned keys. Only SHA-256 digests enter PostgreSQL.
 psql(
@@ -174,6 +214,10 @@ psql(
        values (202, 'bob', 'Bob')"""
 )
 psql("insert into personal_libraries (user_id, library_id) values (202, 22)")
+psql(
+    f"""insert into external_identities (issuer, subject, user_id)
+        values ('{oidc_issuer}', '{oidc_bob_subject}', 202)"""
+)
 psql("update library set version = 3 where id = 22")
 psql(
     """insert into object (library_id, kind, key, version, data)
@@ -319,6 +363,59 @@ with subtest("static recovery key remains bound to the bootstrap user"):
         }}'"""
     )
 
+with subtest("OIDC approval requires the exact bootstrap identity"):
+    rejected_session = create_login_session()
+    rejected_hash = sha256_hex(rejected_session)
+    alice_keys_before_rejection = psql(
+        "select count(*) from api_keys where user_id = 101"
+    )
+    rejected_identities = (
+        "",
+        f"-H 'X-Zhost-OIDC-Issuer: {oidc_issuer}'",
+        f"-H 'X-Zhost-OIDC-Subject: {oidc_subject}'",
+        (
+            f"-H 'X-Zhost-OIDC-Issuer: {oidc_issuer}' "
+            f"-H 'X-Zhost-OIDC-Issuer: {oidc_issuer}' "
+            f"-H 'X-Zhost-OIDC-Subject: {oidc_subject}'"
+        ),
+        (
+            f"-H 'X-Zhost-OIDC-Issuer: {oidc_issuer}' "
+            f"-H 'X-Zhost-OIDC-Subject: {oidc_subject}' "
+            f"-H 'X-Zhost-OIDC-Subject: {oidc_subject}'"
+        ),
+        "-H 'X-Auth-Request-Email: owner@mulatta.io'",
+        (
+            f"-H 'X-Zhost-OIDC-Issuer: {oidc_issuer}' "
+            "-H 'X-Zhost-OIDC-Subject: unknown-subject'"
+        ),
+        (
+            "-H 'X-Zhost-OIDC-Issuer: https://other-id.example.test' "
+            f"-H 'X-Zhost-OIDC-Subject: {oidc_subject}'"
+        ),
+        (
+            f"-H 'X-Zhost-OIDC-Issuer: {oidc_issuer}/' "
+            f"-H 'X-Zhost-OIDC-Subject: {oidc_subject}'"
+        ),
+    )
+    for identity_headers in rejected_identities:
+        assert approve_login_session(rejected_session, identity_headers) == "403"
+
+    rejected_result = poll_login_session(rejected_session)
+    assert rejected_result["status"] == "pending"
+    assert "apiKey" not in rejected_result or rejected_result["apiKey"] is None
+    assert (
+        psql("select count(*) from api_keys where user_id = 101")
+        == alice_keys_before_rejection
+    )
+    assert (
+        psql(
+            f"""select status = 'pending' and api_key_id is null
+                from login_sessions
+                where token_hash = decode('{rejected_hash}', 'hex')"""
+        )
+        == "t"
+    )
+
 with subtest("browser login mints distinct hashed full-access keys for Alice"):
     initial_alice_keys = int(psql("select count(*) from api_keys where user_id = 101"))
     first_session = create_login_session()
@@ -434,6 +531,45 @@ with subtest("browser login mints distinct hashed full-access keys for Alice"):
         == "0"
     )
     assert http_code("/keys/current", recovery) == "200"
+
+with subtest("mapped non-bootstrap OIDC identity mints a key for Bob"):
+    initial_bob_keys = int(psql("select count(*) from api_keys where user_id = 202"))
+    bob_session = create_login_session()
+    assert approve_login_session(bob_session, oidc_bob) == "200"
+    bob_result = poll_login_session(bob_session)
+    assert bob_result["status"] == "completed"
+    assert bob_result["userID"] == 202 and bob_result["username"] == "bob"
+    bob_login_key = bob_result["apiKey"]
+    assert len(bob_login_key) == 24
+    assert set(bob_login_key) <= set("23456789ABCDEFGHIJKLMNPQRSTUVWXYZ")
+    assert int(psql("select count(*) from api_keys where user_id = 202")) == initial_bob_keys + 1
+    assert (
+        psql(
+            f"""select ls.status = 'completed'
+                       and ls.user_id = 202
+                       and ls.api_key_id = k.id
+                       and k.user_id = 202
+                       and encode(k.token_hash, 'hex') = '{sha256_hex(bob_login_key)}'
+                       and p.library and p.notes and p.write and p.files
+                from login_sessions ls
+                join api_keys k on k.id = ls.api_key_id
+                join api_key_user_permissions p on p.api_key_id = k.id
+                where ls.token_hash = decode('{sha256_hex(bob_session)}', 'hex')"""
+        )
+        == "t"
+    )
+    machine.succeed(
+        f"""curl -sf {api_headers} -H 'Zotero-API-Key: {bob_login_key}' {base}/keys/current |
+        jq -e '. == {{
+          "key":"{bob_login_key}",
+          "userID":202,
+          "username":"bob",
+          "displayName":"Bob",
+          "access":{{"user":{{
+            "library":true,"files":true,"notes":true,"write":true
+          }}}}
+        }}'"""
+    )
 
 with subtest("expired login sessions are terminal without minting a key"):
     expired_session = create_login_session()
@@ -749,5 +885,35 @@ with subtest("revocation takes effect on the next request"):
     assert http_code("/keys/current", alice) == "403"
 
 with subtest("database stores only fixed-length key digests"):
-    assert psql("select count(*) from api_keys where octet_length(token_hash) = 32") == "8"
+    assert psql("select count(*) from api_keys where octet_length(token_hash) = 32") == "9"
     assert psql("select count(*) from api_keys where encode(token_hash, 'escape') like '%token%'") == "0"
+
+with subtest("bootstrap OIDC ownership conflict fails startup closed"):
+    machine.succeed("systemctl stop zhost.service")
+    psql(
+        f"""update external_identities
+            set user_id = 202
+            where issuer = '{oidc_issuer}' and subject = '{oidc_subject}'"""
+    )
+    machine.succeed("systemctl start zhost.service >/dev/null 2>&1 || true")
+    machine.wait_until_fails("systemctl is-active --quiet zhost.service")
+    machine.succeed("systemctl is-failed --quiet zhost.service")
+    assert (
+        psql(
+            f"""select user_id
+                from external_identities
+                where issuer = '{oidc_issuer}' and subject = '{oidc_subject}'"""
+        )
+        == "202"
+    )
+
+    psql(
+        f"""update external_identities
+            set user_id = 101
+            where issuer = '{oidc_issuer}' and subject = '{oidc_subject}'"""
+    )
+    machine.succeed("systemctl reset-failed zhost.service")
+    machine.succeed("systemctl start zhost.service")
+    machine.wait_for_unit("zhost.service")
+    machine.wait_for_open_port(8189)
+    assert http_code("/keys/current", recovery) == "200"
