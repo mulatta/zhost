@@ -61,12 +61,19 @@ struct AppState {
 
 tokio::task_local! {
     static REQUEST_LIBRARY: LibraryId;
+    static REQUEST_PERMISSIONS: Permissions;
 }
 
 fn request_library() -> LibraryId {
     REQUEST_LIBRARY
         .try_with(|library_id| *library_id)
         .expect("library store access requires authenticated request context")
+}
+
+fn request_permissions() -> Permissions {
+    REQUEST_PERMISSIONS
+        .try_with(|permissions| *permissions)
+        .expect("permission-aware access requires authenticated request context")
 }
 
 fn storage_key(library_id: LibraryId, item_key: &str) -> String {
@@ -484,13 +491,13 @@ async fn read(state: &AppState, kind: &str, params: HashMap<String, String>) -> 
         let current = store::current_version(&state.pool, request_library())
             .await
             .unwrap_or(0);
-        return match store::versions(&state.pool, request_library(), kind, since).await {
+        return match store::versions(&state.pool, request_library(), kind, since, true).await {
             Ok(value) => (version_headers(current), Json(value)).into_response(),
             Err(error) => server_error("read", error),
         };
     }
     let keys = csv_of(&params, &format!("{kind}Key"));
-    match store::objects(&state.pool, request_library(), kind, &keys).await {
+    match store::objects(&state.pool, request_library(), kind, &keys, true).await {
         Ok(value) => (current_headers(state).await, Json(value)).into_response(),
         Err(error) => server_error("read", error),
     }
@@ -511,9 +518,22 @@ async fn item_sync_read(state: &AppState, params: &query::Params, top: bool) -> 
             .await
             .unwrap_or(0);
         let result = if top {
-            store::top_versions(&state.pool, request_library(), since).await
+            store::top_versions(
+                &state.pool,
+                request_library(),
+                since,
+                request_permissions().notes,
+            )
+            .await
         } else {
-            store::versions(&state.pool, request_library(), "item", since).await
+            store::versions(
+                &state.pool,
+                request_library(),
+                "item",
+                since,
+                request_permissions().notes,
+            )
+            .await
         };
         return Some(match result {
             Ok(value) => (version_headers(current), Json(value)).into_response(),
@@ -523,7 +543,15 @@ async fn item_sync_read(state: &AppState, params: &query::Params, top: bool) -> 
     if let Some(csv) = params.get("itemKey") {
         let keys: Vec<String> = csv.split(',').map(String::from).collect();
         return Some(
-            match store::objects(&state.pool, request_library(), "item", &keys).await {
+            match store::objects(
+                &state.pool,
+                request_library(),
+                "item",
+                &keys,
+                request_permissions().notes,
+            )
+            .await
+            {
                 Ok(value) => (current_headers(state).await, Json(value)).into_response(),
                 Err(error) => server_error("items batch", error),
             },
@@ -541,7 +569,14 @@ async fn item_listing(
     raw: Option<&str>,
     q: &query::ItemQuery,
 ) -> Response {
-    match store::query_items(&state.pool, request_library(), q).await {
+    match store::query_items(
+        &state.pool,
+        request_library(),
+        q,
+        request_permissions().notes,
+    )
+    .await
+    {
         Ok((items, total)) => {
             let mut headers = current_headers(state).await;
             headers.insert("total-results", total.to_string().parse().unwrap());
@@ -579,7 +614,14 @@ async fn item_keys_response(
         return None;
     }
     Some(
-        match store::item_keys(&state.pool, request_library(), q).await {
+        match store::item_keys(
+            &state.pool,
+            request_library(),
+            q,
+            request_permissions().notes,
+        )
+        .await
+        {
             // A `String` body sets `Content-Type: text/plain`, which is what the
             // client expects; current_headers adds `Last-Modified-Version`.
             Ok(keys) => (current_headers(state).await, keys.join("\n")).into_response(),
@@ -1245,11 +1287,6 @@ async fn log_and_auth(State(state): State<AppState>, req: Request, next: Next) -
         if path != "/keys/current" && !context.permissions.library {
             return (StatusCode::FORBIDDEN, "library access denied").into_response();
         }
-        // Note/annotation filtering is a separate store contract. Until that
-        // resolver lands, fail closed for keys that explicitly omit notes.
-        if path.starts_with("/users/") && !context.permissions.notes {
-            return (StatusCode::FORBIDDEN, "notes access denied").into_response();
-        }
         match path_user_id(path) {
             Ok(Some(path_user_id)) if path_user_id == context.principal.user_id.get() => {}
             Ok(Some(_)) => return (StatusCode::FORBIDDEN, "user access denied").into_response(),
@@ -1266,13 +1303,20 @@ async fn log_and_auth(State(state): State<AppState>, req: Request, next: Next) -
         if mutating && !context.permissions.write {
             return (StatusCode::FORBIDDEN, "read-only API key").into_response();
         }
-        selected_library = Some(context.principal.library_id);
+        selected_library = Some((context.principal.library_id, context.permissions));
         parts.extensions.insert(context);
     }
 
     let request = Request::from_parts(parts, Body::from(bytes));
     let response = match selected_library {
-        Some(library_id) => REQUEST_LIBRARY.scope(library_id, next.run(request)).await,
+        Some((library_id, permissions)) => {
+            REQUEST_LIBRARY
+                .scope(
+                    library_id,
+                    REQUEST_PERMISSIONS.scope(permissions, next.run(request)),
+                )
+                .await
+        }
         None => next.run(request).await,
     };
     let status = response.status();

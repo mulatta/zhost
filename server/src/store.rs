@@ -326,14 +326,17 @@ pub async fn versions(
     library_id: LibraryId,
     kind: &str,
     since: i64,
+    include_notes: bool,
 ) -> sqlx::Result<Value> {
     let rows = sqlx::query(
         "select key, version from object \
-         where library_id = $1 and kind = $2 and version > $3",
+         where library_id = $1 and kind = $2 and version > $3 \
+         and ($4 or kind <> 'item' or item_type is distinct from 'note')",
     )
     .bind(library_id.get())
     .bind(kind)
     .bind(since)
+    .bind(include_notes)
     .fetch_all(pool)
     .await?;
     Ok(version_map(rows, "key"))
@@ -342,13 +345,20 @@ pub async fn versions(
 /// `{key: version}` for top-level items changed after `since`. The client's
 /// sync fetches top-level items first (a parent-first phase), so this is the
 /// top-filtered counterpart of `versions(pool, library_id, "item", since)`.
-pub async fn top_versions(pool: &PgPool, library_id: LibraryId, since: i64) -> sqlx::Result<Value> {
+pub async fn top_versions(
+    pool: &PgPool,
+    library_id: LibraryId,
+    since: i64,
+    include_notes: bool,
+) -> sqlx::Result<Value> {
     let rows = sqlx::query(
         "select key, version from object \
-         where library_id = $1 and kind = 'item' and is_top and version > $2",
+         where library_id = $1 and kind = 'item' and is_top and version > $2 \
+         and ($3 or item_type is distinct from 'note')",
     )
     .bind(library_id.get())
     .bind(since)
+    .bind(include_notes)
     .fetch_all(pool)
     .await?;
     Ok(version_map(rows, "key"))
@@ -360,14 +370,17 @@ pub async fn objects(
     library_id: LibraryId,
     kind: &str,
     keys: &[String],
+    include_notes: bool,
 ) -> sqlx::Result<Value> {
     let rows = sqlx::query(
         "select key, version, data from object \
-         where library_id = $1 and kind = $2 and key = any($3)",
+         where library_id = $1 and kind = $2 and key = any($3) \
+         and ($4 or kind <> 'item' or item_type is distinct from 'note')",
     )
     .bind(library_id.get())
     .bind(kind)
     .bind(keys)
+    .bind(include_notes)
     .fetch_all(pool)
     .await?;
     Ok(Value::Array(rows.into_iter().map(object_json).collect()))
@@ -386,10 +399,21 @@ fn escape_like(term: &str) -> String {
 /// they always filter identically. Filters compare the generated columns from
 /// migration 0006 (item_type/is_top/deleted/search_text/tag_names/…), so they
 /// are plain indexed comparisons rather than jsonb digging.
-fn push_item_filters(sql: &mut QueryBuilder<Postgres>, library_id: LibraryId, q: &ItemQuery) {
+fn push_item_filters(
+    sql: &mut QueryBuilder<Postgres>,
+    library_id: LibraryId,
+    q: &ItemQuery,
+    include_notes: bool,
+) {
     sql.push("library_id = ")
         .push_bind(library_id.get())
         .push(" and kind = 'item'");
+
+    // Zotero's notes capability hides note items from every item search shape.
+    // Annotations remain visible: upstream treats only itemType=note as scoped.
+    if !include_notes {
+        sql.push(" and item_type is distinct from 'note'");
+    }
 
     // Trash handling: /items/trash returns only trashed items; otherwise trashed
     // items are excluded unless includeTrashed is set.
@@ -456,14 +480,15 @@ pub async fn query_items(
     pool: &PgPool,
     library_id: LibraryId,
     q: &ItemQuery,
+    include_notes: bool,
 ) -> sqlx::Result<(Vec<Value>, i64)> {
     let mut count: QueryBuilder<Postgres> = QueryBuilder::new("select count(*) from object where ");
-    push_item_filters(&mut count, library_id, q);
+    push_item_filters(&mut count, library_id, q, include_notes);
     let total: i64 = count.build().fetch_one(pool).await?.get(0);
 
     let mut sql: QueryBuilder<Postgres> =
         QueryBuilder::new("select key, version, data from object where ");
-    push_item_filters(&mut sql, library_id, q);
+    push_item_filters(&mut sql, library_id, q, include_notes);
     // order_expr/sql() are fixed strings (no user input), so pushing them raw is
     // safe; nulls sort last so items missing the sort field don't lead.
     sql.push(" order by ")
@@ -493,9 +518,10 @@ pub async fn item_keys(
     pool: &PgPool,
     library_id: LibraryId,
     q: &ItemQuery,
+    include_notes: bool,
 ) -> sqlx::Result<Vec<String>> {
     let mut sql: QueryBuilder<Postgres> = QueryBuilder::new("select key from object where ");
-    push_item_filters(&mut sql, library_id, q);
+    push_item_filters(&mut sql, library_id, q, include_notes);
     sql.push(" order by key");
     let keys = sql
         .build()
@@ -510,6 +536,8 @@ pub async fn item_keys(
 /// Distinct tags across non-trashed items with their item counts, as
 /// `[{tag, numItems}]` ordered by tag. Backs the CLI-facing `/tags` listing.
 pub async fn tags(pool: &PgPool, library_id: LibraryId) -> sqlx::Result<Value> {
+    // Upstream treats /tags as library metadata rather than an item search, so
+    // note-only tags and their linked-item counts are not notes-filtered.
     // Unnest the generated tag_names column (already guards malformed data).
     let rows = sqlx::query(
         "select tag, count(*) as num \
