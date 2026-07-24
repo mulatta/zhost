@@ -2,7 +2,7 @@ use sqlx::{PgPool, Row};
 
 use crate::domain::UserId;
 
-use super::principal_from_row;
+use super::identity::principal_from_row;
 
 pub enum LoginSession {
     Pending,
