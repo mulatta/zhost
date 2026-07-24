@@ -91,7 +91,7 @@ async fn main() {
 
 #[cfg(test)]
 mod middleware_tests {
-    use super::{is_group_discovery_path, path_group_data_id};
+    use crate::http::validation::{is_group_discovery_path, path_group_data_id};
 
     #[test]
     fn group_permission_bypass_is_limited_to_discovery_routes() {
