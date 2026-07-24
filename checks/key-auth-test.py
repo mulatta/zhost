@@ -303,6 +303,17 @@ psql(
 )
 psql(
     """insert into object (library_id, kind, key, version, data)
+       values
+       (1, 'item', 'GRPBKK22', 7,
+        '{"key":"GRPBKK22","version":7,"itemType":"book",
+          "title":"Personal collision fixture"}')"""
+)
+psql(
+    """insert into setting (library_id, key, version, value)
+       values (33, 'groupSetting', 17, '"shared"')"""
+)
+psql(
+    """insert into object (library_id, kind, key, version, data)
        values (22, 'item', 'LEGACY22', 3,
                '{"key":"LEGACY22","version":3,"itemType":"book",
                  "title":"Bob private item",
@@ -559,6 +570,7 @@ with subtest("membership removal immediately revokes explicit group discovery"):
     )
     assert get_json("/users/202/groups?format=versions", bob) == {}
     assert http_code("/groups/303", bob) == "404"
+    assert http_code("/groups/303/items?format=versions", bob) == "403"
     assert get_json("/users/202/groups?format=versions", alice) == {}
     assert get_json("/users/101/groups?format=versions", bob) == {}
     assert get_json("/users/101/groups?format=versions", alice) == {"303": 4}
@@ -581,6 +593,40 @@ with subtest("a disabled private-group owner hides the group from members"):
     psql("update users set disabled_at = null where id = 101")
     assert get_json("/users/202/groups?format=versions", bob) == {"303": 4}
     assert http_code("/groups/303", bob) == "200"
+
+with subtest("group data routes resolve the authorized group library"):
+    expected_group_versions = {
+        "GRPBKK22": 17,
+        "GRPTRS22": 17,
+    }
+    assert (
+        get_json("/groups/303/items?format=versions&since=0", bob)
+        == expected_group_versions
+    )
+    assert (
+        get_json("/groups/303/items?format=versions&since=0", alice)
+        == expected_group_versions
+    )
+    assert (
+        get_json("/groups/303/items?format=versions&since=0", recovery)
+        == expected_group_versions
+    )
+    group_items = get_json(
+        "/groups/303/items?itemKey=GRPBKK22,GRPTRS22&format=json", bob
+    )
+    assert {entry["key"] for entry in group_items} == {"GRPBKK22", "GRPTRS22"}
+    assert next(
+        entry for entry in group_items if entry["key"] == "GRPBKK22"
+    )["data"]["title"] == "Group fixture item"
+    assert get_json("/groups/303/settings", bob)["groupSetting"]["value"] == "shared"
+    assert get_json("/groups/303/collections?format=versions", bob) == {}
+    assert get_json("/groups/303/searches?format=versions", bob) == {}
+    assert get_json("/groups/303/fulltext?format=versions", bob) == {}
+    assert get_json("/groups/303/tags", bob) == []
+    deleted = get_json("/groups/303/deleted?since=0", bob)
+    assert all(not values for values in deleted.values())
+    assert http_code("/groups/303/items?format=versions", bob_full) == "403"
+    assert http_code("/groups/999/items?format=versions", alice) == "404"
 
 with subtest("static recovery key remains bound to the bootstrap user"):
     machine.succeed(
