@@ -66,6 +66,12 @@ fn request_library() -> LibraryId {
         .expect("library store access requires authenticated request context")
 }
 
+fn request_access() -> LibraryAccess {
+    REQUEST_ACCESS
+        .try_with(|access| *access)
+        .expect("library access requires authenticated request context")
+}
+
 fn request_permissions() -> Permissions {
     REQUEST_ACCESS
         .try_with(|access| access.permissions)
@@ -989,8 +995,19 @@ async fn write(state: &AppState, kind: &str, headers: HeaderMap, body: Bytes) ->
         Ok(v) => v,
         Err(resp) => return resp,
     };
-    match store::write(&state.pool, request_library(), kind, batch, Some(expected)).await {
-        Ok(store::Outcome::Done((version, successful))) => (
+    let access = request_access();
+    let allow_stored_file_write = access.group_id.is_none() || access.file_write;
+    match store::write(
+        &state.pool,
+        access.library_id,
+        kind,
+        batch,
+        Some(expected),
+        allow_stored_file_write,
+    )
+    .await
+    {
+        Ok(store::ObjectMutation::Done((version, successful))) => (
             version_headers(version),
             Json(json!({
                 "successful": successful,
@@ -1000,7 +1017,10 @@ async fn write(state: &AppState, kind: &str, headers: HeaderMap, body: Bytes) ->
             })),
         )
             .into_response(),
-        Ok(store::Outcome::Conflict(current)) => conflict(current),
+        Ok(store::ObjectMutation::Conflict(current)) => conflict(current),
+        Ok(store::ObjectMutation::FileWriteDenied) => {
+            (StatusCode::FORBIDDEN, "group file editing denied").into_response()
+        }
         Err(error) => server_error("write", error),
     }
 }
@@ -1016,11 +1036,25 @@ async fn delete(
         Err(resp) => return resp,
     };
     let keys = csv_of(&params, &format!("{kind}Key"));
-    match store::delete(&state.pool, request_library(), kind, &keys, Some(expected)).await {
-        Ok(store::Outcome::Done(version)) => {
+    let access = request_access();
+    let allow_stored_file_write = access.group_id.is_none() || access.file_write;
+    match store::delete(
+        &state.pool,
+        access.library_id,
+        kind,
+        &keys,
+        Some(expected),
+        allow_stored_file_write,
+    )
+    .await
+    {
+        Ok(store::ObjectMutation::Done(version)) => {
             (StatusCode::NO_CONTENT, version_headers(version)).into_response()
         }
-        Ok(store::Outcome::Conflict(current)) => conflict(current),
+        Ok(store::ObjectMutation::Conflict(current)) => conflict(current),
+        Ok(store::ObjectMutation::FileWriteDenied) => {
+            (StatusCode::FORBIDDEN, "group file editing denied").into_response()
+        }
         Err(error) => server_error("delete", error),
     }
 }
@@ -1043,6 +1077,20 @@ async fn settings_read(
     }
 }
 
+fn group_admin_setting_denied<'a>(
+    access: LibraryAccess,
+    keys: impl Iterator<Item = &'a str>,
+) -> bool {
+    const ADMIN_ONLY: [&str; 3] = [
+        "attachmentRenameTemplate",
+        "autoRenameFiles",
+        "autoRenameFilesFileTypes",
+    ];
+    access.group_id.is_some()
+        && !access.is_admin
+        && keys.into_iter().any(|key| ADMIN_ONLY.contains(&key))
+}
+
 async fn settings_write(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1053,6 +1101,15 @@ async fn settings_write(
         Err(resp) => return resp,
     };
     let value: Value = serde_json::from_slice(&body).unwrap_or_else(|_| json!({}));
+    if group_admin_setting_denied(
+        request_access(),
+        value
+            .as_object()
+            .into_iter()
+            .flat_map(|settings| settings.keys().map(String::as_str)),
+    ) {
+        return (StatusCode::FORBIDDEN, "group admin setting denied").into_response();
+    }
     match store::write_settings(&state.pool, request_library(), value, Some(expected)).await {
         Ok(store::Outcome::Done(version)) => {
             (StatusCode::NO_CONTENT, version_headers(version)).into_response()
@@ -1076,6 +1133,9 @@ async fn settings_delete(
         Err(resp) => return resp,
     };
     let keys = csv_of(&params, "settingKey");
+    if group_admin_setting_denied(request_access(), keys.iter().map(String::as_str)) {
+        return (StatusCode::FORBIDDEN, "group admin setting denied").into_response();
+    }
     match store::delete_settings(&state.pool, request_library(), &keys, Some(expected)).await {
         Ok(store::Outcome::Done(version)) => {
             (StatusCode::NO_CONTENT, version_headers(version)).into_response()
@@ -1566,7 +1626,10 @@ async fn log_and_auth(State(state): State<AppState>, req: Request, next: Next) -
             }
             Some(LibraryAccess {
                 library_id: context.principal.library_id,
+                group_id: None,
                 permissions: context.permissions,
+                is_admin: true,
+                file_write: context.permissions.write && context.permissions.files,
             })
         } else {
             None
@@ -1654,14 +1717,6 @@ fn app(state: AppState) -> Router {
                 },
             )
     };
-    let object_reads = |kind: &'static str| {
-        get(
-            move |State(state): State<AppState>, Query(params): Query<HashMap<String, String>>| async move {
-                read(&state, kind, params).await
-            },
-        )
-    };
-
     Router::new()
         .route("/keys/current", get(key_current))
         .route("/keys/sessions", post(create_session))
@@ -1672,8 +1727,13 @@ fn app(state: AppState) -> Router {
         .route("/login", get(login_page).post(login_authorize))
         .route("/users/{id}/groups", get(groups))
         .route("/groups/{id}", get(group_get).head(group_get))
-        .route("/groups/{id}/settings", get(settings_read))
-        .route("/groups/{id}/collections", object_reads("collection"))
+        .route(
+            "/groups/{id}/settings",
+            get(settings_read)
+                .post(settings_write)
+                .delete(settings_delete),
+        )
+        .route("/groups/{id}/collections", objects("collection"))
         .route(
             "/groups/{id}/collections/{key}/items",
             get(collection_items),
@@ -1682,12 +1742,42 @@ fn app(state: AppState) -> Router {
             "/groups/{id}/collections/{key}/items/top",
             get(collection_items_top),
         )
-        .route("/groups/{id}/searches", object_reads("search"))
-        .route("/groups/{id}/items", get(items_get))
+        .route("/groups/{id}/searches", objects("search"))
+        .route(
+            "/groups/{id}/items",
+            get(items_get)
+                .post(
+                    move |State(state): State<AppState>,
+                          headers: HeaderMap,
+                          body: Bytes| async move {
+                        write(&state, "item", headers, body).await
+                    },
+                )
+                .patch(
+                    move |State(state): State<AppState>,
+                          headers: HeaderMap,
+                          body: Bytes| async move {
+                        write(&state, "item", headers, body).await
+                    },
+                )
+                .delete(
+                    move |State(state): State<AppState>,
+                          headers: HeaderMap,
+                          Query(params): Query<HashMap<String, String>>| async move {
+                        delete(&state, "item", headers, params).await
+                    },
+                ),
+        )
         .route("/groups/{id}/items/top", get(items_top))
         .route("/groups/{id}/items/trash", get(items_trash))
-        .route("/groups/{id}/tags", get(tags_get))
-        .route("/groups/{id}/fulltext", get(fulltext_versions))
+        .route(
+            "/groups/{id}/tags",
+            get(tags_get).delete(tags_delete),
+        )
+        .route(
+            "/groups/{id}/fulltext",
+            get(fulltext_versions).post(fulltext_write),
+        )
         .route(
             "/groups/{id}/items/{key}/fulltext",
             get(fulltext_item),

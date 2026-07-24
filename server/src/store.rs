@@ -80,6 +80,20 @@ pub enum Outcome<T> {
     Conflict(i64),
 }
 
+pub enum ObjectMutation<T> {
+    Done(T),
+    Conflict(i64),
+    FileWriteDenied,
+}
+
+fn is_stored_file_attachment(value: &Value) -> bool {
+    value.get("itemType").and_then(Value::as_str) == Some("attachment")
+        && matches!(
+            value.get("linkMode").and_then(Value::as_str),
+            Some("imported_file" | "imported_url")
+        )
+}
+
 /// Lock the library row, check the client's expected version, and reserve the
 /// next one. Serializing on the row also prevents concurrent writes from racing.
 async fn guarded_version(
@@ -468,7 +482,7 @@ pub async fn resolve_group_library(
     static_permissions: Option<Permissions>,
 ) -> sqlx::Result<GroupLibraryResolution> {
     let row = sqlx::query(
-        "select g.library_id, g.library_editing, membership.role, \
+        "select g.library_id, g.library_editing, g.file_editing, membership.role, \
                 coalesce(all_grant.library, false) as all_library, \
                 coalesce(all_grant.write, false) as all_write, \
                 coalesce(explicit_grant.library, false) as explicit_library, \
@@ -508,18 +522,28 @@ pub async fn resolve_group_library(
         || (role == "member" && row.get::<String, _>("library_editing") == "members");
     let write = (explicit_library && row.get::<bool, _>("explicit_write"))
         || (all_library && all_write && policy_write);
+    let is_admin = matches!(role.as_str(), "owner" | "admin");
+    let file_write = write
+        && match row.get::<String, _>("file_editing").as_str() {
+            "members" => true,
+            "admins" => is_admin,
+            _ => false,
+        };
     let raw_library_id = row.get::<i64, _>("library_id");
     let library_id = LibraryId::new(raw_library_id).ok_or_else(|| {
         sqlx::Error::Protocol(format!("invalid group library ID {raw_library_id}"))
     })?;
     Ok(GroupLibraryResolution::Allowed(LibraryAccess {
         library_id,
+        group_id: Some(group_id),
         permissions: Permissions {
             library: true,
             notes: true,
             write,
             files: true,
         },
+        is_admin,
+        file_write,
     }))
 }
 
@@ -1031,17 +1055,18 @@ pub async fn write(
     kind: &str,
     batch: Vec<Value>,
     expected: Option<i64>,
-) -> sqlx::Result<Outcome<(i64, Value)>> {
+    allow_stored_file_write: bool,
+) -> sqlx::Result<ObjectMutation<(i64, Value)>> {
     if batch.is_empty() {
         return Ok(match no_change(pool, library_id, expected).await? {
-            Outcome::Done(version) => Outcome::Done((version, Value::Object(Map::new()))),
-            Outcome::Conflict(current) => Outcome::Conflict(current),
+            Outcome::Done(version) => ObjectMutation::Done((version, Value::Object(Map::new()))),
+            Outcome::Conflict(current) => ObjectMutation::Conflict(current),
         });
     }
     let mut tx = pool.begin().await?;
     let version = match guarded_version(&mut tx, library_id, expected).await? {
         Outcome::Done(version) => version,
-        Outcome::Conflict(current) => return Ok(Outcome::Conflict(current)),
+        Outcome::Conflict(current) => return Ok(ObjectMutation::Conflict(current)),
     };
 
     let mut successful = Map::new();
@@ -1062,6 +1087,7 @@ pub async fn write(
                 .fetch_optional(&mut *tx)
                 .await?
                 .map(|row| row.get::<Value, _>("data"));
+        let existing_is_stored_file = existing.as_ref().is_some_and(is_stored_file_attachment);
         let mut object = match (existing, &provided) {
             (Some(Value::Object(mut base)), Value::Object(fields)) => {
                 for (k, v) in fields {
@@ -1074,6 +1100,12 @@ pub async fn write(
         if let Value::Object(fields) = &mut object {
             fields.insert("key".into(), Value::from(key.clone()));
             fields.insert("version".into(), Value::from(version));
+        }
+        if kind == "item"
+            && !allow_stored_file_write
+            && (existing_is_stored_file || is_stored_file_attachment(&object))
+        {
+            return Ok(ObjectMutation::FileWriteDenied);
         }
         sqlx::query(
             "insert into object (library_id, kind, key, version, data) \
@@ -1100,7 +1132,7 @@ pub async fn write(
         );
     }
     tx.commit().await?;
-    Ok(Outcome::Done((version, Value::Object(successful))))
+    Ok(ObjectMutation::Done((version, Value::Object(successful))))
 }
 
 /// Delete objects of `kind`, recording them in the deletion log.
@@ -1110,16 +1142,33 @@ pub async fn delete(
     kind: &str,
     keys: &[String],
     expected: Option<i64>,
-) -> sqlx::Result<Outcome<i64>> {
+    allow_stored_file_write: bool,
+) -> sqlx::Result<ObjectMutation<i64>> {
     if keys.is_empty() {
-        return no_change(pool, library_id, expected).await;
+        return Ok(match no_change(pool, library_id, expected).await? {
+            Outcome::Done(version) => ObjectMutation::Done(version),
+            Outcome::Conflict(current) => ObjectMutation::Conflict(current),
+        });
     }
     let mut tx = pool.begin().await?;
     let version = match guarded_version(&mut tx, library_id, expected).await? {
         Outcome::Done(version) => version,
-        Outcome::Conflict(current) => return Ok(Outcome::Conflict(current)),
+        Outcome::Conflict(current) => return Ok(ObjectMutation::Conflict(current)),
     };
     for key in keys {
+        if kind == "item" && !allow_stored_file_write {
+            let data: Option<Value> = sqlx::query_scalar(
+                "select data from object where library_id = $1 and kind = $2 and key = $3",
+            )
+            .bind(library_id.get())
+            .bind(kind)
+            .bind(key)
+            .fetch_optional(&mut *tx)
+            .await?;
+            if data.as_ref().is_some_and(is_stored_file_attachment) {
+                return Ok(ObjectMutation::FileWriteDenied);
+            }
+        }
         sqlx::query("delete from object where library_id = $1 and kind = $2 and key = $3")
             .bind(library_id.get())
             .bind(kind)
@@ -1138,7 +1187,7 @@ pub async fn delete(
         .await?;
     }
     tx.commit().await?;
-    Ok(Outcome::Done(version))
+    Ok(ObjectMutation::Done(version))
 }
 
 /// All settings as `{key: {value, version}}`.
