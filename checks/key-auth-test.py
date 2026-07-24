@@ -68,6 +68,14 @@ psql(
        values (1, 'LEGACY22', '5d41402abc4b2a76b9719d911017c592',
                'legacy.pdf', 5, 1700000000000, 7)"""
 )
+psql("insert into library (id, version) values (22, 0)")
+psql(
+    """insert into file
+       (library_id, item_key, md5, filename, filesize, mtime, version)
+       values (22, 'OLDLIB22', '27b525e7d8fdb7db5b821c3a0bf7c60e',
+               'old.pdf', 5, 1700000000001, 0)"""
+)
+machine.succeed("printf old22 | mc pipe s3/zotero/libraries/22/OLDLIB22")
 psql(
     """insert into fulltext
        (library_id, item_key, content, indexed_chars, total_chars,
@@ -113,6 +121,7 @@ with subtest("populated v7 data survives the identity migration"):
                       and md5 = '5d41402abc4b2a76b9719d911017c592'
                       and filename = 'legacy.pdf' and filesize = 5
                       and mtime = 1700000000000 and version = 7
+                      and blob_key = 'LEGACY22'
                from file where item_key = 'LEGACY22'"""
         )
         == "t"
@@ -138,7 +147,6 @@ psql(
     """insert into users (id, username, display_name)
        values (202, 'bob', 'Bob')"""
 )
-psql("insert into library (id, kind, version) values (22, 'personal', 0)")
 psql("insert into personal_libraries (user_id, library_id) values (202, 22)")
 psql("update library set version = 3 where id = 22")
 psql(
@@ -205,6 +213,23 @@ psql(
        (1003, true, true, true, true)"""
 )
 psql("update api_keys set revoked_at = now() where id = 1003")
+
+with subtest("non-default legacy attachment path survives the blob-key migration"):
+    assert (
+        psql("select blob_key from file where library_id = 22 and item_key = 'OLDLIB22'")
+        == "libraries/22/OLDLIB22"
+    )
+    old_location = machine.succeed(
+        f"curl -sf -D /tmp/old-library-file -o /dev/null "
+        f"{base}/users/202/items/OLDLIB22/file {api_headers} "
+        f"-H 'Zotero-API-Key: {bob_full}' "
+        "&& grep -i '^location:' /tmp/old-library-file | tr -d '\\r' | awk '{print $2}'"
+    ).strip()
+    machine.succeed(
+        "grep -iq 'zotero-file-md5: 27b525e7d8fdb7db5b821c3a0bf7c60e' "
+        "/tmp/old-library-file"
+    )
+    assert machine.succeed(f"curl -sf '{old_location}'").strip() == "old22"
 
 with subtest("current-key introspection returns the authenticated DB owner"):
     machine.succeed(
@@ -509,6 +534,13 @@ with subtest("same attachment key stays isolated across personal libraries"):
     machine.succeed(
         f"curl -sf -X POST {base}/users/202/items/SHARED22/file {api_headers} "
         f"-H 'Zotero-API-Key: {bob_full}' -H 'If-None-Match: *' -d 'upload={bob_token}'"
+    )
+    bob_blob_key = psql(
+        "select blob_key from file where library_id = 22 and item_key = 'SHARED22'"
+    )
+    assert bob_blob_key.startswith("libraries/22/uploads/"), bob_blob_key
+    assert bob_blob_key != psql(
+        "select blob_key from file where library_id = 1 and item_key = 'LEGACY22'"
     )
     bob_location = machine.succeed(
         f"curl -sf -D /tmp/bob-file -o /dev/null {base}/users/202/items/SHARED22/file "
