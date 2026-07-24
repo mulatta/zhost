@@ -14,6 +14,7 @@ use crate::query::{ItemQuery, QMode};
 
 mod groups;
 mod sessions;
+mod settings;
 pub use groups::{
     active_user_exists, api_key_group_grants, group_for_user, groups_for_user,
     resolve_group_library, GroupGrant, GroupLibraryResolution, GroupMetadata,
@@ -22,6 +23,7 @@ pub use sessions::{
     cancel_login_session, complete_login_session, create_login_session, login_session,
     LoginSession, LoginSessionChange,
 };
+pub use settings::{delete_settings, settings, write_settings};
 
 /// `{<key_col>: version}` map from version-listing rows (the `format=versions`
 /// shape shared by objects, top items and full-text).
@@ -107,7 +109,7 @@ fn is_stored_file_attachment(value: &Value) -> bool {
 
 /// Lock the library row, check the client's expected version, and reserve the
 /// next one. Serializing on the row also prevents concurrent writes from racing.
-async fn guarded_version(
+pub(super) async fn guarded_version(
     conn: &mut sqlx::PgConnection,
     library_id: LibraryId,
     expected: Option<i64>,
@@ -340,7 +342,7 @@ pub async fn authenticate_api_key(
 /// current version, or a conflict if the client's expectation is already stale,
 /// without bumping the version — a no-op must not churn the counter and make
 /// every other client think the library changed.
-async fn no_change(
+pub(super) async fn no_change(
     pool: &PgPool,
     library_id: LibraryId,
     expected: Option<i64>,
@@ -769,98 +771,6 @@ pub async fn delete(
 }
 
 /// All settings as `{key: {value, version}}`.
-pub async fn settings(pool: &PgPool, library_id: LibraryId) -> sqlx::Result<Value> {
-    let rows = sqlx::query("select key, version, value from setting where library_id = $1")
-        .bind(library_id.get())
-        .fetch_all(pool)
-        .await?;
-    let mut map = Map::new();
-    for row in rows {
-        let value: Value = row.get("value");
-        map.insert(
-            row.get("key"),
-            serde_json::json!({ "value": value, "version": row.get::<i64, _>("version") }),
-        );
-    }
-    Ok(Value::Object(map))
-}
-
-/// Store a `{key: {value}}` settings object.
-pub async fn write_settings(
-    pool: &PgPool,
-    library_id: LibraryId,
-    body: Value,
-    expected: Option<i64>,
-) -> sqlx::Result<Outcome<i64>> {
-    if body.as_object().is_none_or(|m| m.is_empty()) {
-        return no_change(pool, library_id, expected).await;
-    }
-    let mut tx = pool.begin().await?;
-    let version = match guarded_version(&mut tx, library_id, expected).await? {
-        Outcome::Done(version) => version,
-        Outcome::Conflict(current) => return Ok(Outcome::Conflict(current)),
-    };
-    if let Value::Object(entries) = body {
-        for (key, entry) in entries {
-            let value = entry.get("value").cloned().unwrap_or(entry);
-            sqlx::query(
-                "insert into setting (library_id, key, version, value) values ($1, $2, $3, $4) \
-                 on conflict (library_id, key) do update set version = $3, value = $4",
-            )
-            .bind(library_id.get())
-            .bind(&key)
-            .bind(version)
-            .bind(&value)
-            .execute(&mut *tx)
-            .await?;
-        }
-    }
-    tx.commit().await?;
-    Ok(Outcome::Done(version))
-}
-
-/// Delete the named settings, recording each in the deletion log so `/deleted`
-/// can propagate the removal. Returns the new library version or a conflict.
-pub async fn delete_settings(
-    pool: &PgPool,
-    library_id: LibraryId,
-    keys: &[String],
-    expected: Option<i64>,
-) -> sqlx::Result<Outcome<i64>> {
-    if keys.is_empty() {
-        return no_change(pool, library_id, expected).await;
-    }
-    let mut tx = pool.begin().await?;
-    let version = match guarded_version(&mut tx, library_id, expected).await? {
-        Outcome::Done(version) => version,
-        Outcome::Conflict(current) => return Ok(Outcome::Conflict(current)),
-    };
-    for key in keys {
-        sqlx::query("delete from setting where library_id = $1 and key = $2")
-            .bind(library_id.get())
-            .bind(key)
-            .execute(&mut *tx)
-            .await?;
-        sqlx::query(
-            "insert into deletion (library_id, kind, key, version) values ($1, 'setting', $2, $3) \
-             on conflict (library_id, kind, key) do update set version = $3",
-        )
-        .bind(library_id.get())
-        .bind(key)
-        .bind(version)
-        .execute(&mut *tx)
-        .await?;
-    }
-    tx.commit().await?;
-    Ok(Outcome::Done(version))
-}
-
-/// Delete tags library-wide: strip each tag from every item that carries it
-/// (bumping those items to the new version) and record the tag in the deletion
-/// log so `/deleted` propagates the removal. A tag has no object of its own, so
-/// an orphaned tag with zero items still needs its deletion-log entry for
-/// clients to purge it — the deletion is recorded regardless of matches.
-/// Returns the new library version or a conflict.
 pub async fn delete_tags(
     pool: &PgPool,
     library_id: LibraryId,
