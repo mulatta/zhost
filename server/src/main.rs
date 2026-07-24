@@ -15,7 +15,7 @@ use std::sync::{Arc, LazyLock, Mutex};
 
 use axum::{
     body::{Body, Bytes},
-    extract::{DefaultBodyLimit, Form, Path, Query, RawQuery, Request, State},
+    extract::{DefaultBodyLimit, Form, OriginalUri, Path, Query, RawQuery, Request, State},
     http::{HeaderMap, StatusCode},
     middleware::{self, Next},
     response::{IntoResponse, Response},
@@ -27,7 +27,7 @@ use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
 use sqlx::PgPool;
 
-use crate::domain::{GroupId, LibraryId, Permissions, RequestContext, UserId};
+use crate::domain::{GroupId, LibraryAccess, LibraryId, Permissions, RequestContext, UserId};
 
 struct Config {
     /// Static recovery token → access, loaded from secret files at boot.
@@ -57,19 +57,18 @@ struct AppState {
 }
 
 tokio::task_local! {
-    static REQUEST_LIBRARY: LibraryId;
-    static REQUEST_PERMISSIONS: Permissions;
+    static REQUEST_ACCESS: LibraryAccess;
 }
 
 fn request_library() -> LibraryId {
-    REQUEST_LIBRARY
-        .try_with(|library_id| *library_id)
+    REQUEST_ACCESS
+        .try_with(|access| access.library_id)
         .expect("library store access requires authenticated request context")
 }
 
 fn request_permissions() -> Permissions {
-    REQUEST_PERMISSIONS
-        .try_with(|permissions| *permissions)
+    REQUEST_ACCESS
+        .try_with(|access| access.permissions)
         .expect("permission-aware access requires authenticated request context")
 }
 
@@ -837,7 +836,7 @@ async fn item_keys_response(
 /// `GET /users/<id>/items`: the two sync reads, or the CLI query when neither.
 async fn items_get(
     State(state): State<AppState>,
-    Path(id): Path<String>,
+    OriginalUri(uri): OriginalUri,
     RawQuery(raw): RawQuery,
 ) -> Response {
     let params = query::Params::parse(raw.as_deref());
@@ -848,14 +847,14 @@ async fn items_get(
     if let Some(resp) = item_keys_response(&state, &params, &q).await {
         return resp;
     }
-    item_listing(&state, &format!("/users/{id}/items"), raw.as_deref(), &q).await
+    item_listing(&state, uri.path(), raw.as_deref(), &q).await
 }
 
 /// `GET /users/<id>/items/top`: top-level items (no `parentItem`). Also answers
 /// the sync `format=versions` (top-filtered) and `itemKey` reads sent here.
 async fn items_top(
     State(state): State<AppState>,
-    Path(id): Path<String>,
+    OriginalUri(uri): OriginalUri,
     RawQuery(raw): RawQuery,
 ) -> Response {
     let params = query::Params::parse(raw.as_deref());
@@ -867,19 +866,13 @@ async fn items_top(
     if let Some(resp) = item_keys_response(&state, &params, &q).await {
         return resp;
     }
-    item_listing(
-        &state,
-        &format!("/users/{id}/items/top"),
-        raw.as_deref(),
-        &q,
-    )
-    .await
+    item_listing(&state, uri.path(), raw.as_deref(), &q).await
 }
 
 /// `GET /users/<id>/items/trash`: only trashed items (`data.deleted`).
 async fn items_trash(
     State(state): State<AppState>,
-    Path(id): Path<String>,
+    OriginalUri(uri): OriginalUri,
     RawQuery(raw): RawQuery,
 ) -> Response {
     let params = query::Params::parse(raw.as_deref());
@@ -888,19 +881,14 @@ async fn items_trash(
     if let Some(resp) = item_keys_response(&state, &params, &q).await {
         return resp;
     }
-    item_listing(
-        &state,
-        &format!("/users/{id}/items/trash"),
-        raw.as_deref(),
-        &q,
-    )
-    .await
+    item_listing(&state, uri.path(), raw.as_deref(), &q).await
 }
 
 /// `GET /users/<id>/collections/<key>/items`: items in the given collection.
 async fn collection_items(
     State(state): State<AppState>,
-    Path((id, key)): Path<(String, String)>,
+    OriginalUri(uri): OriginalUri,
+    Path((_id, key)): Path<(String, String)>,
     RawQuery(raw): RawQuery,
 ) -> Response {
     let params = query::Params::parse(raw.as_deref());
@@ -909,13 +897,7 @@ async fn collection_items(
     if let Some(resp) = item_keys_response(&state, &params, &q).await {
         return resp;
     }
-    item_listing(
-        &state,
-        &format!("/users/{id}/collections/{key}/items"),
-        raw.as_deref(),
-        &q,
-    )
-    .await
+    item_listing(&state, uri.path(), raw.as_deref(), &q).await
 }
 
 /// `GET /users/<id>/collections/<key>/items/top`: top-level items in the
@@ -923,7 +905,8 @@ async fn collection_items(
 /// previously-deleted collection (syncEngine.js `_restoreRestoredCollectionItems`).
 async fn collection_items_top(
     State(state): State<AppState>,
-    Path((id, key)): Path<(String, String)>,
+    OriginalUri(uri): OriginalUri,
+    Path((_id, key)): Path<(String, String)>,
     RawQuery(raw): RawQuery,
 ) -> Response {
     let params = query::Params::parse(raw.as_deref());
@@ -933,13 +916,7 @@ async fn collection_items_top(
     if let Some(resp) = item_keys_response(&state, &params, &q).await {
         return resp;
     }
-    item_listing(
-        &state,
-        &format!("/users/{id}/collections/{key}/items/top"),
-        raw.as_deref(),
-        &q,
-    )
-    .await
+    item_listing(&state, uri.path(), raw.as_deref(), &q).await
 }
 
 /// `GET /users/<id>/tags`: distinct tags with item counts.
@@ -1543,7 +1520,7 @@ async fn log_and_auth(State(state): State<AppState>, req: Request, next: Next) -
         "request"
     );
 
-    let mut selected_library = None;
+    let mut selected_access = None;
     let is_bootstrap =
         path.starts_with("/keys/sessions") || path.starts_with("/uploads") || path == "/login";
     if !is_bootstrap {
@@ -1553,9 +1530,6 @@ async fn log_and_auth(State(state): State<AppState>, req: Request, next: Next) -
             Err(error) => return server_error("API key authentication", error),
         };
         let is_group_discovery = is_group_discovery_path(&path);
-        if path != "/keys/current" && !is_group_discovery && !context.permissions.library {
-            return (StatusCode::FORBIDDEN, "library access denied").into_response();
-        }
         match path_user_id(&path) {
             Ok(Some(path_user_id)) if path_user_id == context.principal.user_id.get() => {}
             Ok(Some(_)) if is_group_discovery => {}
@@ -1563,30 +1537,60 @@ async fn log_and_auth(State(state): State<AppState>, req: Request, next: Next) -
             Err(()) => return StatusCode::NOT_FOUND.into_response(),
             Ok(None) => {}
         }
-        if path.contains("/file") && !context.permissions.files {
+        let group_id = match path_group_data_id(&path) {
+            Ok(group_id) => group_id,
+            Err(()) => return StatusCode::NOT_FOUND.into_response(),
+        };
+        let access = if let Some(group_id) = group_id {
+            match store::resolve_group_library(
+                &state.pool,
+                group_id,
+                context.principal.user_id,
+                context.api_key_id,
+                context.api_key_id.is_none().then_some(context.permissions),
+            )
+            .await
+            {
+                Ok(store::GroupLibraryResolution::Allowed(access)) => Some(access),
+                Ok(store::GroupLibraryResolution::Denied) => {
+                    return (StatusCode::FORBIDDEN, "group access denied").into_response();
+                }
+                Ok(store::GroupLibraryResolution::Missing) => {
+                    return StatusCode::NOT_FOUND.into_response();
+                }
+                Err(error) => return server_error("resolve group library", error),
+            }
+        } else if path != "/keys/current" && !is_group_discovery {
+            if !context.permissions.library {
+                return (StatusCode::FORBIDDEN, "library access denied").into_response();
+            }
+            Some(LibraryAccess {
+                library_id: context.principal.library_id,
+                permissions: context.permissions,
+            })
+        } else {
+            None
+        };
+        if path.contains("/file") && access.is_some_and(|access| !access.permissions.files) {
             return (StatusCode::FORBIDDEN, "file access denied").into_response();
         }
         let mutating = matches!(
             parts.method,
-            axum::http::Method::POST | axum::http::Method::PATCH | axum::http::Method::DELETE
+            axum::http::Method::POST
+                | axum::http::Method::PUT
+                | axum::http::Method::PATCH
+                | axum::http::Method::DELETE
         );
-        if mutating && !context.permissions.write {
+        if mutating && access.is_some_and(|access| !access.permissions.write) {
             return (StatusCode::FORBIDDEN, "read-only API key").into_response();
         }
-        selected_library = Some((context.principal.library_id, context.permissions));
+        selected_access = access;
         parts.extensions.insert(context);
     }
 
     let request = Request::from_parts(parts, Body::from(bytes));
-    let response = match selected_library {
-        Some((library_id, permissions)) => {
-            REQUEST_LIBRARY
-                .scope(
-                    library_id,
-                    REQUEST_PERMISSIONS.scope(permissions, next.run(request)),
-                )
-                .await
-        }
+    let response = match selected_access {
+        Some(access) => REQUEST_ACCESS.scope(access, next.run(request)).await,
         None => next.run(request).await,
     };
     let status = response.status();
@@ -1608,6 +1612,18 @@ fn path_user_id(path: &str) -> Result<Option<i64>, ()> {
     }
     let id = segments.next().ok_or(())?.parse().map_err(|_| ())?;
     Ok(Some(id))
+}
+
+fn path_group_data_id(path: &str) -> Result<Option<GroupId>, ()> {
+    let segments: Vec<_> = path
+        .split('/')
+        .filter(|segment| !segment.is_empty())
+        .collect();
+    if segments.first() != Some(&"groups") || segments.len() < 3 {
+        return Ok(None);
+    }
+    let raw = segments[1].parse().map_err(|_| ())?;
+    GroupId::new(raw).map(Some).ok_or(())
 }
 
 fn app(state: AppState) -> Router {
@@ -1638,6 +1654,13 @@ fn app(state: AppState) -> Router {
                 },
             )
     };
+    let object_reads = |kind: &'static str| {
+        get(
+            move |State(state): State<AppState>, Query(params): Query<HashMap<String, String>>| async move {
+                read(&state, kind, params).await
+            },
+        )
+    };
 
     Router::new()
         .route("/keys/current", get(key_current))
@@ -1649,6 +1672,27 @@ fn app(state: AppState) -> Router {
         .route("/login", get(login_page).post(login_authorize))
         .route("/users/{id}/groups", get(groups))
         .route("/groups/{id}", get(group_get).head(group_get))
+        .route("/groups/{id}/settings", get(settings_read))
+        .route("/groups/{id}/collections", object_reads("collection"))
+        .route(
+            "/groups/{id}/collections/{key}/items",
+            get(collection_items),
+        )
+        .route(
+            "/groups/{id}/collections/{key}/items/top",
+            get(collection_items_top),
+        )
+        .route("/groups/{id}/searches", object_reads("search"))
+        .route("/groups/{id}/items", get(items_get))
+        .route("/groups/{id}/items/top", get(items_top))
+        .route("/groups/{id}/items/trash", get(items_trash))
+        .route("/groups/{id}/tags", get(tags_get))
+        .route("/groups/{id}/fulltext", get(fulltext_versions))
+        .route(
+            "/groups/{id}/items/{key}/fulltext",
+            get(fulltext_item),
+        )
+        .route("/groups/{id}/deleted", get(deleted))
         .route(
             "/users/{id}/settings",
             get(settings_read)
@@ -1883,7 +1927,7 @@ async fn main() {
 
 #[cfg(test)]
 mod middleware_tests {
-    use super::is_group_discovery_path;
+    use super::{is_group_discovery_path, path_group_data_id};
 
     #[test]
     fn group_permission_bypass_is_limited_to_discovery_routes() {
@@ -1891,5 +1935,19 @@ mod middleware_tests {
         assert!(is_group_discovery_path("/users/101/groups"));
         assert!(!is_group_discovery_path("/groups/303/items"));
         assert!(!is_group_discovery_path("/admin/users/101/groups"));
+    }
+
+    #[test]
+    fn group_data_paths_resolve_only_nested_positive_ids() {
+        assert_eq!(
+            path_group_data_id("/groups/303/items")
+                .unwrap()
+                .map(|id| id.get()),
+            Some(303)
+        );
+        assert_eq!(path_group_data_id("/groups/303").unwrap(), None);
+        assert_eq!(path_group_data_id("/users/303/items").unwrap(), None);
+        assert!(path_group_data_id("/groups/not-an-id/items").is_err());
+        assert!(path_group_data_id("/groups/0/items").is_err());
     }
 }

@@ -9,7 +9,7 @@ use serde_json::{Map, Value};
 use sqlx::postgres::PgRow;
 use sqlx::{PgPool, Postgres, QueryBuilder, Row};
 
-use crate::domain::{ApiKeyId, GroupId, LibraryId, Permissions, Principal, UserId};
+use crate::domain::{ApiKeyId, GroupId, LibraryAccess, LibraryId, Permissions, Principal, UserId};
 use crate::query::{ItemQuery, QMode};
 
 /// `{<key_col>: version}` map from version-listing rows (the `format=versions`
@@ -452,6 +452,75 @@ pub async fn active_user_exists(pool: &PgPool, user_id: UserId) -> sqlx::Result<
         .bind(user_id.get())
         .fetch_one(pool)
         .await
+}
+
+pub enum GroupLibraryResolution {
+    Missing,
+    Denied,
+    Allowed(LibraryAccess),
+}
+
+pub async fn resolve_group_library(
+    pool: &PgPool,
+    group_id: GroupId,
+    user_id: UserId,
+    api_key_id: Option<ApiKeyId>,
+    static_permissions: Option<Permissions>,
+) -> sqlx::Result<GroupLibraryResolution> {
+    let row = sqlx::query(
+        "select g.library_id, g.library_editing, membership.role, \
+                coalesce(all_grant.library, false) as all_library, \
+                coalesce(all_grant.write, false) as all_write, \
+                coalesce(explicit_grant.library, false) as explicit_library, \
+                coalesce(explicit_grant.write, false) as explicit_write \
+         from groups g \
+         join library l on l.id = g.library_id and l.kind = g.library_kind \
+         join users owner_user \
+           on owner_user.id = g.owner_user_id and owner_user.disabled_at is null \
+         left join group_memberships membership \
+           on membership.group_id = g.id and membership.user_id = $2 \
+         left join api_key_all_groups_permissions all_grant \
+           on all_grant.api_key_id = $3 \
+         left join api_key_group_permissions explicit_grant \
+           on explicit_grant.api_key_id = $3 and explicit_grant.group_id = g.id \
+         where g.id = $1",
+    )
+    .bind(group_id.get())
+    .bind(user_id.get())
+    .bind(api_key_id.map(ApiKeyId::get))
+    .fetch_optional(pool)
+    .await?;
+    let Some(row) = row else {
+        return Ok(GroupLibraryResolution::Missing);
+    };
+    let Some(role) = row.get::<Option<String>, _>("role") else {
+        return Ok(GroupLibraryResolution::Denied);
+    };
+    let static_library = static_permissions.is_some_and(|permissions| permissions.library);
+    let static_write = static_permissions.is_some_and(|permissions| permissions.write);
+    let all_library = static_library || row.get::<bool, _>("all_library");
+    let all_write = static_write || row.get::<bool, _>("all_write");
+    let explicit_library = row.get::<bool, _>("explicit_library");
+    if !all_library && !explicit_library {
+        return Ok(GroupLibraryResolution::Denied);
+    }
+    let policy_write = matches!(role.as_str(), "owner" | "admin")
+        || (role == "member" && row.get::<String, _>("library_editing") == "members");
+    let write = (explicit_library && row.get::<bool, _>("explicit_write"))
+        || (all_library && all_write && policy_write);
+    let raw_library_id = row.get::<i64, _>("library_id");
+    let library_id = LibraryId::new(raw_library_id).ok_or_else(|| {
+        sqlx::Error::Protocol(format!("invalid group library ID {raw_library_id}"))
+    })?;
+    Ok(GroupLibraryResolution::Allowed(LibraryAccess {
+        library_id,
+        permissions: Permissions {
+            library: true,
+            notes: true,
+            write,
+            files: true,
+        },
+    }))
 }
 
 pub async fn group_for_user(

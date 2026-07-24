@@ -86,6 +86,13 @@ impl Permissions {
     }
 }
 
+/// One fully resolved library scope used by data handlers.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct LibraryAccess {
+    pub library_id: LibraryId,
+    pub permissions: Permissions,
+}
+
 /// Authentication result inserted into Axum request extensions.
 ///
 /// Deliberately lacks `Debug`: `presented_key` is the raw secret that Zotero
