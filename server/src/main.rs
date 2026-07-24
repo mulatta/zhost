@@ -11,7 +11,7 @@ mod s3;
 mod store;
 
 use std::collections::HashMap;
-use std::sync::{Arc, LazyLock, Mutex};
+use std::sync::Arc;
 
 use axum::{
     body::{Body, Bytes},
@@ -82,46 +82,15 @@ fn upload_storage_key(library_id: LibraryId, upload_token: &str) -> String {
     format!("libraries/{}/uploads/{upload_token}", library_id.get())
 }
 
-/// In-flight file uploads, keyed by an unguessable upload token (not the item
-/// key, which is guessable) and remembered between the authorisation, upload and
-/// registration steps. Pruned on insert so a never-completed upload can't leak.
-static PENDING: LazyLock<Mutex<HashMap<String, PendingUpload>>> =
-    LazyLock::new(|| Mutex::new(HashMap::new()));
-
-/// How long an authorized-but-unfinished upload stays valid.
-const PENDING_TTL: std::time::Duration = std::time::Duration::from_secs(3600);
-
-#[derive(Clone)]
-struct PendingUpload {
-    /// Library that authorized the upload token.
-    library_id: LibraryId,
-    group_id: Option<GroupId>,
-    /// DB key digest, when a user-owned key authorized this upload. Static
-    /// recovery keys have no digest and are checked through bootstrap identity.
-    api_key_hash: Option<Vec<u8>>,
-    bootstrap_user_id: Option<UserId>,
-    bootstrap_permissions: Option<Permissions>,
-    /// The attachment item the candidate bytes belong to.
-    item_key: String,
-    /// MD5 that was current when this upload was authorized. `None` means the
-    /// authorization required no registered file to exist.
-    expected_md5: Option<String>,
-    /// Immutable candidate object. Registration atomically makes this live by
-    /// storing the pointer beside the file metadata.
-    blob_key: String,
-    md5: String,
-    filename: String,
-    filesize: i64,
-    mtime: i64,
-    state: PendingUploadState,
-    created: std::time::Instant,
+fn key_hash(key: &str) -> Vec<u8> {
+    Sha256::digest(key.as_bytes()).to_vec()
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum PendingUploadState {
-    Authorized,
-    Uploading,
-    Uploaded,
+fn recovery_key_permissions(config: &Config, hash: &[u8]) -> Option<Permissions> {
+    config
+        .keys
+        .iter()
+        .find_map(|(key, permissions)| (key_hash(key) == hash).then_some(*permissions))
 }
 
 /// An unguessable upload token (128 bits of OS randomness, hex-encoded). `None`
@@ -1238,18 +1207,13 @@ async fn file_post(
     // Registration step: the client posts upload=<token> after PUTting the bytes
     // to the upload endpoint, which verified them and stored the object.
     if let Some(token) = form.get("upload") {
-        let pending = {
-            let mut pending = PENDING.lock().unwrap();
-            if pending
-                .get(token)
-                .is_some_and(|upload| upload.created.elapsed() >= PENDING_TTL)
-            {
-                pending.remove(token);
+        let token_hash = key_hash(token);
+        let upload = match store::pending_upload(&state.pool, &token_hash).await {
+            Ok(Some(upload)) => upload,
+            Ok(None) => {
+                return (StatusCode::BAD_REQUEST, "no pending upload").into_response();
             }
-            pending.get(token).cloned()
-        };
-        let Some(upload) = pending else {
-            return (StatusCode::BAD_REQUEST, "no pending upload").into_response();
+            Err(error) => return server_error("pending upload lookup", error),
         };
         if upload.item_key != key {
             return (StatusCode::BAD_REQUEST, "upload token does not match item").into_response();
@@ -1260,35 +1224,24 @@ async fn file_post(
         if upload.group_id != request_access().group_id {
             return (StatusCode::FORBIDDEN, "upload token group mismatch").into_response();
         }
-        if upload.state != PendingUploadState::Uploaded {
+        if upload.state != store::PendingUploadState::Uploaded {
             return (StatusCode::BAD_REQUEST, "no uploaded bytes").into_response();
         }
-        return match store::register_file(
-            &state.pool,
-            request_library(),
-            &key,
-            store::FileRegistration {
-                expected_md5: upload.expected_md5.as_deref(),
-                blob_key: &upload.blob_key,
-                md5: &upload.md5,
-                filename: &upload.filename,
-                filesize: upload.filesize,
-                mtime: upload.mtime,
-            },
-        )
-        .await
-        {
+        let outcome = store::register_file(&state.pool, &token_hash, request_library(), &key).await;
+        return match outcome {
             Ok(store::FileRegistrationOutcome::Done(version)) => {
-                PENDING.lock().unwrap().remove(token);
                 (StatusCode::NO_CONTENT, version_headers(version)).into_response()
             }
             Ok(store::FileRegistrationOutcome::Conflict(current)) => {
-                PENDING.lock().unwrap().remove(token);
+                cleanup_pending_uploads(&state).await;
                 conflict(current)
             }
             Ok(store::FileRegistrationOutcome::InvalidItem) => {
-                PENDING.lock().unwrap().remove(token);
+                cleanup_pending_uploads(&state).await;
                 (StatusCode::CONFLICT, "attachment item changed").into_response()
+            }
+            Ok(store::FileRegistrationOutcome::InvalidUpload) => {
+                (StatusCode::BAD_REQUEST, "no pending upload").into_response()
             }
             Err(error) => server_error("register file", error),
         };
@@ -1351,52 +1304,43 @@ async fn file_post(
         }
     }
 
-    // Authorize: mint an unguessable token, remember the upload (pruning stale
-    // ones), and hand back the upload URL. Bytes land at a token-specific path.
+    // Authorize: persist only the capability digest. Candidate bytes use a
+    // separate random object ID so the database never stores the raw token.
+    cleanup_pending_uploads(&state).await;
     let Some(token) = upload_token() else {
         return StatusCode::INTERNAL_SERVER_ERROR.into_response();
     };
+    let Some(candidate_id) = upload_token() else {
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    };
+    let upload = store::PendingUpload {
+        library_id: request_library(),
+        group_id: request_access().group_id,
+        authorizer_key_hash: key_hash(&context.presented_key),
+        bootstrap_user_id: state
+            .config
+            .keys
+            .contains_key(&context.presented_key)
+            .then_some(context.principal.user_id),
+        item_key: key.clone(),
+        expected_md5: if if_none_match {
+            None
+        } else {
+            stored_md5.clone()
+        },
+        blob_key: upload_storage_key(request_library(), &candidate_id),
+        md5,
+        filename: form.get("filename").cloned().unwrap_or_default(),
+        filesize: form
+            .get("filesize")
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0),
+        mtime: form.get("mtime").and_then(|s| s.parse().ok()).unwrap_or(0),
+        state: store::PendingUploadState::Authorized,
+    };
+    if let Err(error) = store::create_pending_upload(&state.pool, &key_hash(&token), &upload).await
     {
-        let mut pending = PENDING.lock().unwrap();
-        pending.retain(|_, u| u.created.elapsed() < PENDING_TTL);
-        pending.insert(
-            token.clone(),
-            PendingUpload {
-                library_id: request_library(),
-                group_id: request_access().group_id,
-                api_key_hash: if state.config.keys.contains_key(&context.presented_key) {
-                    None
-                } else {
-                    Some(Sha256::digest(context.presented_key.as_bytes()).to_vec())
-                },
-                bootstrap_user_id: state
-                    .config
-                    .keys
-                    .contains_key(&context.presented_key)
-                    .then_some(context.principal.user_id),
-                bootstrap_permissions: state
-                    .config
-                    .keys
-                    .contains_key(&context.presented_key)
-                    .then_some(context.permissions),
-                item_key: key.clone(),
-                expected_md5: if if_none_match {
-                    None
-                } else {
-                    stored_md5.clone()
-                },
-                blob_key: upload_storage_key(request_library(), &token),
-                md5,
-                filename: form.get("filename").cloned().unwrap_or_default(),
-                filesize: form
-                    .get("filesize")
-                    .and_then(|s| s.parse().ok())
-                    .unwrap_or(0),
-                mtime: form.get("mtime").and_then(|s| s.parse().ok()).unwrap_or(0),
-                state: PendingUploadState::Authorized,
-                created: std::time::Instant::now(),
-            },
-        );
+        return server_error("create pending upload", error);
     }
     // Empty prefix/suffix: the client PUTs the raw file bytes to url.
     Json(json!({
@@ -1411,7 +1355,7 @@ async fn file_post(
 
 async fn upload_scope_authorized(
     state: &AppState,
-    upload: &PendingUpload,
+    upload: &store::PendingUpload,
     principal: &crate::domain::Principal,
     api_key_id: Option<crate::domain::ApiKeyId>,
     permissions: Permissions,
@@ -1439,6 +1383,39 @@ async fn upload_scope_authorized(
     }
 }
 
+async fn cleanup_pending_uploads(state: &AppState) {
+    loop {
+        let garbage = match store::claim_pending_upload_garbage(&state.pool, 32).await {
+            Ok(garbage) => garbage,
+            Err(error) => {
+                tracing::warn!(%error, "claim pending upload garbage");
+                return;
+            }
+        };
+        if garbage.is_empty() {
+            return;
+        }
+        for candidate in garbage {
+            if let Err(error) = state.storage.delete(&candidate.blob_key).await {
+                tracing::warn!(%error, "delete pending upload candidate");
+                continue;
+            }
+            if let Err(error) =
+                store::delete_pending_upload_garbage(&state.pool, &candidate.token_hash).await
+            {
+                tracing::warn!(%error, "finish pending upload cleanup");
+            }
+        }
+    }
+}
+
+async fn pending_upload_cleanup_loop(state: AppState) {
+    loop {
+        tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+        cleanup_pending_uploads(&state).await;
+    }
+}
+
 /// Receive the raw attachment bytes for a pending upload token, verify them
 /// against the authorized md5/filesize, and store an immutable candidate.
 /// Rejects an unknown token. Verifying here (where the bytes are in hand) keeps
@@ -1448,27 +1425,23 @@ async fn upload_put(
     Path(token): Path<String>,
     body: Bytes,
 ) -> Response {
-    let pending = {
-        let mut pending = PENDING.lock().unwrap();
-        if pending
-            .get(&token)
-            .is_some_and(|upload| upload.created.elapsed() >= PENDING_TTL)
-        {
-            pending.remove(&token);
+    let token_hash = key_hash(&token);
+    let upload = match store::pending_upload(&state.pool, &token_hash).await {
+        Ok(Some(upload)) => upload,
+        Ok(None) => {
+            return (StatusCode::BAD_REQUEST, "unknown upload token").into_response();
         }
-        pending.get(&token).cloned()
+        Err(error) => return server_error("pending upload lookup", error),
     };
-    let Some(upload) = pending else {
-        return (StatusCode::BAD_REQUEST, "unknown upload token").into_response();
-    };
-    if upload.state != PendingUploadState::Authorized {
+    if upload.state != store::PendingUploadState::Authorized {
         return (StatusCode::CONFLICT, "upload token already used").into_response();
     }
-    if let Some(token_hash) = &upload.api_key_hash {
-        let authenticated = match store::authenticate_api_key(&state.pool, token_hash).await {
-            Ok(authenticated) => authenticated,
-            Err(error) => return server_error("upload authorization", error),
-        };
+    if upload.bootstrap_user_id.is_none() {
+        let authenticated =
+            match store::authenticate_api_key(&state.pool, &upload.authorizer_key_hash).await {
+                Ok(authenticated) => authenticated,
+                Err(error) => return server_error("upload authorization", error),
+            };
         let Some((api_key_id, principal, permissions)) = authenticated else {
             return (StatusCode::FORBIDDEN, "API key revoked").into_response();
         };
@@ -1487,13 +1460,18 @@ async fn upload_put(
             Err(error) => return server_error("upload authorization", error),
         }
     } else if let Some(user_id) = upload.bootstrap_user_id {
-        let principal = match store::bootstrap_principal(&state.pool, user_id).await {
+        if user_id != state.config.user_id {
+            return (StatusCode::FORBIDDEN, "bootstrap user changed").into_response();
+        }
+        let principal = match store::bootstrap_principal(&state.pool, state.config.user_id).await {
             Ok(Some(principal)) => principal,
             Ok(None) => return (StatusCode::FORBIDDEN, "bootstrap user disabled").into_response(),
             Err(error) => return server_error("upload authorization", error),
         };
-        let Some(permissions) = upload.bootstrap_permissions else {
-            return (StatusCode::FORBIDDEN, "bootstrap permission missing").into_response();
+        let Some(permissions) =
+            recovery_key_permissions(&state.config, &upload.authorizer_key_hash)
+        else {
+            return (StatusCode::FORBIDDEN, "recovery key removed").into_response();
         };
         match upload_scope_authorized(
             &state,
@@ -1522,37 +1500,34 @@ async fn upload_put(
         )
             .into_response();
     }
-    {
-        let mut pending = PENDING.lock().unwrap();
-        let Some(current) = pending.get_mut(&token) else {
-            return (StatusCode::BAD_REQUEST, "unknown upload token").into_response();
-        };
-        if current.created.elapsed() >= PENDING_TTL {
-            pending.remove(&token);
-            return (StatusCode::BAD_REQUEST, "expired upload token").into_response();
-        }
-        if current.state != PendingUploadState::Authorized {
+    match store::claim_pending_upload(&state.pool, &token_hash).await {
+        Ok(true) => {}
+        Ok(false) => {
             return (StatusCode::CONFLICT, "upload token already used").into_response();
         }
-        current.state = PendingUploadState::Uploading;
+        Err(error) => return server_error("claim pending upload", error),
     }
     if let Err(error) = state
         .storage
         .put(&upload.blob_key, &body, "application/octet-stream")
         .await
     {
-        if let Some(current) = PENDING.lock().unwrap().get_mut(&token) {
-            if current.state == PendingUploadState::Uploading {
-                current.state = PendingUploadState::Authorized;
-            }
+        if let Err(reset_error) = store::reset_pending_upload(&state.pool, &token_hash).await {
+            tracing::warn!(error = %reset_error, "reset failed pending upload");
         }
+        cleanup_pending_uploads(&state).await;
         return s3_error("store file", error);
     }
-    // Mark the pending upload stored so registration can commit its metadata.
-    if let Some(u) = PENDING.lock().unwrap().get_mut(&token) {
-        if u.state == PendingUploadState::Uploading {
-            u.state = PendingUploadState::Uploaded;
+    match store::mark_pending_upload_uploaded(&state.pool, &token_hash).await {
+        Ok(true) => {}
+        Ok(false) => {
+            if let Err(error) = store::discard_pending_upload(&state.pool, &token_hash).await {
+                tracing::warn!(%error, "discard incomplete pending upload");
+            }
+            cleanup_pending_uploads(&state).await;
+            return (StatusCode::CONFLICT, "upload token already used").into_response();
         }
+        Err(error) => return server_error("complete pending upload", error),
     }
     StatusCode::CREATED.into_response()
 }
@@ -2092,6 +2067,11 @@ async fn main() {
         pool,
         storage,
     };
+    store::reset_interrupted_pending_uploads(&state.pool)
+        .await
+        .expect("recover interrupted uploads");
+    cleanup_pending_uploads(&state).await;
+    tokio::spawn(pending_upload_cleanup_loop(state.clone()));
 
     let listener = tokio::net::TcpListener::bind(&state.config.bind)
         .await

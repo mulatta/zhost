@@ -31,6 +31,13 @@ def library_version():
     ).strip()
 
 
+def restart_zhost():
+    machine.succeed("systemctl reset-failed zhost.service")
+    machine.succeed("systemctl restart zhost.service")
+    machine.wait_for_unit("zhost.service")
+    machine.wait_for_open_port(8189)
+
+
 def assert_attachment(item_key, expected_md5, expected_body, scratch):
     headers = f"/tmp/{scratch}.headers"
     machine.succeed(
@@ -99,9 +106,7 @@ with subtest("login session hands out the key only after authorization"):
     machine.succeed(f"curl -sf '{login_url}' | grep -qi 'Authorize'")
     machine.succeed(f"curl -sf {base}/keys/sessions/{token} | jq -e '.status == \"pending\"'")
     machine.succeed(f"curl -sf {base}/keys/sessions/{token} | jq -e '.apiKey == null'")
-    machine.succeed("systemctl restart zhost.service")
-    machine.wait_for_unit("zhost.service")
-    machine.wait_for_open_port(8189)
+    restart_zhost()
     machine.succeed(f"curl -sf {base}/keys/sessions/{token} | jq -e '.status == \"pending\"'")
     # A cross-site form POST (foreign Origin) is refused even with a valid identity.
     assert (
@@ -157,9 +162,7 @@ with subtest("login session hands out the key only after authorization"):
         "/tmp/completed-session"
     )
 
-    machine.succeed("systemctl restart zhost.service")
-    machine.wait_for_unit("zhost.service")
-    machine.wait_for_open_port(8189)
+    restart_zhost()
     machine.succeed(f"curl -sf {base}/keys/sessions/{token} > /tmp/restarted-session")
     assert machine.succeed("jq -r .apiKey /tmp/restarted-session").strip() == login_key
     machine.succeed(
@@ -323,7 +326,7 @@ with subtest("an attachment file uploads to S3 and downloads via a presigned URL
     ).strip()
     machine.succeed(f"grep -iq 'zotero-file-md5: {md5}' /tmp/dlhdr")
     # The redirect targets the object store directly, not this server.
-    assert ":9000" in location and "8189" not in location, location
+    assert location.split("/", 3)[2] == "127.0.0.1:9000", location
     assert machine.succeed(f"curl -sf '{location}'").strip() == "hello"
 
 with subtest("re-authorizing the same file returns exists:1 (dedup)"):
@@ -343,6 +346,31 @@ with subtest("an unregistered replacement cannot change the live attachment"):
         f"-d 'md5={world_md5}&filename=t.pdf&filesize=5&mtime=1700000000001' "
         f"| jq -r .uploadKey"
     ).strip()
+    assert (
+        psql(
+            f"""select count(*) = 1
+                       and bool_and(position('{abandoned}' in row_to_json(p)::text) = 0)
+                from pending_uploads p
+                where library_id = 1 and item_key = 'ATTACH22'
+                  and state = 'authorized'"""
+        )
+        == "t"
+    )
+
+    # A crash after the atomic claim but before S3 completion restores the token
+    # to authorized when the single service process restarts.
+    psql(
+        """update pending_uploads set state = 'uploading'
+           where library_id = 1 and item_key = 'ATTACH22'"""
+    )
+    restart_zhost()
+    assert (
+        psql(
+            """select state from pending_uploads
+               where library_id = 1 and item_key = 'ATTACH22'"""
+        )
+        == "authorized"
+    )
     machine.succeed(
         f"printf world | curl -sf -X POST {base}/uploads/{abandoned} --data-binary @-"
     )
@@ -357,37 +385,69 @@ with subtest("an unregistered replacement cannot change the live attachment"):
     # DB pointer, readers must still receive the old metadata and old bytes.
     assert_attachment("ATTACH22", old_md5, "hello", "replacement-before-restart")
 
-    # Losing the in-memory pending token must abandon only the candidate, not
-    # corrupt the registered attachment.
-    machine.succeed("systemctl restart zhost.service")
-    machine.wait_for_unit("zhost.service")
-    machine.wait_for_open_port(8189)
+    # Uploaded candidate also survives restart so desktop can finish registration
+    # without re-uploading bytes.
+    restart_zhost()
     assert_attachment("ATTACH22", old_md5, "hello", "replacement-after-restart")
     assert (
         http_code(
             f"-X POST {base}/users/1/items/ATTACH22/file {auth} "
             f"-H 'If-Match: {old_md5}' -d 'upload={abandoned}'"
         )
-        == "400"
+        == "204"
     )
+    assert (
+        psql(
+            """select count(*) from pending_uploads
+               where library_id = 1 and item_key = 'ATTACH22'"""
+        )
+        == "0"
+    )
+    assert_attachment("ATTACH22", world_md5, "world", "replacement-registered")
 
-    replacement = machine.succeed(
+with subtest("expired upload candidates are deleted before their rows"):
+    world_md5 = "7d793037a0760186574b0282f2f435e7"
+    trash_md5 = "30639096bfe4ec4b9f17696ef1d02b9f"
+    expired_token = machine.succeed(
         f"curl -sf -X POST {base}/users/1/items/ATTACH22/file {auth} "
-        f"-H 'If-Match: {old_md5}' "
-        f"-d 'md5={world_md5}&filename=t.pdf&filesize=5&mtime=1700000000001' "
+        f"-H 'If-Match: {world_md5}' "
+        f"-d 'md5={trash_md5}&filename=t.pdf&filesize=5&mtime=1700000000002' "
         f"| jq -r .uploadKey"
     ).strip()
     machine.succeed(
-        f"printf world | curl -sf -X POST {base}/uploads/{replacement} --data-binary @-"
+        f"printf trash | curl -sf -X POST {base}/uploads/{expired_token} --data-binary @-"
     )
-    assert (
-        http_code(
-            f"-X POST {base}/users/1/items/ATTACH22/file {auth} "
-            f"-H 'If-Match: {old_md5}' -d 'upload={replacement}'"
-        )
-        == "204"
+    expired_blob = psql(
+        """select blob_key from pending_uploads
+           where library_id = 1 and item_key = 'ATTACH22' and state = 'uploaded'"""
     )
-    assert_attachment("ATTACH22", world_md5, "world", "replacement-registered")
+    machine.succeed(f"mc stat 's3/zotero/{expired_blob}'")
+    psql(
+        """update pending_uploads
+           set created_at = now() - interval '2 hours',
+               expires_at = now() - interval '1 hour'
+           where library_id = 1 and item_key = 'ATTACH22' and state = 'uploaded'"""
+    )
+    restart_zhost()
+    assert psql("select count(*) from pending_uploads where token_hash is not null") == "0"
+    machine.fail(f"mc stat 's3/zotero/{expired_blob}'")
+    assert_attachment("ATTACH22", world_md5, "world", "expired-candidate-cleanup")
+    psql(
+        """insert into pending_uploads (
+               token_hash, library_id, authorizer_key_hash, bootstrap_user_id,
+               item_key, blob_key, md5, filename, filesize, mtime,
+               created_at, expires_at
+           )
+           select decode(lpad(to_hex(i), 64, '0'), 'hex'), 1,
+                  decode(repeat('00', 32), 'hex'), 1,
+                  'GC' || lpad(i::text, 6, '0'),
+                  'libraries/1/uploads/gc-' || i,
+                  '00000000000000000000000000000000', 'gc', 0, 0,
+                  now() - interval '2 hours', now() - interval '1 hour'
+           from generate_series(1, 33) as i"""
+    )
+    restart_zhost()
+    assert psql("select count(*) from pending_uploads") == "0"
 
 with subtest("concurrent replacements compare-and-swap the registered md5"):
     world_md5 = "7d793037a0760186574b0282f2f435e7"
@@ -819,9 +879,10 @@ with subtest("a versions read with nothing newer returns 200 + empty map, not 30
         machine.succeed(f"curl -sf '{base}/users/1/{path}' {auth} | jq -e '. == {{}}'")
     # The version header is still present so the client keeps tracking the library version.
     machine.succeed(
-        f"curl -sf -D - -o /dev/null '{base}/users/1/items?format=versions&since={v}' {auth} "
-        f"| grep -iq 'last-modified-version: {v}'"
+        f"curl -sf -D /tmp/empty-versions.headers -o /dev/null "
+        f"'{base}/users/1/items?format=versions&since={v}' {auth}"
     )
+    machine.succeed(f"grep -iq 'last-modified-version: {v}' /tmp/empty-versions.headers")
     # settings still 304s — getSettings sends the If-Modified-Since-Version header
     # and handles a 304 itself.
     assert (

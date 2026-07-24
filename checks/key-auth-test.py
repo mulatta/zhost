@@ -47,6 +47,13 @@ def http_code(path, token=None, method="GET", body=None, version=None):
     ).strip()
 
 
+def restart_zhost():
+    machine.succeed("systemctl reset-failed zhost.service")
+    machine.succeed("systemctl restart zhost.service")
+    machine.wait_for_unit("zhost.service")
+    machine.wait_for_open_port(8189)
+
+
 def get_json(path, token):
     return json.loads(
         machine.succeed(
@@ -182,6 +189,11 @@ machine.wait_for_unit("zhost.service")
 machine.wait_for_open_port(8189)
 
 with subtest("populated v7 data survives the identity migration"):
+    assert (
+        psql("select string_agg(version::text, ',' order by version) from _sqlx_migrations")
+        == "1,2,3,4,5,6,7,8,9,10,11,12"
+    )
+    assert psql("select count(*) from pending_uploads") == "0"
     assert psql("select (id, version) = (1, 7) from library where id = 1") == "t"
     assert (
         psql(
@@ -253,9 +265,7 @@ with subtest("bootstrap identity owns the legacy personal library"):
     )
 
 with subtest("bootstrap OIDC identity remains unique across restarts"):
-    machine.succeed("systemctl restart zhost.service")
-    machine.wait_for_unit("zhost.service")
-    machine.wait_for_open_port(8189)
+    restart_zhost()
     assert (
         psql(
             f"""select count(*) = 1 and min(user_id) = 101
@@ -833,6 +843,13 @@ with subtest("group files revalidate policy and grants across upload steps"):
         )
         == "0"
     )
+    assert (
+        psql(
+            """select count(*) from pending_uploads
+               where library_id = 33 and item_key = 'STALAT22'"""
+        )
+        == "0"
+    )
     psql(
         """delete from object
            where library_id = 33 and kind = 'item' and key = 'STALAT22'"""
@@ -873,6 +890,7 @@ with subtest("group files revalidate policy and grants across upload steps"):
         http_code(f"/uploads/{revoked_before_register}", method="POST", body="hello")
         == "201"
     )
+    restart_zhost()
     psql("delete from api_key_group_permissions where api_key_id = 1008")
     assert (
         machine.succeed(
@@ -1529,6 +1547,27 @@ with subtest("same attachment key stays isolated across personal libraries"):
     assert machine.succeed(f"curl -sf '{alice_location}'").strip() == "hello"
     assert machine.succeed(f"curl -sf '{bob_location}'").strip() == "world"
 
+with subtest("recovery upload cannot cross bootstrap-user reconfiguration"):
+    recovery_pending = machine.succeed(
+        f"curl -sf -X POST {base}/users/101/items/SHARED22/file {api_headers} "
+        f"-H 'Zotero-API-Key: {recovery}' "
+        "-H 'If-Match: 5d41402abc4b2a76b9719d911017c592' "
+        "-d 'md5=7d793037a0760186574b0282f2f435e7&filename=r.pdf&filesize=5&mtime=4' "
+        "| jq -r .uploadKey"
+    ).strip()
+    psql(
+        """update pending_uploads set bootstrap_user_id = 202
+           where library_id = 1 and item_key = 'SHARED22'"""
+    )
+    restart_zhost()
+    assert http_code(f"/uploads/{recovery_pending}", method="POST", body="world") == "403"
+    psql(
+        """update pending_uploads
+           set created_at = now() - interval '2 hours',
+               expires_at = now() - interval '1 hour'
+           where library_id = 1 and item_key = 'SHARED22'"""
+    )
+
 with subtest("revoked key cannot finish an authorized upload"):
     psql(
         """insert into object (library_id, kind, key, version, data)
@@ -1545,6 +1584,7 @@ with subtest("revoked key cannot finish an authorized upload"):
         "-d 'md5=7d793037a0760186574b0282f2f435e7&filename=r.pdf&filesize=5&mtime=3' "
         "| jq -r .uploadKey"
     ).strip()
+    restart_zhost()
     psql("update api_keys set revoked_at = now() where id = 1005")
     assert http_code(f"/uploads/{pending_token}", method="POST", body="world") == "403"
 
