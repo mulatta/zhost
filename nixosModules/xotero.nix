@@ -79,15 +79,22 @@ in
       description = "PostgreSQL connection URL (defaults to the local peer socket).";
     };
 
-    loginAuthorizedUser = lib.mkOption {
-      type = lib.types.nullOr lib.types.str;
-      default = null;
-      example = "me@example.org";
+    bootstrapOidcIssuer = lib.mkOption {
+      type = lib.types.str;
+      example = "https://id.example.org";
       description = ''
-        If set, `POST /login` only authorizes a session when the front SSO proxy
-        forwards a matching `X-Auth-Request-Email`/`-User` (e.g. the kanidm user
-        allowed to enroll). Leave null on a private network, where reachability
-        is the gate.
+        Stable OIDC issuer for the bootstrap user's external identity. Reverse
+        proxy must overwrite `X-Xotero-OIDC-Issuer` from its verified claim.
+        Changing this adds a mapping; remove retired mappings explicitly.
+      '';
+    };
+
+    bootstrapOidcSubject = lib.mkOption {
+      type = lib.types.str;
+      example = "248289761001";
+      description = ''
+        Stable OIDC subject for the bootstrap user's external identity. Reverse
+        proxy must overwrite `X-Xotero-OIDC-Subject` from its verified claim.
       '';
     };
 
@@ -201,6 +208,20 @@ in
         assertion = allKeys != { };
         message = "services.xotero: configure at least one key via `keys` or `apiKeyFile`.";
       }
+      {
+        assertion = cfg.bootstrapOidcIssuer != "";
+        message = "services.xotero.bootstrapOidcIssuer must be nonempty.";
+      }
+      {
+        assertion = cfg.bootstrapOidcSubject != "";
+        message = "services.xotero.bootstrapOidcSubject must be nonempty.";
+      }
+      {
+        assertion =
+          lib.hasPrefix "127." cfg.bind
+          || lib.hasPrefix "[::1]:" cfg.bind;
+        message = "services.xotero.bind must be loopback so only a trusted local proxy can set OIDC headers.";
+      }
     ];
 
     services.postgresql = lib.mkIf cfg.createLocalDatabase {
@@ -233,6 +254,8 @@ in
         XOTERO_USER_ID = toString cfg.bootstrapUserId;
         XOTERO_USERNAME = cfg.bootstrapUsername;
         XOTERO_DISPLAY_NAME = cfg.bootstrapDisplayName;
+        XOTERO_BOOTSTRAP_OIDC_ISSUER = cfg.bootstrapOidcIssuer;
+        XOTERO_BOOTSTRAP_OIDC_SUBJECT = cfg.bootstrapOidcSubject;
         XOTERO_S3_ENDPOINT = cfg.s3.endpoint;
         XOTERO_S3_REGION = cfg.s3.region;
         XOTERO_S3_BUCKET = cfg.s3.bucket;
@@ -244,9 +267,6 @@ in
         XOTERO_LOGIN_KDF_KEY_FILE = "%d/login-kdf-key";
         XOTERO_KEYS = keyManifest;
         RUST_LOG = "info";
-      }
-      // lib.optionalAttrs (cfg.loginAuthorizedUser != null) {
-        XOTERO_LOGIN_AUTHORIZED_USER = cfg.loginAuthorizedUser;
       };
 
       serviceConfig = {

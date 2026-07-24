@@ -218,6 +218,40 @@ pub async fn bootstrap_identity(
     tx.commit().await
 }
 
+/// Add one externally authenticated identity to the configured bootstrap user.
+/// Existing tuple ownership is never rewritten. A new configured tuple adds a
+/// mapping; removing an old provider identity remains an explicit DB operation.
+pub async fn bootstrap_external_identity(
+    pool: &PgPool,
+    issuer: &str,
+    subject: &str,
+    user_id: UserId,
+) -> sqlx::Result<()> {
+    let mut tx = pool.begin().await?;
+    sqlx::query(
+        "insert into external_identities (issuer, subject, user_id) \
+         values ($1, $2, $3) on conflict (issuer, subject) do nothing",
+    )
+    .bind(issuer)
+    .bind(subject)
+    .bind(user_id.get())
+    .execute(&mut *tx)
+    .await?;
+    let mapped_user_id: i64 = sqlx::query_scalar(
+        "select user_id from external_identities where issuer = $1 and subject = $2 for update",
+    )
+    .bind(issuer)
+    .bind(subject)
+    .fetch_one(&mut *tx)
+    .await?;
+    if mapped_user_id != user_id.get() {
+        return Err(sqlx::Error::Protocol(format!(
+            "external identity ({issuer}, {subject}) already belongs to user {mapped_user_id}"
+        )));
+    }
+    tx.commit().await
+}
+
 /// Resolve the bootstrap principal on every static-key request so disabling the
 /// user takes effect immediately.
 pub async fn bootstrap_principal(
@@ -371,7 +405,8 @@ pub async fn complete_login_session(
     pool: &PgPool,
     token_hash: &[u8],
     api_key_hash: &[u8],
-    user_id: UserId,
+    issuer: &str,
+    subject: &str,
 ) -> sqlx::Result<LoginSessionChange> {
     let mut tx = pool.begin().await?;
     let session = sqlx::query(
@@ -390,20 +425,26 @@ pub async fn complete_login_session(
     if session.get::<bool, _>("expired") {
         return Ok(LoginSessionChange::Expired);
     }
-    let active = sqlx::query_scalar::<_, bool>(
-        "select exists( \
-             select 1 from users u \
-             join personal_libraries pl on pl.user_id = u.id \
-             join library l on l.id = pl.library_id and l.kind = 'personal' \
-             where u.id = $1 and u.disabled_at is null \
-         )",
+    // Resolve and lock identity ownership inside key-creation transaction.
+    // Relinking or disabling cannot race approval and mint for a stale user.
+    let mapped_user_id = sqlx::query_scalar::<_, i64>(
+        "select u.id \
+         from external_identities e \
+         join users u on u.id = e.user_id and u.disabled_at is null \
+         join personal_libraries pl on pl.user_id = u.id \
+         join library l on l.id = pl.library_id and l.kind = 'personal' \
+         where e.issuer = $1 and e.subject = $2 \
+         for share of e, u, pl, l",
     )
-    .bind(user_id.get())
-    .fetch_one(&mut *tx)
+    .bind(issuer)
+    .bind(subject)
+    .fetch_optional(&mut *tx)
     .await?;
-    if !active {
+    let Some(mapped_user_id) = mapped_user_id else {
         return Ok(LoginSessionChange::UserUnavailable);
-    }
+    };
+    let user_id = UserId::new(mapped_user_id)
+        .ok_or_else(|| sqlx::Error::Protocol(format!("invalid mapped user ID {mapped_user_id}")))?;
     let client_type: String = session.get("client_type");
     let key_name = match client_type.as_str() {
         "mac" => "Zotero for Mac",
