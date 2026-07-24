@@ -217,9 +217,7 @@ in
         message = "services.zhost.bootstrapOidcSubject must be nonempty.";
       }
       {
-        assertion =
-          lib.hasPrefix "127." cfg.bind
-          || lib.hasPrefix "[::1]:" cfg.bind;
+        assertion = lib.hasPrefix "127." cfg.bind || lib.hasPrefix "[::1]:" cfg.bind;
         message = "services.zhost.bind must be loopback so only a trusted local proxy can set OIDC headers.";
       }
     ];
