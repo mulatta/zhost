@@ -257,12 +257,16 @@ fn version_headers(version: i64) -> HeaderMap {
     headers
 }
 
-async fn current_headers(state: &AppState, library_id: LibraryId) -> HeaderMap {
-    version_headers(
-        store::current_version(&state.pool, library_id)
-            .await
-            .unwrap_or(0),
-    )
+async fn current_library_version(state: &AppState, library_id: LibraryId) -> Result<i64, Response> {
+    store::current_version(&state.pool, library_id)
+        .await
+        .map_err(|error| server_error("current library version", error))
+}
+
+async fn current_headers(state: &AppState, library_id: LibraryId) -> Result<HeaderMap, Response> {
+    current_library_version(state, library_id)
+        .await
+        .map(version_headers)
 }
 
 /// For a since/versions read: the current library version, and whether the
@@ -270,11 +274,13 @@ async fn current_headers(state: &AppState, library_id: LibraryId) -> HeaderMap {
 /// version greater than `since`). `since == 0` is the initial pull, so never
 /// 304 it. One DB read, so the caller reuses `current` for the response's
 /// `Last-Modified-Version` instead of querying it again.
-async fn since_check(state: &AppState, library_id: LibraryId, since: i64) -> (i64, bool) {
-    let current = store::current_version(&state.pool, library_id)
-        .await
-        .unwrap_or(0);
-    (current, since > 0 && since >= current)
+async fn since_check(
+    state: &AppState,
+    library_id: LibraryId,
+    since: i64,
+) -> Result<(i64, bool), Response> {
+    let current = current_library_version(state, library_id).await?;
+    Ok((current, since > 0 && since >= current))
 }
 
 /// The `If-Modified-Since-Version` request header (0 if absent/unparseable). The
@@ -448,11 +454,10 @@ async fn groups(
     State(state): State<AppState>,
     Extension(context): Extension<RequestContext>,
 ) -> Response {
-    (
-        current_headers(&state, context.principal.library_id).await,
-        Json(json!({})),
-    )
-        .into_response()
+    match current_headers(&state, context.principal.library_id).await {
+        Ok(headers) => (headers, Json(json!({}))).into_response(),
+        Err(response) => response,
+    }
 }
 
 fn server_error(context: &str, error: sqlx::Error) -> Response {
@@ -525,9 +530,10 @@ async fn read(
         // 304 as "no data", which then mismatches its library-version check and
         // makes it restart the sync forever. 304 is only for the header path
         // (settings), not for `?since=` versions reads.
-        let current = store::current_version(&state.pool, library_id)
-            .await
-            .unwrap_or(0);
+        let current = match current_library_version(state, library_id).await {
+            Ok(current) => current,
+            Err(response) => return response,
+        };
         return match store::versions(&state.pool, library_id, kind, since, true).await {
             Ok(value) => (version_headers(current), Json(value)).into_response(),
             Err(error) => server_error("read", error),
@@ -535,7 +541,10 @@ async fn read(
     }
     let keys = csv_of(&params, &format!("{kind}Key"));
     match store::objects(&state.pool, library_id, kind, &keys, true).await {
-        Ok(value) => (current_headers(state, library_id).await, Json(value)).into_response(),
+        Ok(value) => match current_headers(state, library_id).await {
+            Ok(headers) => (headers, Json(value)).into_response(),
+            Err(response) => response,
+        },
         Err(error) => server_error("read", error),
     }
 }
@@ -557,9 +566,10 @@ async fn item_sync_read(
             .and_then(|s| s.parse().ok())
             .unwrap_or(0);
         // Always 200 + map (never 304); see `read` — a 304 here loops the client.
-        let current = store::current_version(&state.pool, library_id)
-            .await
-            .unwrap_or(0);
+        let current = match current_library_version(state, library_id).await {
+            Ok(current) => current,
+            Err(response) => return Some(response),
+        };
         let result = if top {
             store::top_versions(&state.pool, library_id, since, permissions.notes).await
         } else {
@@ -574,9 +584,10 @@ async fn item_sync_read(
         let keys: Vec<String> = csv.split(',').map(String::from).collect();
         return Some(
             match store::objects(&state.pool, library_id, "item", &keys, permissions.notes).await {
-                Ok(value) => {
-                    (current_headers(state, library_id).await, Json(value)).into_response()
-                }
+                Ok(value) => match current_headers(state, library_id).await {
+                    Ok(headers) => (headers, Json(value)).into_response(),
+                    Err(response) => response,
+                },
                 Err(error) => server_error("items batch", error),
             },
         );
@@ -597,7 +608,10 @@ async fn item_listing(
 ) -> Response {
     match store::query_items(&state.pool, library_id, q, permissions.notes).await {
         Ok((items, total)) => {
-            let mut headers = current_headers(state, library_id).await;
+            let mut headers = match current_headers(state, library_id).await {
+                Ok(headers) => headers,
+                Err(response) => return response,
+            };
             headers.insert("total-results", total.to_string().parse().unwrap());
             if q.start + q.limit < total {
                 let link = next_link(&state.config, path, raw, q.start + q.limit);
@@ -638,7 +652,10 @@ async fn item_keys_response(
         match store::item_keys(&state.pool, library_id, q, permissions.notes).await {
             // A `String` body sets `Content-Type: text/plain`, which is what the
             // client expects; current_headers adds `Last-Modified-Version`.
-            Ok(keys) => (current_headers(state, library_id).await, keys.join("\n")).into_response(),
+            Ok(keys) => match current_headers(state, library_id).await {
+                Ok(headers) => (headers, keys.join("\n")).into_response(),
+                Err(response) => response,
+            },
             Err(error) => server_error("item keys", error),
         },
     )
@@ -834,12 +851,12 @@ async fn tags_get(
     State(state): State<AppState>,
     Extension(context): Extension<RequestContext>,
 ) -> Response {
-    match store::tags(&state.pool, context.principal.library_id).await {
-        Ok(value) => (
-            current_headers(&state, context.principal.library_id).await,
-            Json(value),
-        )
-            .into_response(),
+    let library_id = context.principal.library_id;
+    match store::tags(&state.pool, library_id).await {
+        Ok(value) => match current_headers(&state, library_id).await {
+            Ok(headers) => (headers, Json(value)).into_response(),
+            Err(response) => response,
+        },
         Err(error) => server_error("tags", error),
     }
 }
@@ -966,7 +983,10 @@ async fn settings_read(
     // The client may send the cursor as ?since= or the If-Modified-Since-Version
     // header; honour whichever is higher.
     let since = since_of(&params).max(if_modified_since(&headers));
-    let (current, fresh) = since_check(&state, context.principal.library_id, since).await;
+    let (current, fresh) = match since_check(&state, context.principal.library_id, since).await {
+        Ok(result) => result,
+        Err(response) => return response,
+    };
     if fresh {
         return (StatusCode::NOT_MODIFIED, version_headers(current)).into_response();
     }
@@ -1041,11 +1061,10 @@ async fn deleted(
 ) -> Response {
     let since = since_of(&params);
     match store::deleted(&state.pool, context.principal.library_id, since).await {
-        Ok(value) => (
-            current_headers(&state, context.principal.library_id).await,
-            Json(value),
-        )
-            .into_response(),
+        Ok(value) => match current_headers(&state, context.principal.library_id).await {
+            Ok(headers) => (headers, Json(value)).into_response(),
+            Err(response) => response,
+        },
         Err(error) => server_error("deleted", error),
     }
 }
@@ -1059,9 +1078,10 @@ async fn fulltext_versions(
 ) -> Response {
     let since = since_of(&params);
     // Always 200 + map (never 304); see `read` — a 304 here loops the client.
-    let current = store::current_version(&state.pool, context.principal.library_id)
-        .await
-        .unwrap_or(0);
+    let current = match current_library_version(&state, context.principal.library_id).await {
+        Ok(current) => current,
+        Err(response) => return response,
+    };
     match store::fulltext_versions(&state.pool, context.principal.library_id, since).await {
         Ok(value) => (version_headers(current), Json(value)).into_response(),
         Err(error) => server_error("fulltext versions", error),
@@ -1207,7 +1227,7 @@ async fn file_post(
 
     let md5 = form.get("md5").cloned().unwrap_or_default();
     let stored_md5 = match store::file_meta(&state.pool, context.principal.library_id, &key).await {
-        Ok(meta) => meta.map(|(md5, _, _)| md5),
+        Ok(meta) => meta.map(|(m, _, _)| m),
         Err(error) => return server_error("file auth", error),
     };
 
@@ -1218,17 +1238,15 @@ async fn file_post(
         // different existing file → conflict.
         if let Some(existing) = &stored_md5 {
             if existing.eq_ignore_ascii_case(&md5) {
-                return (
-                    current_headers(&state, context.principal.library_id).await,
-                    Json(json!({ "exists": 1 })),
-                )
-                    .into_response();
+                return match current_headers(&state, context.principal.library_id).await {
+                    Ok(headers) => (headers, Json(json!({ "exists": 1 }))).into_response(),
+                    Err(response) => response,
+                };
             }
-            return conflict(
-                store::current_version(&state.pool, context.principal.library_id)
-                    .await
-                    .unwrap_or(0),
-            );
+            return match current_library_version(&state, context.principal.library_id).await {
+                Ok(current) => conflict(current),
+                Err(response) => response,
+            };
         }
     } else if let Some(want) = &if_match {
         // "Only if the current md5 matches." Otherwise → conflict.
@@ -1236,11 +1254,10 @@ async fn file_post(
             .as_deref()
             .is_some_and(|m| m.eq_ignore_ascii_case(want))
         {
-            return conflict(
-                store::current_version(&state.pool, context.principal.library_id)
-                    .await
-                    .unwrap_or(0),
-            );
+            return match current_library_version(&state, context.principal.library_id).await {
+                Ok(current) => conflict(current),
+                Err(response) => response,
+            };
         }
     }
 

@@ -339,6 +339,31 @@ with subtest("protected requests authenticate before consuming their body"):
 with subtest("invalid upload tokens are rejected before consuming their body"):
     assert incomplete_body_http_code("/uploads/not-a-real-upload-token") == "400"
 
+with subtest("library version lookup failures fail closed"):
+    # Keep authentication and the resource queries operational while making only
+    # `select version from library` fail. Capture both responses before restoring
+    # the schema so failed assertions cannot strand the service in this state.
+    psql("alter table library rename column version to unavailable_version")
+    settings_code = machine.succeed(
+        f"curl -sS -D /tmp/version-failure-settings.headers -o /dev/null "
+        f"-w '%{{http_code}}' {api_headers} "
+        f"-H 'Zotero-API-Key: {bob_ro}' "
+        f"-H 'If-Modified-Since-Version: 999' "
+        f"{base}/users/202/settings"
+    ).strip()
+    versions_code = machine.succeed(
+        f"curl -sS -D /tmp/version-failure-versions.headers -o /dev/null "
+        f"-w '%{{http_code}}' {api_headers} "
+        f"-H 'Zotero-API-Key: {bob_ro}' "
+        f"'{base}/users/202/items?format=versions&since=0'"
+    ).strip()
+    psql("alter table library rename column unavailable_version to version")
+
+    assert settings_code == "500"
+    assert versions_code == "500"
+    machine.fail("grep -i '^last-modified-version:' /tmp/version-failure-settings.headers")
+    machine.fail("grep -i '^last-modified-version:' /tmp/version-failure-versions.headers")
+
 with subtest("disabled users fail closed for DB and recovery keys"):
     psql("update users set disabled_at = now() where id = 202")
     assert http_code("/keys/current", bob_ro) == "403"
