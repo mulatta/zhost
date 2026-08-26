@@ -1,5 +1,7 @@
 """DB-backed API-key contract and populated-v7 migration coverage."""
 
+import shlex
+
 base = "http://localhost:8189"
 recovery = "recoverytoken"
 alice = "AliceKey23456789AbCdEfGh"
@@ -29,6 +31,29 @@ def http_code(path, token=None, method="GET", body=None, version=None):
         f"curl -s -o /dev/null -w '%{{http_code}}' -X {method} "
         f"{api_headers} {auth} {data} {base}{path}"
     ).strip()
+
+
+def incomplete_body_http_code(path, headers=()):
+    """Send only request headers and require an early response within 3 seconds."""
+    request = "\r\n".join(
+        [
+            f"POST {path} HTTP/1.1",
+            "Host: localhost",
+            "Connection: close",
+            "Content-Length: 1048576",
+            *headers,
+            "",
+            "",
+        ]
+    )
+    script = (
+        "exec 3<>/dev/tcp/127.0.0.1/8189; "
+        f"printf %s {shlex.quote(request)} >&3; "
+        "IFS= read -r -t 3 status <&3; "
+        "printf %s \"${status%$'\r'}\""
+    )
+    status = machine.succeed("timeout 5 bash -c " + shlex.quote(script)).strip()
+    return status.split()[1]
 
 
 machine.wait_for_unit("postgresql.service")
@@ -296,6 +321,23 @@ with subtest("static recovery key remains bound to the bootstrap user"):
 with subtest("unknown and revoked keys fail closed"):
     assert http_code("/keys/current", "unknown-token") == "403"
     assert http_code("/keys/current", revoked) == "403"
+
+with subtest("protected requests authenticate before consuming their body"):
+    assert (
+        incomplete_body_http_code(
+            "/users/202/items",
+            (
+                "Zotero-API-Version: 3",
+                "Zotero-Schema-Version: 42",
+                "Zotero-API-Key: unknown-token",
+                "Content-Type: application/json",
+            ),
+        )
+        == "403"
+    )
+
+with subtest("invalid upload tokens are rejected before consuming their body"):
+    assert incomplete_body_http_code("/uploads/not-a-real-upload-token") == "400"
 
 with subtest("disabled users fail closed for DB and recovery keys"):
     psql("update users set disabled_at = now() where id = 202")

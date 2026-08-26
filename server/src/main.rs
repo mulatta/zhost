@@ -130,10 +130,47 @@ fn upload_token() -> Option<String> {
     Some(buf.iter().map(|b| format!("{b:02x}")).collect())
 }
 
-/// Maximum buffered request body. Attachments can be large; everything else is
-/// tiny. A finite cap bounds per-request memory so one device can't OOM the host
-/// (the body is fully buffered by the auth middleware before handlers run).
+/// Maximum buffered attachment body. This remains an interim bound until the
+/// object-store client supports streaming uploads.
 const MAX_BODY: usize = 256 * 1024 * 1024;
+
+/// Public login/session requests are tiny and do not need the attachment limit.
+const MAX_BOOTSTRAP_BODY: usize = 1024 * 1024;
+
+/// Buffer one already-authorized request body and decode HTTP gzip content off
+/// the Tokio worker. Both the encoded and decoded representations are bounded.
+async fn buffered_body(
+    headers: &mut HeaderMap,
+    body: Body,
+    limit: usize,
+) -> Result<Bytes, Response> {
+    let raw = axum::body::to_bytes(body, limit)
+        .await
+        .map_err(|_| (StatusCode::PAYLOAD_TOO_LARGE, "request body too large").into_response())?;
+    let gzipped = headers
+        .get("content-encoding")
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|encoding| encoding.contains("gzip"));
+    if !gzipped {
+        return Ok(raw);
+    }
+
+    let decoded = tokio::task::spawn_blocking(move || {
+        use std::io::Read;
+
+        let mut decoder = flate2::read::GzDecoder::new(&raw[..]).take((limit + 1) as u64);
+        let mut output = Vec::new();
+        decoder.read_to_end(&mut output).map_err(|_| ())?;
+        (output.len() <= limit).then_some(output).ok_or(())
+    })
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())?
+    .map_err(|_| (StatusCode::BAD_REQUEST, "invalid gzip request body").into_response())?;
+
+    headers.remove("content-encoding");
+    headers.remove("content-length");
+    Ok(Bytes::from(decoded))
+}
 
 /// Item keys become object keys in the bucket (and path components in URLs), so
 /// reject anything that isn't a plain alphanumeric token (no `/`, `.`, `..`).
@@ -1266,7 +1303,7 @@ async fn file_post(
 async fn upload_put(
     State(state): State<AppState>,
     Path(token): Path<String>,
-    body: Bytes,
+    request: Request,
 ) -> Response {
     let pending = {
         let mut pending = PENDING.lock().unwrap();
@@ -1297,6 +1334,15 @@ async fn upload_put(
             Err(error) => return server_error("upload authorization", error),
         }
     }
+
+    // The capability and its live key permissions are checked before consuming
+    // a potentially large body. A guessed/expired token therefore cannot force
+    // allocation or hashing work.
+    let (mut parts, request_body) = request.into_parts();
+    let body = match buffered_body(&mut parts.headers, request_body, MAX_BODY).await {
+        Ok(body) => body,
+        Err(response) => return response,
+    };
     let actual_md5 = {
         use md5::{Digest, Md5};
         format!("{:x}", Md5::new().chain_update(&body).finalize())
@@ -1389,45 +1435,16 @@ fn request_log_path(path: &str) -> &str {
     }
 }
 
-/// Decode gzip write bodies, log safe routing metadata, and reject anything
-/// without the configured key except bootstrap endpoints. Query strings, form
-/// values, and content never enter logs because they can hold capability tokens
-/// and private library data.
+/// Log safe routing metadata, authorize protected routes, then decode bounded
+/// gzip bodies. Query strings, form values, and content never enter logs because
+/// they can hold capability tokens and private library data.
 async fn log_and_auth(State(state): State<AppState>, req: Request, next: Next) -> Response {
     let (mut parts, body) = req.into_parts();
-    let raw = match axum::body::to_bytes(body, MAX_BODY).await {
-        Ok(raw) => raw,
-        Err(_) => return (StatusCode::PAYLOAD_TOO_LARGE, "request body too large").into_response(),
-    };
-
-    let gzipped = parts
-        .headers
-        .get("content-encoding")
-        .and_then(|v| v.to_str().ok())
-        .is_some_and(|e| e.contains("gzip"));
-    let bytes = if gzipped {
-        use std::io::Read;
-        // Cap the decompressed size too, so a small gzip can't expand without
-        // bound (a malformed/over-large body then fails to parse downstream).
-        let mut decoder = flate2::read::GzDecoder::new(&raw[..]).take(MAX_BODY as u64);
-        let mut out = Vec::new();
-        match decoder.read_to_end(&mut out) {
-            Ok(_) => {
-                parts.headers.remove("content-encoding");
-                parts.headers.remove("content-length");
-                Bytes::from(out)
-            }
-            Err(_) => raw,
-        }
-    } else {
-        raw
-    };
-
     let header = |name: &str| {
         parts
             .headers
             .get(name)
-            .and_then(|v| v.to_str().ok())
+            .and_then(|value| value.to_str().ok())
             .unwrap_or("-")
             .to_string()
     };
@@ -1439,13 +1456,14 @@ async fn log_and_auth(State(state): State<AppState>, req: Request, next: Next) -
         path = %log_path,
         api_version = %header("zotero-api-version"),
         if_unmod = %header("if-unmodified-since-version"),
-        body_bytes = bytes.len(),
         "request"
     );
 
-    let is_bootstrap =
-        path.starts_with("/keys/sessions") || path.starts_with("/uploads") || path == "/login";
+    let is_upload = path.starts_with("/uploads/");
+    let is_bootstrap = path.starts_with("/keys/sessions") || is_upload || path == "/login";
     if !is_bootstrap {
+        // Authentication and path authorization deliberately happen before the
+        // body is read, decompressed, or allocated.
         let context = match authenticate_request(&state, &parts.headers).await {
             Ok(Some(context)) => context,
             Ok(None) => return (StatusCode::FORBIDDEN, "invalid API key").into_response(),
@@ -1473,7 +1491,24 @@ async fn log_and_auth(State(state): State<AppState>, req: Request, next: Next) -
         parts.extensions.insert(context);
     }
 
-    let request = Request::from_parts(parts, Body::from(bytes));
+    // Upload capabilities are checked inside upload_put before that handler
+    // consumes its body. Other public bootstrap requests get a small limit;
+    // authenticated API requests retain the existing compatibility bound.
+    let request = if is_upload {
+        Request::from_parts(parts, body)
+    } else {
+        let limit = if is_bootstrap {
+            MAX_BOOTSTRAP_BODY
+        } else {
+            MAX_BODY
+        };
+        let bytes = match buffered_body(&mut parts.headers, body, limit).await {
+            Ok(bytes) => bytes,
+            Err(response) => return response,
+        };
+        Request::from_parts(parts, Body::from(bytes))
+    };
+
     let response = next.run(request).await;
     let status = response.status();
     if status.is_client_error() || status.is_server_error() {
