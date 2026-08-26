@@ -18,6 +18,20 @@ def library_version():
     ).strip()
 
 
+def assert_attachment(item_key, expected_md5, expected_body, scratch):
+    headers = f"/tmp/{scratch}.headers"
+    machine.succeed(
+        f"curl -sf -D {headers} -o /dev/null "
+        f"{base}/users/1/items/{item_key}/file {auth}"
+    )
+    machine.succeed(f"grep -iq 'zotero-file-md5: {expected_md5}' {headers}")
+    location = machine.succeed(
+        f"grep -i '^location:' {headers} | tr -d '\\r' | awk '{{print $2}}'"
+    ).strip()
+    actual_body = machine.succeed(f"curl -sf '{location}'").strip()
+    assert actual_body == expected_body, (expected_body, actual_body)
+
+
 machine.wait_for_unit("postgresql.service")
 machine.wait_for_unit("rustfs.service")
 machine.wait_for_open_port(9000)
@@ -78,7 +92,7 @@ with subtest("the api key is required off the bootstrap paths"):
 
 with subtest("a read-only key reads but cannot write"):
     assert http_code(f"'{base}/users/1/items?format=versions&since=0' {readonly}") == "200"
-    machine.succeed(f"curl -sf {base}/keys/current {readonly} | jq -e '.access.user.write == false'")
+    machine.succeed(f"curl -sf {base}/keys/current {readonly} | jq -e '.access.user.write == null'")
     machine.succeed(f"curl -sf {base}/keys/current {auth} | jq -e '.access.user.write == true'")
     assert (
         http_code(
@@ -203,6 +217,134 @@ with subtest("re-authorizing the same file returns exists:1 (dedup)"):
         f"-d 'md5=5d41402abc4b2a76b9719d911017c592&filename=t.pdf&filesize=5&mtime=1700000000000' "
         f"| jq -e '.exists == 1'"
     )
+
+with subtest("an unregistered replacement cannot change the live attachment"):
+    old_md5 = "5d41402abc4b2a76b9719d911017c592"
+    world_md5 = "7d793037a0760186574b0282f2f435e7"
+    abandoned = machine.succeed(
+        f"curl -sf -X POST {base}/users/1/items/ATTACH22/file {auth} "
+        f"-H 'If-Match: {old_md5}' "
+        f"-d 'md5={world_md5}&filename=t.pdf&filesize=5&mtime=1700000000001' "
+        f"| jq -r .uploadKey"
+    ).strip()
+    machine.succeed(
+        f"printf world | curl -sf -X POST {base}/uploads/{abandoned} --data-binary @-"
+    )
+    assert (
+        http_code(
+            f"-X POST {base}/uploads/{abandoned} --data-binary 'world'"
+        )
+        == "409"
+    )
+
+    # Uploaded bytes are an immutable candidate. Until registration commits its
+    # DB pointer, readers must still receive the old metadata and old bytes.
+    assert_attachment("ATTACH22", old_md5, "hello", "replacement-before-restart")
+
+    # Losing the in-memory pending token must abandon only the candidate, not
+    # corrupt the registered attachment.
+    machine.succeed("systemctl restart zhost.service")
+    machine.wait_for_unit("zhost.service")
+    machine.wait_for_open_port(8189)
+    assert_attachment("ATTACH22", old_md5, "hello", "replacement-after-restart")
+    assert (
+        http_code(
+            f"-X POST {base}/users/1/items/ATTACH22/file {auth} "
+            f"-H 'If-Match: {old_md5}' -d 'upload={abandoned}'"
+        )
+        == "400"
+    )
+
+    replacement = machine.succeed(
+        f"curl -sf -X POST {base}/users/1/items/ATTACH22/file {auth} "
+        f"-H 'If-Match: {old_md5}' "
+        f"-d 'md5={world_md5}&filename=t.pdf&filesize=5&mtime=1700000000001' "
+        f"| jq -r .uploadKey"
+    ).strip()
+    machine.succeed(
+        f"printf world | curl -sf -X POST {base}/uploads/{replacement} --data-binary @-"
+    )
+    assert (
+        http_code(
+            f"-X POST {base}/users/1/items/ATTACH22/file {auth} "
+            f"-H 'If-Match: {old_md5}' -d 'upload={replacement}'"
+        )
+        == "204"
+    )
+    assert_attachment("ATTACH22", world_md5, "world", "replacement-registered")
+
+with subtest("concurrent replacements compare-and-swap the registered md5"):
+    world_md5 = "7d793037a0760186574b0282f2f435e7"
+    first_md5 = "8b04d5e3775d298e78455efc5ca404d5"
+    other_md5 = "795f3202b17cb6bc3d4b771d8c6c9eaf"
+    version_before = int(library_version())
+
+    first_token = machine.succeed(
+        f"curl -sf -X POST {base}/users/1/items/ATTACH22/file {auth} "
+        f"-H 'If-Match: {world_md5}' "
+        f"-d 'md5={first_md5}&filename=t.pdf&filesize=5&mtime=1700000000002' "
+        f"| jq -r .uploadKey"
+    ).strip()
+    other_token = machine.succeed(
+        f"curl -sf -X POST {base}/users/1/items/ATTACH22/file {auth} "
+        f"-H 'If-Match: {world_md5}' "
+        f"-d 'md5={other_md5}&filename=t.pdf&filesize=5&mtime=1700000000003' "
+        f"| jq -r .uploadKey"
+    ).strip()
+    machine.succeed(
+        f"printf first | curl -sf -X POST {base}/uploads/{first_token} --data-binary @-"
+    )
+    machine.succeed(
+        f"printf other | curl -sf -X POST {base}/uploads/{other_token} --data-binary @-"
+    )
+
+    assert (
+        http_code(
+            f"-X POST {base}/users/1/items/ATTACH22/file {auth} "
+            f"-H 'If-Match: {world_md5}' -d 'upload={first_token}'"
+        )
+        == "204"
+    )
+    version_after_first = int(library_version())
+    assert version_after_first == version_before + 1
+
+    stale_code = machine.succeed(
+        f"curl -s -D /tmp/stale-registration.headers -o /dev/null "
+        f"-w '%{{http_code}}' -X POST "
+        f"{base}/users/1/items/ATTACH22/file {auth} "
+        f"-H 'If-Match: {world_md5}' -d 'upload={other_token}'"
+    ).strip()
+    assert stale_code == "412", stale_code
+    machine.succeed(
+        "grep -i '^last-modified-version:' /tmp/stale-registration.headers "
+        f"| tr -d '\\r' | awk '{{print $2}}' | grep -qx '{version_after_first}'"
+    )
+    assert int(library_version()) == version_after_first
+    assert (
+        http_code(
+            f"-X POST {base}/users/1/items/ATTACH22/file {auth} "
+            f"-H 'If-Match: {world_md5}' -d 'upload={other_token}'"
+        )
+        == "400"
+    )
+    assert int(library_version()) == version_after_first
+    assert_attachment("ATTACH22", first_md5, "first", "replacement-race-winner")
+    machine.succeed(
+        f"curl -sf '{base}/users/1/items?itemKey=ATTACH22&format=json' {auth} "
+        f"| jq -e '.[0].data.md5 == \"{first_md5}\" "
+        f"and .[0].data.version == {version_after_first}'"
+    )
+
+    # Registration tokens are single-use. Upstream returns 400 after removing
+    # a completed upload key.
+    assert (
+        http_code(
+            f"-X POST {base}/users/1/items/ATTACH22/file {auth} "
+            f"-H 'If-Match: {world_md5}' -d 'upload={first_token}'"
+        )
+        == "400"
+    )
+    assert int(library_version()) == version_after_first
 
 with subtest("a file authorization without a precondition header is 428"):
     assert (
@@ -693,4 +835,79 @@ with subtest("deletes are recorded in the deletion log"):
     )
     machine.succeed(
         f"curl -sf '{base}/users/1/deleted?since=0' {auth} | jq -e '.items | index(\"ITEM2223\")'"
+    )
+
+with subtest("request journal keeps routing evidence without secrets or content"):
+    form_marker = "ZHOST_JOURNAL_FORM_SECRET_9A6C1D"
+    upload_marker = "ZHOST_JOURNAL_UPLOAD_SECRET_7F3C9A"
+    json_marker = "ZHOST_JOURNAL_JSON_SECRET_4D8E2B"
+
+    machine.succeed(f"curl -sf -X POST {base}/keys/sessions -d '{{}}' > /tmp/journal-session")
+    session_token = machine.succeed("jq -r .sessionToken /tmp/journal-session").strip()
+    login_url = machine.succeed("jq -r .loginURL /tmp/journal-session").strip()
+    machine.succeed(f"curl -sf -o /dev/null '{login_url}'")
+    machine.succeed(
+        f"curl -sf -o /dev/null -X POST {base}/login {sso} "
+        f"--data-urlencode 'session={session_token}' "
+        f"--data-urlencode 'marker={form_marker}'"
+    )
+    machine.succeed(
+        f"curl -sf {base}/keys/sessions/{session_token} | jq -e '.status == \"completed\"'"
+    )
+
+    upload_token = machine.succeed(
+        f"curl -sf -X POST {base}/users/1/items/LOGSEC22/file {auth} "
+        f"-H 'If-None-Match: *' "
+        f"-d 'md5=b08aa6d1650e7bc5b03e9fac83121b8f"
+        f"&filename=journal.bin&filesize=34&mtime=1700000000010' "
+        f"| jq -r .uploadKey"
+    ).strip()
+    machine.succeed(
+        f"printf '%s' '{upload_marker}' | "
+        f"curl -sf -X POST {base}/uploads/{upload_token} --data-binary @-"
+    )
+
+    machine.succeed(
+        f"curl -sf -X POST {base}/users/1/items {auth} "
+        f"-H 'Content-Type: application/json' "
+        f"-H 'If-Unmodified-Since-Version: {library_version()}' "
+        f"--data '[{{\"key\":\"LGSEC223\",\"itemType\":\"book\","
+        f"\"title\":\"{json_marker}\"}}]' | jq -e .successful"
+    )
+
+    machine.succeed("journalctl --sync")
+    journal = machine.succeed("journalctl -u zhost.service --no-pager")
+    leaked = [
+        label
+        for label, secret in (
+            ("session token", session_token),
+            ("upload token", upload_token),
+            ("login form", form_marker),
+            ("attachment body", upload_marker),
+            ("JSON body", json_marker),
+            ("API key", "testtoken"),
+        )
+        if secret in journal
+    ]
+    assert not leaked, leaked
+    leaked_fields = [field for field in ("want_md5", "got_md5") if field in journal]
+    assert not leaked_fields, leaked_fields
+    journal_lines = journal.splitlines()
+    assert any(
+        "request" in line
+        and "method=POST" in line
+        and "path=/users/1/items/LOGSEC22/file" in line
+        for line in journal_lines
+    )
+    assert any(
+        "request" in line
+        and "method=GET" in line
+        and "path=/keys/sessions/{token}" in line
+        for line in journal_lines
+    )
+    assert any(
+        "request" in line
+        and "method=POST" in line
+        and "path=/uploads/{token}" in line
+        for line in journal_lines
     )

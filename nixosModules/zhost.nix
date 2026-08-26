@@ -46,6 +46,24 @@ in
       description = "Internal listen address; front it with a reverse proxy.";
     };
 
+    bootstrapUserId = lib.mkOption {
+      type = lib.types.ints.positive;
+      default = 1;
+      description = "Stable local user ID owning the legacy personal library.";
+    };
+
+    bootstrapUsername = lib.mkOption {
+      type = lib.types.str;
+      default = "zhost";
+      description = "Stable username for the bootstrap personal-library owner.";
+    };
+
+    bootstrapDisplayName = lib.mkOption {
+      type = lib.types.str;
+      default = "zhost";
+      description = "Display name for the bootstrap personal-library owner.";
+    };
+
     publicUrl = lib.mkOption {
       type = lib.types.str;
       example = "https://zotero.example.org";
@@ -208,6 +226,9 @@ in
         ZHOST_BIND = cfg.bind;
         ZHOST_PUBLIC_URL = cfg.publicUrl;
         ZHOST_DATABASE_URL = cfg.database;
+        ZHOST_USER_ID = toString cfg.bootstrapUserId;
+        ZHOST_USERNAME = cfg.bootstrapUsername;
+        ZHOST_DISPLAY_NAME = cfg.bootstrapDisplayName;
         ZHOST_S3_ENDPOINT = cfg.s3.endpoint;
         ZHOST_S3_REGION = cfg.s3.region;
         ZHOST_S3_BUCKET = cfg.s3.bucket;
