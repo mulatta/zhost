@@ -90,7 +90,50 @@ async fn main() {
 
 #[cfg(test)]
 mod middleware_tests {
-    use crate::http::validation::{is_group_discovery_path, path_group_data_id};
+    use crate::http::validation::{
+        is_attachment_permission_path, is_group_discovery_path, path_group_data_id,
+    };
+
+    #[test]
+    fn attachment_permission_paths_match_exact_personal_and_group_routes() {
+        for path in [
+            "/users/101/items/ABCDEFGH/file",
+            "/users/101/items/ABCDEFGH/file/view/url",
+            "/groups/303/items/ABCDEFGH/file",
+            "/groups/303/items/ABCDEFGH/file/view/url",
+            "/groups/303/items/ABCDEFGI/file",
+            "/users/101/items/OLDLIB22/file",
+            "/users/101/items/LEGACY22/file",
+            "/users/101/items/%4CEGACY22/file",
+            "/groups/303/items/ABCDEFGO/file",
+            "/groups/303/items/ABCDEFG0/file",
+            "/groups/303/items/ABCDEFG1/file",
+            "/groups/303/items/ABC/file",
+            "/groups/303/items/abcdefgH/file",
+            "/users/101/items/bad!/file",
+        ] {
+            assert!(is_attachment_permission_path(path), "{path}");
+        }
+
+        for path in [
+            "/users/101/items/ABCDEFGH/filesuffix",
+            "/users/101/items/ABCDEFGH/file/view",
+            "/users/101/items/ABCDEFGH/file/view/url/extra",
+            "/users/101/items/ABCDEFGH/file/",
+            "/users/101/items/ABCDEFGH/file//view/url",
+            "/users/101/items/ABCDEFGH//file",
+            "/users/101/items//file",
+            "/users/101//items/ABCDEFGH/file",
+            "/users//items/ABCDEFGH/file",
+            "//users/101/items/ABCDEFGH/file",
+            "/users/0/items/ABCDEFGH/file",
+            "/groups/-303/items/ABCDEFGH/file",
+            "/groups/9223372036854775808/items/ABCDEFGH/file",
+            "groups/303/items/ABCDEFGH/file",
+        ] {
+            assert!(!is_attachment_permission_path(path), "{path}");
+        }
+    }
 
     #[test]
     fn group_permission_bypass_is_limited_to_discovery_routes() {

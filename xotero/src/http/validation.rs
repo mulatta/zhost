@@ -19,6 +19,40 @@ pub(crate) fn valid_object_key(key: &str) -> bool {
             .all(|b| b"23456789ABCDEFGHIJKLMNPQRSTUVWXYZ".contains(&b))
 }
 
+pub(crate) fn is_attachment_permission_path(path: &str) -> bool {
+    let mut segments = path.split('/');
+    if segments.next() != Some("") {
+        return false;
+    }
+    let Some(scope) = segments.next() else {
+        return false;
+    };
+    if !matches!(scope, "users" | "groups") {
+        return false;
+    }
+    let Some(raw_id) = segments.next() else {
+        return false;
+    };
+    if !raw_id.parse::<i64>().is_ok_and(|id| id > 0) || segments.next() != Some("items") {
+        return false;
+    }
+    let Some(key) = segments.next() else {
+        return false;
+    };
+    if key.is_empty() {
+        return false;
+    }
+    matches!(
+        (
+            segments.next(),
+            segments.next(),
+            segments.next(),
+            segments.next(),
+        ),
+        (Some("file"), None, None, None) | (Some("file"), Some("view"), Some("url"), None)
+    )
+}
+
 pub(crate) fn request_log_path(path: &str) -> &str {
     if path.starts_with("/uploads/") {
         "/uploads/{token}"

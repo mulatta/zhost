@@ -15,7 +15,8 @@ use crate::domain::{LibraryAccess, RequestContext};
 use crate::error::server_error;
 use crate::http::access::request_access_scope;
 use crate::http::validation::{
-    is_group_discovery_path, path_group_data_id, path_user_id, request_log_path,
+    is_attachment_permission_path, is_group_discovery_path, path_group_data_id, path_user_id,
+    request_log_path,
 };
 use crate::{store, AppState};
 
@@ -235,7 +236,8 @@ pub(crate) async fn log_and_auth(
         } else {
             None
         };
-        if path.contains("/file") && access.is_some_and(|access| !access.permissions.files) {
+        let is_attachment_path = is_attachment_permission_path(&path);
+        if is_attachment_path && access.is_some_and(|access| !access.permissions.files) {
             return (StatusCode::FORBIDDEN, "file access denied").into_response();
         }
         let mutating = matches!(
@@ -245,7 +247,7 @@ pub(crate) async fn log_and_auth(
                 | axum::http::Method::PATCH
                 | axum::http::Method::DELETE
         );
-        if mutating && path.contains("/file") && access.is_some_and(|access| !access.file_write) {
+        if mutating && is_attachment_path && access.is_some_and(|access| !access.file_write) {
             return (StatusCode::FORBIDDEN, "file editing denied").into_response();
         }
         if mutating && access.is_some_and(|access| !access.permissions.write) {

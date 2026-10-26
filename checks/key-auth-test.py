@@ -48,6 +48,49 @@ def http_code(path, token=None, method="GET", body=None, version=None):
     ).strip()
 
 
+def attachment_route_receipt(path, token, method="GET", path_as_is=False):
+    path_option = "--path-as-is " if path_as_is else ""
+    raw = machine.succeed(
+        f"curl -sS --max-time 10 {path_option}-D - -o /dev/null -X {method} "
+        f"-H 'Content-Length: 0' {api_headers} "
+        f"-H 'Host: localhost:8189' -H 'User-Agent: xotero-task5-route-probe' "
+        f"-H 'Accept: */*' -H 'Zotero-API-Key: {token}' {base}{path}"
+    ).replace("\r\n", "\n")
+    lines = raw.splitlines()
+    status = int(lines[0].split()[1])
+    headers = []
+    for line in lines[1:]:
+        if line.lower().startswith("location:"):
+            headers.append("Location: <redacted>")
+        elif line:
+            headers.append(line)
+    receipt = {
+        "request": {
+            "method": method,
+            "path": path,
+            "url": base + path,
+            "curl_options": ["--path-as-is"] if path_as_is else [],
+            "headers": [
+                "Content-Length: 0",
+                "Host: localhost:8189",
+                "User-Agent: xotero-task5-route-probe",
+                "Accept: */*",
+                "Zotero-API-Version: 3",
+                "Zotero-Schema-Version: 42",
+                "Zotero-API-Key: <redacted>",
+            ],
+        },
+        "response": {
+            "status": status,
+            "headers": headers,
+            "redirect_followed": False,
+            "body_captured": False,
+        },
+    }
+    print("ATTACHMENT-ROUTE " + json.dumps(receipt, sort_keys=True))
+    return status, headers
+
+
 def incomplete_body_status(path, token=None, method="POST", chunked=False):
     """Keep write side open: final denial must not require body bytes or EOF."""
     script = f"""
@@ -558,6 +601,91 @@ psql(
 )
 psql("update api_keys set revoked_at = now() where id = 1003")
 
+with subtest("file permissions cover legacy and percent-decoded route keys"):
+    snapshot_before = body_admission_snapshot()
+    assert (
+        psql(
+            """select bool_and(files) from api_key_user_permissions
+               where api_key_id in (1001, 1002)"""
+        )
+        == "t"
+    )
+    psql(
+        """update api_key_user_permissions set files = false
+           where api_key_id in (1001, 1002)"""
+    )
+    try:
+        legacy_status, legacy_headers = attachment_route_receipt(
+            "/users/202/items/OLDLIB22/file", bob
+        )
+        plain_status, plain_headers = attachment_route_receipt(
+            "/users/101/items/LEGACY22/file", alice
+        )
+        encoded_status, encoded_headers = attachment_route_receipt(
+            "/users/101/items/%4CEGACY22/file", alice, path_as_is=True
+        )
+    finally:
+        psql(
+            """update api_key_user_permissions set files = true
+               where api_key_id in (1001, 1002)"""
+        )
+    assert (
+        psql(
+            """select bool_and(files) from api_key_user_permissions
+               where api_key_id in (1001, 1002)"""
+        )
+        == "t"
+    )
+    assert body_admission_snapshot() == snapshot_before
+    print("ATTACHMENT-ROUTE legacy-path fixture restored; snapshots unchanged")
+
+    assert legacy_status == 403, ("legacy key file read", legacy_status)
+    assert not any(line.lower().startswith("location:") for line in legacy_headers)
+    assert plain_status == 403, ("plain valid key file read", plain_status)
+    assert not any(line.lower().startswith("location:") for line in plain_headers)
+    assert encoded_status == 403, ("encoded valid key file read", encoded_status)
+    assert not any(line.lower().startswith("location:") for line in encoded_headers)
+
+with subtest("attachment permission routes require exact paths and scoped grants"):
+    snapshot_before = body_admission_snapshot()
+    assert psql(
+        "select files from api_key_user_permissions where api_key_id = 1002"
+    ) == "t"
+    psql("update api_key_user_permissions set files = false where api_key_id = 1002")
+    try:
+        for path, method, expected in (
+            ("/users/202/items/PRIVATCH/file", "GET", 403),
+            ("/users/202/items/PRIVATCH/file/view/url", "GET", 403),
+            ("/users/202/items/PRIVATCH/filesuffix", "GET", 404),
+            ("/users/202/items/PRIVATCH/file/view", "GET", 404),
+            ("/users/202/items/PRIVATCH/file/view/url/extra", "GET", 404),
+            ("/users/202/items/PRIVATCH/file/", "GET", 404),
+            ("/users/202/items/PRIVATCH/file", "PUT", 403),
+            ("/groups/303/items/GRPBKK22/file", "GET", 404),
+            ("/groups/303/items/GRPBKK22/file", "PUT", 403),
+        ):
+            status, response_headers = attachment_route_receipt(path, bob, method)
+            assert status == expected, (path, method, status, expected)
+            if expected == 403:
+                assert not any(
+                    line.lower().startswith("location:")
+                    for line in response_headers
+                )
+
+        allowed_status, allowed_headers = attachment_route_receipt(
+            "/users/101/items/LEGACY22/file", alice
+        )
+        assert allowed_status == 302
+        assert any(line.lower().startswith("location:") for line in allowed_headers)
+        url_status, _ = attachment_route_receipt(
+            "/users/101/items/LEGACY22/file/view/url", alice
+        )
+        assert url_status == 404
+    finally:
+        psql("update api_key_user_permissions set files = true where api_key_id = 1002")
+    assert body_admission_snapshot() == snapshot_before
+    print("ATTACHMENT-ROUTE storage-and-version-snapshot=unchanged")
+
 with subtest("non-default legacy attachment path survives the blob-key migration"):
     assert (
         psql("select blob_key from file where library_id = 22 and item_key = 'OLDLIB22'")
@@ -982,6 +1110,23 @@ with subtest("group mutations enforce key grants, role policy and file policy"):
         """insert into api_key_group_permissions
            (api_key_id, user_id, group_id, library, write)
            values (1008, 202, 303, true, true)"""
+    )
+    group_snapshot = body_admission_snapshot()
+    group_file_status, _ = attachment_route_receipt(
+        "/groups/303/items/GRPBKK22/file", bob_group_rw
+    )
+    assert group_file_status == 404
+    group_put_status, group_put_headers = attachment_route_receipt(
+        "/groups/303/items/GRPBKK22/file", bob_group_rw, "PUT"
+    )
+    assert group_put_status == 403
+    assert not any(
+        line.lower().startswith("location:") for line in group_put_headers
+    )
+    assert body_admission_snapshot() == group_snapshot
+    print(
+        "ATTACHMENT-ROUTE group-grant=allowed personal-files=false "
+        "group-write-policy=denied storage-and-version-snapshot=unchanged"
     )
     assert (
         http_code(
