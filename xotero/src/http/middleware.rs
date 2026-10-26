@@ -115,7 +115,8 @@ async fn authenticate_request(
         return Ok(None);
     };
 
-    if let Some(permissions) = state.config.keys.get(token).copied() {
+    let digest = Sha256::digest(token.as_bytes());
+    if let Some(permissions) = state.config.recovery_permissions(&digest) {
         return Ok(
             store::bootstrap_principal(&state.pool, state.config.user_id)
                 .await?
@@ -128,7 +129,6 @@ async fn authenticate_request(
         );
     }
 
-    let digest = Sha256::digest(token.as_bytes());
     Ok(store::authenticate_api_key(&state.pool, digest.as_slice())
         .await?
         .map(|(api_key_id, principal, permissions)| RequestContext {

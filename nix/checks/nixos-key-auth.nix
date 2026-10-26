@@ -30,6 +30,10 @@ testPkgs.testers.runNixOSTest {
       bind = "127.0.0.1:8189";
       publicUrl = "http://localhost:8189";
       keys.recovery.file = testPkgs.writeText "xotero-recovery-key" "recoverytoken";
+      keys.readonly = {
+        file = testPkgs.writeText "xotero-readonly-recovery-key" "recoveryreadonly";
+        readOnly = true;
+      };
       bootstrapOidcIssuer = "https://id.example.test";
       bootstrapOidcSubject = "alice-subject";
       loginKdfKeyFile = testPkgs.writeText "xotero-login-kdf-key" "0123456789abcdef0123456789abcdef";
@@ -68,6 +72,28 @@ testPkgs.testers.runNixOSTest {
       testPkgs.postgresql
       testPkgs.python3
       testPkgs.sqlx-cli
+      testPkgs.xotero
+    ];
+  };
+
+  nodes.keyless = {
+    imports = [ self.nixosModules.xotero ];
+    services.xotero = {
+      enable = true;
+      bind = "127.0.0.1:8189";
+      publicUrl = "http://localhost:8189";
+      bootstrapOidcIssuer = "https://id.example.test";
+      bootstrapOidcSubject = "alice-subject";
+      loginKdfKeyFile = testPkgs.writeText "xotero-keyless-kdf" "0123456789abcdef0123456789abcdef";
+      s3 = {
+        endpoint = "http://127.0.0.1:9000";
+        accessKeyFile = testPkgs.writeText "xotero-keyless-s3-access" "rustfsadmin";
+        secretKeyFile = testPkgs.writeText "xotero-keyless-s3-secret" "rustfsadmin";
+      };
+    };
+    environment.systemPackages = [
+      testPkgs.curl
+      testPkgs.python3
     ];
   };
 

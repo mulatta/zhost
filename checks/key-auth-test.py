@@ -210,6 +210,73 @@ def poll_login_session(token):
     return json.loads(machine.succeed(f"curl -sf {base}/keys/sessions/{token}"))
 
 
+with subtest("keyless OIDC starts without an implicit recovery credential"):
+    keyless.wait_for_unit("xotero.service")
+    keyless.wait_for_open_port(8189)
+    keyless.succeed(
+        "! systemctl show xotero.service -p Environment | "
+        "grep -q XOTERO_KEYS="
+    )
+    keyless_script = """
+import http.client
+import json
+import pathlib
+import urllib.parse
+
+def request(method, path, body=None, headers=None):
+    connection = http.client.HTTPConnection("localhost", 8189, timeout=10)
+    try:
+        connection.request(method, path, body, headers or {})
+        response = connection.getresponse()
+        data = response.read()
+        return response.status, data
+    finally:
+        connection.close()
+
+for token in ("", "xotero-dev-key", "recoverytoken", "unknown-token"):
+    status, _ = request("GET", "/keys/current", headers={"Zotero-API-Key": token})
+    assert status == 403
+status, data = request("POST", "/keys/sessions")
+assert status == 201
+session = json.loads(data)["sessionToken"]
+status, _ = request("POST", "/login", urllib.parse.urlencode({"session": session}), {
+    "Content-Type": "application/x-www-form-urlencoded",
+    "X-Xotero-OIDC-Issuer": "https://id.example.test",
+    "X-Xotero-OIDC-Subject": "alice-subject",
+})
+assert status == 200
+status, data = request("GET", "/keys/sessions/" + session)
+result = json.loads(data)
+assert status == 200 and result["status"] == "completed" and result["userID"] == 1
+key = result["apiKey"]
+status, data = request("GET", "/keys/current", headers={"Zotero-API-Key": key})
+assert status == 200 and json.loads(data)["userID"] == 1
+pathlib.Path("/run/keyless-replay.json").write_text(json.dumps([session, key]))
+print("keyless login, poll, DB-key authentication and dev-key denial passed")
+"""
+    keyless.succeed(f"python3 -c {shlex.quote(keyless_script)}")
+    keyless.succeed("systemctl restart xotero.service")
+    keyless.wait_for_unit("xotero.service")
+    keyless.wait_for_open_port(8189)
+    replay_script = """
+import http.client
+import json
+import pathlib
+session, expected = json.loads(pathlib.Path("/run/keyless-replay.json").read_text())
+connection = http.client.HTTPConnection("localhost", 8189, timeout=10)
+try:
+    connection.request("GET", "/keys/sessions/" + session)
+    response = connection.getresponse()
+    assert response.status == 200
+    assert json.loads(response.read())["apiKey"] == expected
+finally:
+    connection.close()
+pathlib.Path("/run/keyless-replay.json").unlink()
+print("keyless stable-KDF replay passed")
+"""
+    keyless.succeed(f"python3 -c {shlex.quote(replay_script)}")
+
+
 machine.wait_for_unit("postgresql.service")
 machine.wait_for_unit("rustfs.service")
 machine.succeed("mc alias set s3 http://localhost:9000 rustfsadmin rustfsadmin")
@@ -1438,6 +1505,83 @@ with subtest("browser login mints distinct hashed full-access keys for Alice"):
     )
     assert http_code("/keys/current", recovery) == "200"
 
+with subtest("invalid recovery configuration fails before database or listener"):
+    config_script = r"""
+import os
+import pathlib
+import shutil
+import subprocess
+import tempfile
+
+binary = shutil.which("xotero")
+assert binary is not None
+with tempfile.TemporaryDirectory(prefix="xotero-config-") as directory:
+    root = pathlib.Path(directory)
+    contents = {
+        "rw": b"RECOVERY_RW_MARKER_417\n",
+        "ro": b"RECOVERY_RO_MARKER_628\n",
+        "same": b"RECOVERY_RW_MARKER_417\n",
+        "empty": b"",
+        "blank": b" \t\r\n",
+        "multiline": b"alpha\nbeta\n",
+        "bad-utf8": b"\xff",
+        "kdf": b"KDF_SECRET_MARKER_32_BYTES_12345678\r\n",
+    }
+    for name, content in contents.items():
+        (root / name).write_bytes(content)
+    rw = str(root / "rw")
+    ro = str(root / "ro")
+    valid = {
+        "XOTERO_LOGIN_KDF_KEY_FILE": str(root / "kdf"),
+        "XOTERO_DATABASE_URL": "postgres://localhost:1/not-reached",
+        "XOTERO_BIND": "127.0.0.1:18194",
+        "XOTERO_API_KEY": "LOWER_SOURCE_SECRET_MARKER_59",
+    }
+    manifests = [
+        "", ",", f",rw:{rw}", f"rw:{rw},", f"rw:{rw},,ro:{ro}",
+        "rw", "rw:", f":{rw}", f"admin:{rw}", f"RW:{rw}", f"read:{rw}",
+        "MANIFEST_SECRET_MARKER_83",
+        f"rw:{rw},ro:{root / 'same'}", f"ro:{root / 'same'},rw:{rw}",
+    ] + [f"rw:{root / name}" for name in (
+        "empty", "blank", "multiline", "bad-utf8", "missing"
+    )]
+    cases = [("manifest-" + str(index), {"XOTERO_KEYS": value})
+             for index, value in enumerate(manifests)]
+    cases += [("file-" + name, {"XOTERO_API_KEY_FILE": str(root / name)})
+              for name in ("empty", "blank", "multiline", "bad-utf8", "missing")]
+    cases += [("file-path-empty", {"XOTERO_API_KEY_FILE": ""}),
+              ("token-empty", {"XOTERO_API_KEY": ""}),
+              ("token-blank", {"XOTERO_API_KEY": " \t\r\n"})]
+    cases += [("unicode-" + name, {name: "\udcff"}) for name in (
+        "XOTERO_KEYS", "XOTERO_API_KEY_FILE", "XOTERO_API_KEY"
+    )]
+    secrets = list(contents.values()) + [
+        b"LOWER_SOURCE_SECRET_MARKER_59", b"MANIFEST_SECRET_MARKER_83",
+    ]
+    for label, selected in cases:
+        result = subprocess.run([binary], env=valid | selected,
+                                capture_output=True, timeout=10)
+        output = result.stdout + result.stderr
+        assert result.returncode != 0, label
+        assert b"connect to database" not in output, label
+        assert b"xotero listening" not in output, label
+        assert all(not secret.strip() or secret.strip() not in output
+                   for secret in secrets), label + ": secret leaked"
+        print("config-rejection " + label + " exit=" + str(result.returncode))
+    for name in ("missing", "empty", "short"):
+        (root / "short").write_bytes(b"KDF_SHORT_SECRET_31_BYTES_1234567"[:31])
+        env = {key: value for key, value in valid.items()
+               if key != "XOTERO_API_KEY"}
+        if name == "missing":
+            del env["XOTERO_LOGIN_KDF_KEY_FILE"]
+        else:
+            env["XOTERO_LOGIN_KDF_KEY_FILE"] = str(root / name)
+        result = subprocess.run([binary], env=env, capture_output=True, timeout=10)
+        assert result.returncode != 0 and b"connect to database" not in result.stderr
+        print("keyless-kdf-rejection " + name + " exit=" + str(result.returncode))
+"""
+    machine.succeed(f"python3 -c {shlex.quote(config_script)}")
+
 with subtest("mapped non-bootstrap OIDC identity mints a key for Bob"):
     initial_bob_keys = int(psql("select count(*) from api_keys where user_id = 202"))
     bob_session = create_login_session()
@@ -1935,3 +2079,98 @@ with subtest("bootstrap OIDC ownership conflict fails startup closed"):
     machine.wait_for_unit("xotero.service")
     machine.wait_for_open_port(8189)
     assert http_code("/keys/current", recovery) == "200"
+
+with subtest("explicit recovery roles and pending digest authorization survive reload"):
+    readonly_recovery = "recoveryreadonly"
+    assert http_code("/keys/current", recovery) == "200"
+    assert http_code("/keys/current", readonly_recovery) == "200"
+    assert "write" not in get_json("/keys/current", readonly_recovery)["access"]["user"]
+    assert http_code("/keys/current", "xotero-dev-key") == "403"
+    before = body_admission_snapshot()
+    version = psql("select version from library where id = 1")
+    attachment = json.dumps([{
+        "key": "RCVR2222", "itemType": "attachment",
+        "linkMode": "imported_file", "filename": "recovery.txt",
+    }])
+    assert http_code("/users/101/items", readonly_recovery, "POST", attachment, version) == "403"
+    assert body_admission_snapshot() == before
+    assert http_code("/users/101/items", recovery, "POST", attachment, version) == "200"
+    pending = machine.succeed(
+        f"curl -sf -X POST {base}/users/101/items/RCVR2222/file {api_headers} "
+        f"-H 'Zotero-API-Key: {recovery}' -H 'If-None-Match: *' "
+        "-d 'md5=5d41402abc4b2a76b9719d911017c592&filename=recovery.txt&filesize=5&mtime=1' "
+        "| jq -r .uploadKey"
+    ).strip()
+    assert psql(
+        f"select bootstrap_user_id = 101 and authorizer_key_hash = "
+        f"decode('{sha256_hex(recovery)}', 'hex') from pending_uploads "
+        f"where token_hash = decode('{sha256_hex(pending)}', 'hex')"
+    ) == "t"
+    override = "/run/systemd/system/xotero.service.d/test-recovery.conf"
+    try:
+        for mode, setting in (
+            ("removed", "UnsetEnvironment=XOTERO_KEYS XOTERO_API_KEY_FILE XOTERO_API_KEY"),
+            ("restricted", "Environment=XOTERO_KEYS=ro:%d/key-recovery"),
+        ):
+            machine.succeed(
+                f"printf '%s\\n' '[Service]' {shlex.quote(setting)} > {override} && "
+                "systemctl daemon-reload"
+            )
+            restart_xotero()
+            before = body_admission_snapshot()
+            assert incomplete_body_status(f"/uploads/{pending}") == "403"
+            assert http_code(f"/uploads/{pending}", method="POST", body="hello") == "403"
+            assert body_admission_snapshot() == before
+            assert http_code("/keys/current", recovery) == ("403" if mode == "removed" else "200")
+            assert http_code("/keys/current", first_key) == "200"
+            assert poll_login_session(first_session)["apiKey"] == first_key
+            assert http_code("/keys/current", "xotero-dev-key") == "403"
+            print("recovery-reload " + mode + ": pending upload denied; DB key and KDF replay valid")
+    finally:
+        machine.succeed(f"rm -f {override} && systemctl daemon-reload")
+        restart_xotero()
+    assert http_code(f"/uploads/{pending}", method="POST", body="hello") == "201"
+    assert machine.succeed(
+        f"curl -s -o /dev/null -w '%{{http_code}}' -X POST "
+        f"{base}/users/101/items/RCVR2222/file {api_headers} "
+        f"-H 'Zotero-API-Key: {recovery}' -d 'upload={pending}'"
+    ).strip() == "204"
+    assert machine.succeed(
+        f"curl -sfL {api_headers} -H 'Zotero-API-Key: {recovery}' "
+        f"{base}/users/101/items/RCVR2222/file"
+    ) == "hello"
+
+with subtest("login collision detection compares the configured recovery digest"):
+    collision_session = create_login_session()
+    collision_script = f"""
+import hashlib
+import hmac
+import pathlib
+alphabet = b"23456789ABCDEFGHIJKLMNPQRSTUVWXYZ"
+kdf = pathlib.Path("/run/credentials/xotero.service/login-kdf-key").read_bytes().rstrip(b"\\r\\n")
+key = bytearray()
+counter = 0
+while len(key) < 24:
+    digest = hmac.digest(kdf, b"xotero login api key\\0" + {collision_session!r}.encode()
+                         + counter.to_bytes(4, "big"), hashlib.sha256)
+    key.extend(alphabet[byte % len(alphabet)] for byte in digest if byte < 231)
+    counter += 1
+pathlib.Path("/run/xotero-collision").write_bytes(bytes(key[:24]))
+"""
+    machine.succeed(f"python3 -c {shlex.quote(collision_script)}")
+    count = psql("select count(*) from api_keys")
+    override = "/run/systemd/system/xotero.service.d/test-collision.conf"
+    try:
+        machine.succeed(
+            f"printf '%s\\n' '[Service]' "
+            "'LoadCredential=key-collision:/run/xotero-collision' "
+            "'Environment=XOTERO_KEYS=rw:%d/key-collision' "
+            f"> {override} && systemctl daemon-reload"
+        )
+        restart_xotero()
+        assert approve_login_session(collision_session) == "409"
+        assert psql("select count(*) from api_keys") == count
+        assert poll_login_session(collision_session)["status"] == "pending"
+    finally:
+        machine.succeed(f"rm -f {override} /run/xotero-collision && systemctl daemon-reload")
+        restart_xotero()

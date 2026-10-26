@@ -179,8 +179,8 @@ in
         }
       '';
       description = ''
-        Named recovery or development API keys, each loaded from a secret file
-        as a systemd credential and held in memory. Browser login mints separate
+        Optional named recovery API keys, each loaded from a secret file
+        as a systemd credential and retained only as a digest. Browser login mints separate
         database-owned keys and never returns these static credentials.
       '';
     };
@@ -205,8 +205,8 @@ in
   config = lib.mkIf cfg.enable {
     assertions = [
       {
-        assertion = allKeys != { };
-        message = "services.xotero: configure at least one key via `keys` or `apiKeyFile`.";
+        assertion = cfg.apiKeyFile == null || !(cfg.keys ? default);
+        message = "services.xotero: apiKeyFile conflicts with keys.default.";
       }
       {
         assertion = cfg.bootstrapOidcIssuer != "";
@@ -263,8 +263,10 @@ in
         XOTERO_S3_ACCESS_KEY_FILE = "%d/s3-access-key";
         XOTERO_S3_SECRET_KEY_FILE = "%d/s3-secret-key";
         XOTERO_LOGIN_KDF_KEY_FILE = "%d/login-kdf-key";
-        XOTERO_KEYS = keyManifest;
         RUST_LOG = "info";
+      }
+      // lib.optionalAttrs (allKeys != { }) {
+        XOTERO_KEYS = keyManifest;
       };
 
       serviceConfig = {

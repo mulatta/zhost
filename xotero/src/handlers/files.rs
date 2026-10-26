@@ -9,7 +9,6 @@ use axum::{
 use serde_json::json;
 use sha2::{Digest, Sha256};
 
-use crate::config::Config;
 use crate::domain::{LibraryId, Permissions, RequestContext};
 use crate::error::{s3_error, server_error};
 use crate::http::access::{request_access, request_library};
@@ -24,13 +23,6 @@ fn upload_storage_key(library_id: LibraryId, upload_token: &str) -> String {
 
 fn key_hash(key: &str) -> Vec<u8> {
     Sha256::digest(key.as_bytes()).to_vec()
-}
-
-fn recovery_key_permissions(config: &Config, hash: &[u8]) -> Option<Permissions> {
-    config
-        .keys
-        .iter()
-        .find_map(|(key, permissions)| (key_hash(key) == hash).then_some(*permissions))
 }
 
 /// Attachment file endpoint. The same path serves both POST steps:
@@ -173,10 +165,9 @@ pub(crate) async fn file_post(
         library_id: request_library(),
         group_id: request_access().group_id,
         authorizer_key_hash: key_hash(&context.presented_key),
-        bootstrap_user_id: state
-            .config
-            .keys
-            .contains_key(&context.presented_key)
+        bootstrap_user_id: context
+            .api_key_id
+            .is_none()
             .then_some(context.principal.user_id),
         item_key: key.clone(),
         expected_md5: if if_none_match {
@@ -326,8 +317,9 @@ pub(crate) async fn upload_put(
             Ok(None) => return (StatusCode::FORBIDDEN, "bootstrap user disabled").into_response(),
             Err(error) => return server_error("upload authorization", error),
         };
-        let Some(permissions) =
-            recovery_key_permissions(&state.config, &upload.authorizer_key_hash)
+        let Some(permissions) = state
+            .config
+            .recovery_permissions(&upload.authorizer_key_hash)
         else {
             return (StatusCode::FORBIDDEN, "recovery key removed").into_response();
         };

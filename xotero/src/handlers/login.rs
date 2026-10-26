@@ -192,7 +192,8 @@ pub(crate) async fn login_authorize(
         return (StatusCode::BAD_REQUEST, "missing session").into_response();
     };
     let api_key = login_api_key(&state.config.login_kdf_key, token);
-    if state.config.keys.contains_key(&api_key) {
+    let api_key_hash = token_hash(&api_key);
+    if state.config.recovery_permissions(&api_key_hash).is_some() {
         return (
             StatusCode::CONFLICT,
             "generated key collides with recovery key",
@@ -202,7 +203,7 @@ pub(crate) async fn login_authorize(
     match store::complete_login_session(
         &state.pool,
         &token_hash(token),
-        &token_hash(&api_key),
+        &api_key_hash,
         issuer,
         subject,
     )
