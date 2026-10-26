@@ -1,5 +1,9 @@
+use std::io::Read;
+use std::pin::Pin;
+use std::sync::{Arc, LazyLock};
+
 use axum::{
-    body::{Body, Bytes},
+    body::{Body, Bytes, HttpBody},
     extract::{Request, State},
     http::{HeaderMap, StatusCode},
     middleware::Next,
@@ -15,10 +19,86 @@ use crate::http::validation::{
 };
 use crate::{store, AppState};
 
-/// Maximum buffered request body. Attachments can be large; everything else is
-/// tiny. A finite cap bounds per-request memory so one device can't OOM the host
-/// (the body is fully buffered by the auth middleware before handlers run).
+/// Encoded and decoded attachment/API body bound.
 pub(crate) const MAX_BODY: usize = 256 * 1024 * 1024;
+const MAX_PUBLIC_BODY: usize = 1024 * 1024;
+
+// Admission precedes collection and spawning. The blocking job owns the permit:
+// dropping its requesting future cannot admit another decoder while it runs.
+static DECODERS: LazyLock<Arc<tokio::sync::Semaphore>> =
+    LazyLock::new(|| Arc::new(tokio::sync::Semaphore::new(4)));
+
+pub(crate) async fn buffered_body(
+    mut body: Body,
+    headers: &HeaderMap,
+    limit: usize,
+) -> Result<Bytes, StatusCode> {
+    let gzip = match headers.get("content-encoding") {
+        None => false,
+        Some(value) if value.as_bytes().eq_ignore_ascii_case(b"gzip") => true,
+        Some(value) if value.as_bytes().eq_ignore_ascii_case(b"identity") => false,
+        Some(_) => return Err(StatusCode::UNSUPPORTED_MEDIA_TYPE),
+    };
+    let permit = if gzip {
+        Some(
+            Arc::clone(&DECODERS)
+                .acquire_owned()
+                .await
+                .map_err(|error| {
+                    tracing::error!(%error, "decoder admission failed");
+                    StatusCode::INTERNAL_SERVER_ERROR
+                })?,
+        )
+    } else {
+        None
+    };
+    let mut raw = Vec::new();
+    while let Some(frame) = std::future::poll_fn(|cx| Pin::new(&mut body).poll_frame(cx)).await {
+        let frame = frame.map_err(|_| StatusCode::BAD_REQUEST)?;
+        if let Ok(data) = frame.into_data() {
+            let remaining = (limit + 1).saturating_sub(raw.len());
+            raw.extend_from_slice(&data[..data.len().min(remaining)]);
+            if raw.len() > limit {
+                return Err(StatusCode::PAYLOAD_TOO_LARGE);
+            }
+        }
+    }
+    let Some(permit) = permit else {
+        return Ok(Bytes::from(raw));
+    };
+    spawn_decoder(std::io::Cursor::new(raw), limit, permit).await
+}
+
+async fn spawn_decoder(
+    raw: impl Read + Send + 'static,
+    limit: usize,
+    permit: tokio::sync::OwnedSemaphorePermit,
+) -> Result<Bytes, StatusCode> {
+    tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        decode_gzip(raw, limit)
+    })
+    .await
+    .map_err(|error| {
+        tracing::error!(%error, "request decoder failed");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?
+}
+
+fn decode_gzip(raw: impl Read, limit: usize) -> Result<Bytes, StatusCode> {
+    // MultiGzDecoder validates every member and its trailer; an exact boundary
+    // still reads through EOF, while max+1 detects expansion without truncation.
+    let mut decoder = flate2::read::MultiGzDecoder::new(raw)
+        .take(u64::try_from(limit + 1).map_err(|_| StatusCode::PAYLOAD_TOO_LARGE)?);
+    let mut out = Vec::new();
+    decoder
+        .read_to_end(&mut out)
+        .map_err(|_| StatusCode::BAD_REQUEST)?;
+    if out.len() > limit {
+        return Err(StatusCode::PAYLOAD_TOO_LARGE);
+    }
+    Ok(Bytes::from(out))
+}
 
 /// Resolve static recovery keys and database-owned keys against live identity
 /// state. Database errors remain errors so an outage cannot masquerade as a bad
@@ -69,34 +149,6 @@ pub(crate) async fn log_and_auth(
     next: Next,
 ) -> Response {
     let (mut parts, body) = req.into_parts();
-    let raw = match axum::body::to_bytes(body, MAX_BODY).await {
-        Ok(raw) => raw,
-        Err(_) => return (StatusCode::PAYLOAD_TOO_LARGE, "request body too large").into_response(),
-    };
-
-    let gzipped = parts
-        .headers
-        .get("content-encoding")
-        .and_then(|v| v.to_str().ok())
-        .is_some_and(|e| e.contains("gzip"));
-    let bytes = if gzipped {
-        use std::io::Read;
-        // Cap the decompressed size too, so a small gzip can't expand without
-        // bound (a malformed/over-large body then fails to parse downstream).
-        let mut decoder = flate2::read::GzDecoder::new(&raw[..]).take(MAX_BODY as u64);
-        let mut out = Vec::new();
-        match decoder.read_to_end(&mut out) {
-            Ok(_) => {
-                parts.headers.remove("content-encoding");
-                parts.headers.remove("content-length");
-                Bytes::from(out)
-            }
-            Err(_) => raw,
-        }
-    } else {
-        raw
-    };
-
     let header = |name: &str| {
         parts
             .headers
@@ -113,13 +165,25 @@ pub(crate) async fn log_and_auth(
         path = %log_path,
         api_version = %header("zotero-api-version"),
         if_unmod = %header("if-unmodified-since-version"),
-        body_bytes = bytes.len(),
         "request"
     );
 
     let mut selected_access = None;
-    let is_bootstrap =
-        path.starts_with("/keys/sessions") || path.starts_with("/uploads") || path == "/login";
+    let segments: Vec<_> = path.split('/').collect();
+    let is_upload = method == axum::http::Method::POST
+        && matches!(segments.as_slice(), ["", "uploads", token] if !token.is_empty());
+    let is_bootstrap = is_upload
+        || (path == "/login"
+            && matches!(
+                method,
+                axum::http::Method::GET | axum::http::Method::HEAD | axum::http::Method::POST
+            ))
+        || (path == "/keys/sessions" && method == axum::http::Method::POST)
+        || (matches!(segments.as_slice(), ["", "keys", "sessions", token] if !token.is_empty())
+            && matches!(
+                method,
+                axum::http::Method::GET | axum::http::Method::HEAD | axum::http::Method::DELETE
+            ));
     if !is_bootstrap {
         let context = match authenticate_request(&state, &parts.headers).await {
             Ok(Some(context)) => context,
@@ -191,7 +255,23 @@ pub(crate) async fn log_and_auth(
         parts.extensions.insert(context);
     }
 
-    let request = Request::from_parts(parts, Body::from(bytes));
+    let body = if is_upload {
+        body
+    } else {
+        let limit = if is_bootstrap {
+            MAX_PUBLIC_BODY
+        } else {
+            MAX_BODY
+        };
+        let bytes = match buffered_body(body, &parts.headers, limit).await {
+            Ok(bytes) => bytes,
+            Err(status) => return status.into_response(),
+        };
+        parts.headers.remove("content-encoding");
+        parts.headers.remove("content-length");
+        Body::from(bytes)
+    };
+    let request = Request::from_parts(parts, body);
     let response = match selected_access {
         Some(access) => request_access_scope(access, next.run(request)).await,
         None => next.run(request).await,
@@ -206,4 +286,121 @@ pub(crate) async fn log_and_auth(
         );
     }
     response
+}
+
+#[cfg(test)]
+mod decoding_tests {
+    use super::*;
+    use std::io::Write;
+    use std::time::Duration;
+    use tokio::sync::{oneshot, Semaphore};
+
+    fn gzip(bytes: &[u8]) -> Vec<u8> {
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+        encoder.write_all(bytes).unwrap();
+        encoder.finish().unwrap()
+    }
+
+    #[test]
+    fn exact_decoded_limit_validates_trailer() {
+        let raw = gzip(&[b'x'; 64]);
+        assert_eq!(decode_gzip(&raw[..], 64).unwrap().len(), 64);
+        assert_eq!(
+            decode_gzip(&raw[..], 63),
+            Err(StatusCode::PAYLOAD_TOO_LARGE)
+        );
+        let mut corrupt = raw.clone();
+        let trailer = corrupt.len() - 8;
+        corrupt[trailer] ^= 1;
+        assert_eq!(decode_gzip(&corrupt[..], 64), Err(StatusCode::BAD_REQUEST));
+        assert_eq!(
+            decode_gzip(&raw[..raw.len() - 1], 64),
+            Err(StatusCode::BAD_REQUEST)
+        );
+    }
+
+    #[test]
+    fn concatenated_members_share_decoded_bound() {
+        let mut raw = gzip(b"first");
+        raw.extend(gzip(b"second"));
+        assert_eq!(decode_gzip(&raw[..], 11).unwrap().as_ref(), b"firstsecond");
+        assert_eq!(
+            decode_gzip(&raw[..], 10),
+            Err(StatusCode::PAYLOAD_TOO_LARGE)
+        );
+        raw.extend(b"garbage");
+        assert_eq!(decode_gzip(&raw[..], 64), Err(StatusCode::BAD_REQUEST));
+    }
+
+    #[tokio::test]
+    async fn encoded_limit_distinguishes_boundary_from_overflow() {
+        let headers = HeaderMap::new();
+        assert_eq!(
+            buffered_body(Body::from(vec![b'x'; 64]), &headers, 64)
+                .await
+                .unwrap()
+                .len(),
+            64
+        );
+        assert_eq!(
+            buffered_body(Body::from(vec![b'x'; 65]), &headers, 64)
+                .await
+                .unwrap_err(),
+            StatusCode::PAYLOAD_TOO_LARGE
+        );
+    }
+
+    struct HeldReader {
+        bytes: std::io::Cursor<Vec<u8>>,
+        started: Option<oneshot::Sender<()>>,
+        release: std::sync::mpsc::Receiver<()>,
+    }
+
+    impl Read for HeldReader {
+        fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+            if let Some(started) = self.started.take() {
+                started.send(()).unwrap();
+                self.release.recv_timeout(Duration::from_secs(3)).unwrap();
+            }
+            self.bytes.read(out)
+        }
+    }
+
+    #[tokio::test]
+    async fn canceled_request_holds_decoder_permit_until_job_exits() {
+        // Observers exist before the decoder can start.
+        let semaphore = Arc::new(Semaphore::new(1));
+        let permit = Arc::clone(&semaphore).acquire_owned().await.unwrap();
+        let (started, running) = oneshot::channel();
+        let (release, held) = std::sync::mpsc::channel();
+        let reader = HeldReader {
+            bytes: std::io::Cursor::new(gzip(b"body")),
+            started: Some(started),
+            release: held,
+        };
+        let request = tokio::spawn(spawn_decoder(reader, 64, permit));
+        tokio::time::timeout(Duration::from_secs(3), running)
+            .await
+            .unwrap()
+            .unwrap();
+        request.abort();
+        assert!(request.await.unwrap_err().is_cancelled());
+        // Cancellation must not free admission while the actual job is held.
+        assert!(Arc::clone(&semaphore).try_acquire_owned().is_err());
+        release.send(()).unwrap();
+        let resumed = tokio::time::timeout(
+            Duration::from_secs(3),
+            Arc::clone(&semaphore).acquire_owned(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            spawn_decoder(std::io::Cursor::new(gzip(b"resumed")), 64, resumed)
+                .await
+                .unwrap()
+                .as_ref(),
+            b"resumed"
+        );
+    }
 }

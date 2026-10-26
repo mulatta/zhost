@@ -2,6 +2,7 @@
 
 import hashlib
 import json
+import shlex
 
 
 base = "http://localhost:8189"
@@ -45,6 +46,90 @@ def http_code(path, token=None, method="GET", body=None, version=None):
         f"curl -s -o /dev/null -w '%{{http_code}}' -X {method} "
         f"{api_headers} {auth} {data} {base}{path}"
     ).strip()
+
+
+def incomplete_body_status(path, token=None, method="POST", chunked=False):
+    """Keep write side open: final denial must not require body bytes or EOF."""
+    script = f"""
+import json
+import socket
+headers = [
+    {method!r} + " " + {path!r} + " HTTP/1.1",
+    "Host: localhost:8189",
+    "Connection: close",
+    "Content-Encoding: gzip",
+    "Transfer-Encoding: chunked" if {chunked!r} else "Content-Length: 1048576",
+]
+if {token!r} is not None:
+    headers.append("Zotero-API-Key: " + {token!r})
+with socket.create_connection(("127.0.0.1", 8189), timeout=3) as connection:
+    connection.settimeout(3)
+    connection.sendall(("\\r\\n".join(headers) + "\\r\\n\\r\\n").encode("ascii"))
+    response = b""
+    while b"\\r\\n\\r\\n" not in response:
+        data = connection.recv(4096)
+        assert data, response
+        response += data
+    status = int(response.split(b" ", 2)[1])
+    assert status >= 200, response
+    print(json.dumps({{"status": status, "sent_body_bytes": 0, "sent_eof": False,
+                      "framing": "chunked" if {chunked!r} else "content-length"}}))
+"""
+    result = machine.succeed(f"python3 -c {shlex.quote(script)}")
+    print(f"incomplete-body {method} {path.split('/uploads/')[0]}: {result.strip()}")
+    return str(json.loads(result)["status"])
+
+
+def body_admission_snapshot():
+    return psql(
+        """select json_build_array(
+               (select json_agg(l order by id) from library l),
+               (select json_agg(f order by library_id, item_key) from file f),
+               (select count(*) from object),
+               (select json_agg(p order by token_hash) from pending_uploads p)
+           )"""
+    )
+
+
+def gzip_body_status(path, size, token=None, corruption="", version=None):
+    script = f"""
+import http.client
+import json
+import zlib
+prefix = b"padding=" if {path!r} == "/login" else b'[{{"key":"BNDRY222","itemType":"book"}}]'
+padding = b"x" if {path!r} == "/login" else b" "
+compressor = zlib.compressobj(wbits=31)
+chunks = [compressor.compress(prefix)]
+remaining = {size} - len(prefix)
+while remaining:
+    count = min(remaining, 65536)
+    chunks.append(compressor.compress(padding * count))
+    remaining -= count
+chunks.append(compressor.flush())
+payload = b"".join(chunks)
+if {corruption!r} == "truncated":
+    payload = payload[:-4]
+if {corruption!r} == "crc":
+    payload = payload[:-8] + bytes([payload[-8] ^ 1]) + payload[-7:]
+headers = {{"Content-Encoding": "gzip", "Content-Type": "application/x-www-form-urlencoded"
+           if {path!r} == "/login" else "application/json"}}
+if {token!r} is not None:
+    headers["Zotero-API-Key"] = {token!r}
+if {version!r} is not None:
+    headers["If-Unmodified-Since-Version"] = str({version!r})
+connection = http.client.HTTPConnection("127.0.0.1", 8189, timeout=30)
+try:
+    connection.request("POST", {path!r}, payload, headers)
+    response = connection.getresponse()
+    response.read()
+    print(json.dumps({{"status": response.status, "decoded_bytes": {size},
+                      "encoded_bytes": len(payload), "corruption": {corruption!r}}}))
+finally:
+    connection.close()
+"""
+    result = machine.succeed(f"python3 -c {shlex.quote(script)}")
+    print(f"gzip-body {path}: {result.strip()}")
+    return str(json.loads(result)["status"])
 
 
 def restart_xotero():
@@ -1287,13 +1372,41 @@ with subtest("unknown and revoked keys fail closed"):
     assert http_code("/keys/current", "unknown-token") == "403"
     assert http_code("/keys/current", revoked) == "403"
 
+with subtest("authorization denies incomplete bodies without continuation"):
+    before = body_admission_snapshot()
+    for token in (None, "unknown-token", revoked):
+        assert incomplete_body_status("/users/202/items", token) == "403"
+    assert incomplete_body_status("/users/202/items", None, chunked=True) == "403"
+    assert incomplete_body_status("/users/202/items", alice) == "403"
+    for method in ("POST", "PUT", "PATCH", "DELETE"):
+        assert incomplete_body_status("/users/202/items", bob_ro, method) == "403"
+    assert incomplete_body_status("/uploads/unknown-capability") == "400"
+    for path in ("/uploadsuffix/token", "/uploads/token/extra", "/keys/sessionssuffix"):
+        assert incomplete_body_status(path) == "403"
+    assert body_admission_snapshot() == before
+
 with subtest("disabled users fail closed for DB and recovery keys"):
     psql("update users set disabled_at = now() where id = 202")
+    before = body_admission_snapshot()
+    assert incomplete_body_status("/users/202/items", bob_full) == "403"
+    assert body_admission_snapshot() == before
     assert http_code("/keys/current", bob_ro) == "403"
     psql("update users set disabled_at = null where id = 202")
     psql("update users set disabled_at = now() where id = 101")
+    before = body_admission_snapshot()
+    assert incomplete_body_status("/users/101/items", recovery) == "403"
+    assert body_admission_snapshot() == before
     assert http_code("/keys/current", recovery) == "403"
     psql("update users set disabled_at = null where id = 101")
+
+with subtest("file permissions deny incomplete body before decoding"):
+    psql("update api_key_user_permissions set files = false where api_key_id = 1005")
+    try:
+        before = body_admission_snapshot()
+        assert incomplete_body_status("/users/202/items/PRIVATCH/file", bob_full) == "403"
+        assert body_admission_snapshot() == before
+    finally:
+        psql("update api_key_user_permissions set files = true where api_key_id = 1005")
 
 with subtest("DB permissions allow full keys and gate read-only mutations"):
     assert (
@@ -1562,6 +1675,9 @@ with subtest("recovery upload cannot cross bootstrap-user reconfiguration"):
            where library_id = 1 and item_key = 'SHARED22'"""
     )
     restart_xotero()
+    before = body_admission_snapshot()
+    assert incomplete_body_status(f"/uploads/{recovery_pending}") == "403"
+    assert body_admission_snapshot() == before
     assert http_code(f"/uploads/{recovery_pending}", method="POST", body="world") == "403"
     psql(
         """update pending_uploads
@@ -1588,12 +1704,39 @@ with subtest("revoked key cannot finish an authorized upload"):
     ).strip()
     restart_xotero()
     psql("update api_keys set revoked_at = now() where id = 1005")
+    before = body_admission_snapshot()
+    assert incomplete_body_status(f"/uploads/{pending_token}") == "403"
+    assert body_admission_snapshot() == before
     assert http_code(f"/uploads/{pending_token}", method="POST", body="world") == "403"
 
 with subtest("revocation takes effect on the next request"):
     assert http_code("/keys/current", alice) == "200"
     psql("update api_keys set revoked_at = now() where id = 1001")
     assert http_code("/keys/current", alice) == "403"
+
+with subtest("gzip admission enforces exact public and authenticated boundaries"):
+    before = body_admission_snapshot()
+    assert gzip_body_status("/login", 1024 * 1024) == "403"
+    assert gzip_body_status("/login", 1024 * 1024 + 1) == "413"
+    for corruption in ("truncated", "crc"):
+        assert gzip_body_status("/login", 1024 * 1024, corruption=corruption) == "400"
+        assert gzip_body_status("/users/101/items", 64, recovery, corruption) == "400"
+    assert gzip_body_status("/users/101/items", 256 * 1024 * 1024 + 1, recovery) == "413"
+    assert body_admission_snapshot() == before
+    # A valid authorized JSON body padded to the actual API maximum is accepted.
+    boundary_before = json.loads(body_admission_snapshot())
+    version_before = int(psql("select version from library where id = 1"))
+    assert psql("select count(*) from object where library_id = 1 and key = 'BNDRY222'") == "0"
+    assert gzip_body_status(
+        "/users/101/items", 256 * 1024 * 1024, recovery, version=version_before
+    ) == "200"
+    version_after = int(psql("select version from library where id = 1"))
+    boundary_after = json.loads(body_admission_snapshot())
+    assert version_after == version_before + 1
+    assert boundary_after[2] == boundary_before[2] + 1
+    assert boundary_after[1] == boundary_before[1]
+    assert boundary_after[3] == boundary_before[3]
+    print(f"gzip-boundary-version before={version_before} after={version_after}")
 
 with subtest("database stores only fixed-length key digests"):
     assert psql("select count(*) from api_keys where octet_length(token_hash) = 32") == "9"

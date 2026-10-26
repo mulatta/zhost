@@ -1,6 +1,7 @@
 {
   lib,
   rustPlatform,
+  cacert,
 }:
 
 rustPlatform.buildRustPackage {
@@ -11,6 +12,10 @@ rustPlatform.buildRustPackage {
   cargoLock.lockFile = ../../../Cargo.lock;
 
   buildAndTestSubdir = "xotero";
+
+  preCheck = ''
+    export SSL_CERT_FILE=${cacert}/etc/ssl/certs/ca-bundle.crt
+  '';
 
   meta = {
     description = "Self-hosted Zotero Web API v3 sync server";

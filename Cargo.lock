@@ -2543,6 +2543,7 @@ version = "0.1.0"
 dependencies = [
  "axum",
  "flate2",
+ "futures-util",
  "hmac",
  "md-5",
  "rust-s3",
@@ -2551,6 +2552,7 @@ dependencies = [
  "sha2",
  "sqlx",
  "tokio",
+ "tower",
  "tracing",
  "tracing-subscriber",
 ]

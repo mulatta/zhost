@@ -192,11 +192,159 @@ pub(crate) fn router(state: AppState) -> Router {
         .route("/uploads/{key}", post(upload_put))
         .route("/users/{id}/deleted", get(deleted))
         // Attachment uploads exceed the default 2 MiB extractor limit; raise it
-        // to MAX_BODY (the middleware enforces the same bound while buffering).
+        // to MAX_BODY; middleware and the capability handler enforce body bounds.
         .layer(DefaultBodyLimit::max(MAX_BODY))
         .layer(middleware::from_fn_with_state(
             state.clone(),
             log_and_auth,
         ))
         .with_state(state)
+}
+
+#[cfg(test)]
+mod body_tests {
+    use super::*;
+    use std::convert::Infallible;
+    use std::io::Write;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::task::Poll;
+    use std::time::Duration;
+
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use futures_util::stream;
+    use tower::ServiceExt;
+
+    fn test_router() -> Router {
+        let storage_config = s3::Config {
+            endpoint: "http://127.0.0.1:9000".into(),
+            region: "us-east-1".into(),
+            bucket: "test".into(),
+            access_key: "test".into(),
+            secret_key: "test".into(),
+            path_style: true,
+            presign_ttl: 300,
+        };
+        let config = Config {
+            keys: HashMap::new(),
+            login_kdf_key: vec![0; 32],
+            user_id: crate::domain::UserId::new(1).unwrap(),
+            username: "test".into(),
+            display_name: "test".into(),
+            library_id: crate::domain::LibraryId::new(1).unwrap(),
+            bind: "127.0.0.1:8189".into(),
+            public_url: "http://localhost:8189".into(),
+            database_url: "postgres://localhost/test".into(),
+            s3: storage_config.clone(),
+        };
+        router(AppState {
+            config: Arc::new(config),
+            pool: sqlx::postgres::PgPoolOptions::new()
+                .connect_lazy("postgres://localhost/test")
+                .unwrap(),
+            storage: Arc::new(s3::Storage::new(&storage_config).unwrap()),
+        })
+    }
+
+    #[tokio::test]
+    async fn missing_key_returns_forbidden_without_polling_incomplete_body() {
+        // Given an incomplete application body that records every poll.
+        let polls = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&polls);
+        let body = Body::from_stream(stream::poll_fn(move |_| {
+            observed.fetch_add(1, Ordering::SeqCst);
+            Poll::<Option<Result<Bytes, Infallible>>>::Pending
+        }));
+        let request = Request::post("/users/1/items").body(body).unwrap();
+
+        // When no API key was presented.
+        let response = tokio::time::timeout(Duration::from_secs(2), test_router().oneshot(request))
+            .await
+            .expect("authorization waited for incomplete body")
+            .unwrap();
+
+        // Then authorization completes without asking the body for bytes.
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert_eq!(polls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn public_prefix_lookalikes_require_authentication_before_body_poll() {
+        for path in [
+            "/uploadsuffix/token",
+            "/keys/sessionssuffix",
+            "/uploads/token/extra",
+        ] {
+            let polls = Arc::new(AtomicUsize::new(0));
+            let observed = Arc::clone(&polls);
+            let body = Body::from_stream(stream::poll_fn(move |_| {
+                observed.fetch_add(1, Ordering::SeqCst);
+                Poll::<Option<Result<Bytes, Infallible>>>::Pending
+            }));
+            let response = tokio::time::timeout(
+                Duration::from_secs(2),
+                test_router().oneshot(Request::post(path).body(body).unwrap()),
+            )
+            .await
+            .expect("lookalike route waited for body")
+            .unwrap();
+            assert_eq!(response.status(), StatusCode::FORBIDDEN, "{path}");
+            assert_eq!(polls.load(Ordering::SeqCst), 0, "{path}");
+        }
+    }
+
+    #[tokio::test]
+    async fn corrupt_gzip_is_bad_request_instead_of_raw_fallback() {
+        let request = Request::post("/login")
+            .header("content-type", "application/x-www-form-urlencoded")
+            .header("content-encoding", "gzip")
+            .body(Body::from("not gzip"))
+            .unwrap();
+        let response = test_router().oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn truncated_gzip_is_bad_request_instead_of_raw_fallback() {
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+        encoder.write_all(b"padding=data").unwrap();
+        let mut gzip = encoder.finish().unwrap();
+        gzip.truncate(gzip.len() - 4);
+        let request = Request::post("/login")
+            .header("content-type", "application/x-www-form-urlencoded")
+            .header("content-encoding", "gzip")
+            .body(Body::from(gzip))
+            .unwrap();
+        let response = test_router().oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn public_gzip_decoded_limit_plus_one_is_rejected() {
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+        encoder.write_all(&vec![b'x'; 1024 * 1024 + 1]).unwrap();
+        let request = Request::get("/login")
+            .header("content-encoding", "gzip")
+            .body(Body::from(encoder.finish().unwrap()))
+            .unwrap();
+        let response = test_router().oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    #[tokio::test]
+    async fn public_encoded_limit_accepts_boundary_and_rejects_extra_byte() {
+        for (size, encoding, expected) in [
+            (1024 * 1024, "identity", StatusCode::FORBIDDEN),
+            (1024 * 1024 + 1, "identity", StatusCode::PAYLOAD_TOO_LARGE),
+            (1024 * 1024 + 1, "gzip", StatusCode::PAYLOAD_TOO_LARGE),
+        ] {
+            let request = Request::post("/login")
+                .header("content-type", "application/x-www-form-urlencoded")
+                .header("content-encoding", encoding)
+                .body(Body::from(vec![b'x'; size]))
+                .unwrap();
+            let response = test_router().oneshot(request).await.unwrap();
+            assert_eq!(response.status(), expected, "{encoding} {size}");
+        }
+    }
 }

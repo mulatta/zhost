@@ -1,8 +1,7 @@
 use std::collections::HashMap;
 
 use axum::{
-    body::Bytes,
-    extract::{Form, Path, State},
+    extract::{Form, Path, Request, State},
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     Extension, Json,
@@ -15,6 +14,7 @@ use crate::domain::{LibraryId, Permissions, RequestContext};
 use crate::error::{s3_error, server_error};
 use crate::http::access::{request_access, request_library};
 use crate::http::headers::{conflict, current_headers, header_value, version_headers};
+use crate::http::middleware::{buffered_body, MAX_BODY};
 use crate::http::validation::valid_key;
 use crate::{store, upload_token, AppState};
 
@@ -281,7 +281,7 @@ pub(crate) async fn pending_upload_cleanup_loop(state: AppState) {
 pub(crate) async fn upload_put(
     State(state): State<AppState>,
     Path(token): Path<String>,
-    body: Bytes,
+    request: Request,
 ) -> Response {
     let token_hash = key_hash(&token);
     let upload = match store::pending_upload(&state.pool, &token_hash).await {
@@ -346,6 +346,11 @@ pub(crate) async fn upload_put(
             Err(error) => return server_error("upload authorization", error),
         }
     }
+    let (parts, body) = request.into_parts();
+    let body = match buffered_body(body, &parts.headers, MAX_BODY).await {
+        Ok(body) => body,
+        Err(status) => return status.into_response(),
+    };
     let actual_md5 = {
         use md5::{Digest, Md5};
         format!("{:x}", Md5::new().chain_update(&body).finalize())

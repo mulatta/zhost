@@ -66,6 +66,7 @@ testPkgs.testers.runNixOSTest {
       testPkgs.jq
       testPkgs.minio-client
       testPkgs.postgresql
+      testPkgs.python3
       testPkgs.sqlx-cli
     ];
   };
