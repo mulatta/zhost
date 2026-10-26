@@ -59,7 +59,7 @@ stdenv.mkDerivation {
   '';
 
   meta = zotero.meta // {
-    description = "Zotero patched to sync against a self-hosted zhost server";
+    description = "Zotero patched to sync against a self-hosted xotero server";
     platforms = lib.platforms.linux;
     maintainers = [ lib.maintainers.mulatta ];
   };

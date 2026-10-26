@@ -35,7 +35,7 @@ let
     lib.mapAttrsToList (name: v: "pref(\"${name}\", ${prefValue v});") prefs
   );
   # null when there is nothing to add, so the platform builds skip the patch.
-  prefsFile = if prefs == { } then null else writeText "zhost-prefs.js" (prefsText + "\n");
+  prefsFile = if prefs == { } then null else writeText "xotero-prefs.js" (prefsText + "\n");
   args = {
     inherit
       apiUrl

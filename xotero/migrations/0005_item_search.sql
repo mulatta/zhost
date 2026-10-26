@@ -7,7 +7,7 @@
 -- The function is IMMUTABLE so it can index an expression, and guards a non-array
 -- `creators` value (data is stored opaquely) with jsonb_typeof so a malformed
 -- item can neither break the index nor the query.
-create or replace function zhost_item_text(data jsonb) returns text
+create or replace function xotero_item_text(data jsonb) returns text
 language sql immutable as $$
     select concat_ws(' ',
         data->>'title',
@@ -22,5 +22,5 @@ language sql immutable as $$
 $$;
 
 create index if not exists object_item_text_trgm_idx
-    on object using gin (zhost_item_text(data) gin_trgm_ops)
+    on object using gin (xotero_item_text(data) gin_trgm_ops)
     where kind = 'item';

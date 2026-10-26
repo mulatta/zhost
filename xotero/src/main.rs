@@ -2,8 +2,7 @@
 //!
 //! Objects are stored as opaque jsonb blobs in PostgreSQL (see `store`); each
 //! write bumps a single library version counter so the client's `since` reads
-//! and `If-Unmodified-Since-Version` writes stay coherent. See SPEC.md for the
-//! protocol contract.
+//! and `If-Unmodified-Since-Version` writes stay coherent.
 
 mod query;
 mod s3;
@@ -203,8 +202,8 @@ async fn key_current(headers: HeaderMap) -> Response {
     let write = key_access(&headers).is_some_and(|a| a.write);
     Json(json!({
         "userID": cfg().user_id,
-        "username": "zhost",
-        "displayName": "zhost",
+        "username": "xotero",
+        "displayName": "xotero",
         "access": access_payload(write),
     }))
     .into_response()
@@ -255,7 +254,7 @@ async fn check_session(Path(token): Path<String>) -> Response {
             "status": "completed",
             "apiKey": cfg().login_key,
             "userID": cfg().user_id,
-            "username": "zhost",
+            "username": "xotero",
         }))
         .into_response()
     } else {
@@ -290,7 +289,7 @@ async fn login_page(Query(params): Query<HashMap<String, String>>) -> Response {
     }
     // The token is server-minted hex, safe to interpolate into the hidden field.
     let body = format!(
-        "<!doctype html><meta charset=utf-8><title>zhost login</title>\
+        "<!doctype html><meta charset=utf-8><title>xotero login</title>\
          <h1>Authorize this Zotero login?</h1>\
          <form method=post action=\"/login\">\
          <input type=hidden name=session value=\"{token}\">\
@@ -1136,11 +1135,11 @@ fn app() -> Router {
         .layer(middleware::from_fn(log_and_auth))
 }
 
-/// Build the token→access map from secret files. `ZHOST_KEYS` is a
+/// Build the token→access map from secret files. `XOTERO_KEYS` is a
 /// comma-separated list of `<role>:<path>` entries (`rw`/`ro`), each path a
 /// single-line token (a sops-nix secret exposed via systemd LoadCredential).
-/// Falls back to a single read/write key from `ZHOST_API_KEY_FILE` /
-/// `ZHOST_API_KEY` for simple deployments. Returns the map and a read/write
+/// Falls back to a single read/write key from `XOTERO_API_KEY_FILE` /
+/// `XOTERO_API_KEY` for simple deployments. Returns the map and a read/write
 /// token to hand the app through the login session. Prefer files over the env,
 /// which is visible in /proc.
 fn load_keys() -> (HashMap<String, Access>, String) {
@@ -1153,11 +1152,11 @@ fn load_keys() -> (HashMap<String, Access>, String) {
     let mut keys = HashMap::new();
     let mut login_key = None;
 
-    if let Ok(manifest) = std::env::var("ZHOST_KEYS") {
+    if let Ok(manifest) = std::env::var("XOTERO_KEYS") {
         for entry in manifest.split(',').filter(|s| !s.is_empty()) {
             let (role, path) = entry
                 .split_once(':')
-                .unwrap_or_else(|| panic!("ZHOST_KEYS entry not <role>:<path>: {entry}"));
+                .unwrap_or_else(|| panic!("XOTERO_KEYS entry not <role>:<path>: {entry}"));
             let write = role == "rw";
             let token = read_token(path);
             if write && login_key.is_none() {
@@ -1166,9 +1165,9 @@ fn load_keys() -> (HashMap<String, Access>, String) {
             keys.insert(token, Access { write });
         }
     } else {
-        let token = match std::env::var("ZHOST_API_KEY_FILE") {
+        let token = match std::env::var("XOTERO_API_KEY_FILE") {
             Ok(path) => read_token(&path),
-            Err(_) => std::env::var("ZHOST_API_KEY").unwrap_or_else(|_| "zhost-dev-key".into()),
+            Err(_) => std::env::var("XOTERO_API_KEY").unwrap_or_else(|_| "xotero-dev-key".into()),
         };
         login_key = Some(token.clone());
         keys.insert(token, Access { write: true });
@@ -1199,18 +1198,18 @@ fn load_s3() -> s3::Config {
             .unwrap_or_default()
     };
     s3::Config {
-        endpoint: std::env::var("ZHOST_S3_ENDPOINT")
+        endpoint: std::env::var("XOTERO_S3_ENDPOINT")
             .unwrap_or_else(|_| "http://127.0.0.1:9000".into()),
-        region: std::env::var("ZHOST_S3_REGION").unwrap_or_else(|_| "auto".into()),
-        bucket: std::env::var("ZHOST_S3_BUCKET").unwrap_or_else(|_| "zotero".into()),
-        access_key: from_file_or_env("ZHOST_S3_ACCESS_KEY_FILE", "ZHOST_S3_ACCESS_KEY"),
-        secret_key: from_file_or_env("ZHOST_S3_SECRET_KEY_FILE", "ZHOST_S3_SECRET_KEY"),
-        path_style: std::env::var("ZHOST_S3_PATH_STYLE")
+        region: std::env::var("XOTERO_S3_REGION").unwrap_or_else(|_| "auto".into()),
+        bucket: std::env::var("XOTERO_S3_BUCKET").unwrap_or_else(|_| "zotero".into()),
+        access_key: from_file_or_env("XOTERO_S3_ACCESS_KEY_FILE", "XOTERO_S3_ACCESS_KEY"),
+        secret_key: from_file_or_env("XOTERO_S3_SECRET_KEY_FILE", "XOTERO_S3_SECRET_KEY"),
+        path_style: std::env::var("XOTERO_S3_PATH_STYLE")
             .map(|v| v != "false")
             .unwrap_or(true),
         // Short by default: the client follows the download redirect right away,
         // so the URL needn't stay valid long (it is an unauthenticated capability).
-        presign_ttl: std::env::var("ZHOST_S3_PRESIGN_TTL")
+        presign_ttl: std::env::var("XOTERO_S3_PRESIGN_TTL")
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(300),
@@ -1226,21 +1225,21 @@ async fn main() {
         .init();
 
     let (keys, login_key) = load_keys();
-    let bind = std::env::var("ZHOST_BIND").unwrap_or_else(|_| "127.0.0.1:8189".into());
+    let bind = std::env::var("XOTERO_BIND").unwrap_or_else(|_| "127.0.0.1:8189".into());
     let _ = CFG.set(Config {
         keys,
         login_key,
-        user_id: std::env::var("ZHOST_USER_ID")
+        user_id: std::env::var("XOTERO_USER_ID")
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(1),
-        public_url: std::env::var("ZHOST_PUBLIC_URL").unwrap_or_else(|_| format!("http://{bind}")),
+        public_url: std::env::var("XOTERO_PUBLIC_URL").unwrap_or_else(|_| format!("http://{bind}")),
         bind,
-        database_url: std::env::var("ZHOST_DATABASE_URL")
+        database_url: std::env::var("XOTERO_DATABASE_URL")
             .or_else(|_| std::env::var("DATABASE_URL"))
-            .unwrap_or_else(|_| "postgres://localhost/zhost".into()),
+            .unwrap_or_else(|_| "postgres://localhost/xotero".into()),
         s3: load_s3(),
-        login_authorized_user: std::env::var("ZHOST_LOGIN_AUTHORIZED_USER")
+        login_authorized_user: std::env::var("XOTERO_LOGIN_AUTHORIZED_USER")
             .ok()
             .filter(|s| !s.is_empty()),
     });
@@ -1255,7 +1254,7 @@ async fn main() {
     let listener = tokio::net::TcpListener::bind(&cfg().bind)
         .await
         .expect("bind address");
-    tracing::info!(bind = %cfg().bind, "zhost listening");
+    tracing::info!(bind = %cfg().bind, "xotero listening");
     axum::serve(listener, app())
         .with_graceful_shutdown(async {
             let _ = tokio::signal::ctrl_c().await;

@@ -8,7 +8,7 @@
 -- function that does; the array extractors below guard a non-array value so
 -- malformed data can neither break a column nor its index.
 
-create or replace function zhost_tag_names(data jsonb) returns text[]
+create or replace function xotero_tag_names(data jsonb) returns text[]
 language sql immutable as $$
     select coalesce(array(
         select t->>'tag'
@@ -18,7 +18,7 @@ language sql immutable as $$
     ), '{}')
 $$;
 
-create or replace function zhost_collection_keys(data jsonb) returns text[]
+create or replace function xotero_collection_keys(data jsonb) returns text[]
 language sql immutable as $$
     select coalesce(array(
         select c
@@ -33,9 +33,9 @@ alter table object
     add column is_top          boolean generated always as (coalesce(data->>'parentItem', '') in ('', 'false')) stored,
     add column deleted         boolean generated always as (coalesce(data->>'deleted', '0') in ('1', 'true')) stored,
     add column date_year       text    generated always as (substring(data->>'date' from '\d{4}')) stored,
-    add column search_text     text    generated always as (zhost_item_text(data)) stored,
-    add column tag_names       text[]  generated always as (zhost_tag_names(data)) stored,
-    add column collection_keys text[]  generated always as (zhost_collection_keys(data)) stored;
+    add column search_text     text    generated always as (xotero_item_text(data)) stored,
+    add column tag_names       text[]  generated always as (xotero_tag_names(data)) stored,
+    add column collection_keys text[]  generated always as (xotero_collection_keys(data)) stored;
 
 -- Replace the functional search index (migration 0005) with one on the column.
 drop index if exists object_item_text_trgm_idx;

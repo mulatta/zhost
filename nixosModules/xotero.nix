@@ -6,7 +6,7 @@
 }:
 
 let
-  cfg = config.services.zhost;
+  cfg = config.services.xotero;
 
   # Fold the apiKeyFile shorthand into the keys set.
   allKeys =
@@ -18,25 +18,25 @@ let
       };
     };
   credName = name: "key-${name}";
-  # ZHOST_KEYS: "<role>:%d/<cred>" entries; %d is the systemd credentials dir.
+  # XOTERO_KEYS: "<role>:%d/<cred>" entries; %d is the systemd credentials dir.
   keyManifest = lib.concatStringsSep "," (
     lib.mapAttrsToList (name: k: "${if k.readOnly then "ro" else "rw"}:%d/${credName name}") allKeys
   );
 in
 {
-  options.services.zhost = {
+  options.services.xotero = {
     enable = lib.mkEnableOption "self-hosted Zotero sync server";
 
     package = lib.mkOption {
       type = lib.types.package;
-      default = pkgs.zhost;
-      defaultText = lib.literalExpression "pkgs.zhost";
-      description = "The zhost package (from zhost's overlay).";
+      default = pkgs.xotero;
+      defaultText = lib.literalExpression "pkgs.xotero";
+      description = "The xotero package (from xotero's overlay).";
     };
 
     user = lib.mkOption {
       type = lib.types.str;
-      default = "zhost";
+      default = "xotero";
       description = "User the service runs as, and the PostgreSQL role (peer auth).";
     };
 
@@ -57,7 +57,7 @@ in
 
     database = lib.mkOption {
       type = lib.types.str;
-      default = "postgres:///zhost?host=/run/postgresql";
+      default = "postgres:///xotero?host=/run/postgresql";
       description = "PostgreSQL connection URL (defaults to the local peer socket).";
     };
 
@@ -137,9 +137,9 @@ in
       default = { };
       example = lib.literalExpression ''
         {
-          app.file = config.sops.secrets.zhost-app-key.path;
+          app.file = config.sops.secrets.xotero-app-key.path;
           cli = {
-            file = config.sops.secrets.zhost-cli-key.path;
+            file = config.sops.secrets.xotero-cli-key.path;
             readOnly = true;
           };
         }
@@ -173,17 +173,17 @@ in
     assertions = [
       {
         assertion = allKeys != { };
-        message = "services.zhost: configure at least one key via `keys` or `apiKeyFile`.";
+        message = "services.xotero: configure at least one key via `keys` or `apiKeyFile`.";
       }
       {
         assertion = lib.any (k: !k.readOnly) (lib.attrValues allKeys);
-        message = "services.zhost: at least one key must be read/write (the app login needs it).";
+        message = "services.xotero: at least one key must be read/write (the app login needs it).";
       }
     ];
 
     services.postgresql = lib.mkIf cfg.createLocalDatabase {
       enable = true;
-      ensureDatabases = [ "zhost" ];
+      ensureDatabases = [ "xotero" ];
       ensureUsers = [
         {
           name = cfg.user;
@@ -198,29 +198,29 @@ in
     };
     users.groups.${cfg.user} = { };
 
-    systemd.services.zhost = {
+    systemd.services.xotero = {
       description = "Self-hosted Zotero sync server";
       wantedBy = [ "multi-user.target" ];
       after = [ "network.target" ] ++ lib.optional cfg.createLocalDatabase "postgresql.service";
       requires = lib.optional cfg.createLocalDatabase "postgresql.service";
 
       environment = {
-        ZHOST_BIND = cfg.bind;
-        ZHOST_PUBLIC_URL = cfg.publicUrl;
-        ZHOST_DATABASE_URL = cfg.database;
-        ZHOST_S3_ENDPOINT = cfg.s3.endpoint;
-        ZHOST_S3_REGION = cfg.s3.region;
-        ZHOST_S3_BUCKET = cfg.s3.bucket;
-        ZHOST_S3_PATH_STYLE = lib.boolToString cfg.s3.pathStyle;
-        ZHOST_S3_PRESIGN_TTL = toString cfg.s3.presignTtl;
+        XOTERO_BIND = cfg.bind;
+        XOTERO_PUBLIC_URL = cfg.publicUrl;
+        XOTERO_DATABASE_URL = cfg.database;
+        XOTERO_S3_ENDPOINT = cfg.s3.endpoint;
+        XOTERO_S3_REGION = cfg.s3.region;
+        XOTERO_S3_BUCKET = cfg.s3.bucket;
+        XOTERO_S3_PATH_STYLE = lib.boolToString cfg.s3.pathStyle;
+        XOTERO_S3_PRESIGN_TTL = toString cfg.s3.presignTtl;
         # %d expands to the systemd credentials directory at runtime.
-        ZHOST_S3_ACCESS_KEY_FILE = "%d/s3-access-key";
-        ZHOST_S3_SECRET_KEY_FILE = "%d/s3-secret-key";
-        ZHOST_KEYS = keyManifest;
+        XOTERO_S3_ACCESS_KEY_FILE = "%d/s3-access-key";
+        XOTERO_S3_SECRET_KEY_FILE = "%d/s3-secret-key";
+        XOTERO_KEYS = keyManifest;
         RUST_LOG = "info";
       }
       // lib.optionalAttrs (cfg.loginAuthorizedUser != null) {
-        ZHOST_LOGIN_AUTHORIZED_USER = cfg.loginAuthorizedUser;
+        XOTERO_LOGIN_AUTHORIZED_USER = cfg.loginAuthorizedUser;
       };
 
       serviceConfig = {

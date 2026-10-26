@@ -1,4 +1,4 @@
-"""End-to-end coverage of the zhost sync API, driven over HTTP against the
+"""End-to-end coverage of the xotero sync API, driven over HTTP against the
 nixosModule-deployed service. Grouped by flow rather than per endpoint, since
 each run boots a VM."""
 
@@ -21,7 +21,7 @@ def library_version():
 machine.wait_for_unit("postgresql.service")
 machine.wait_for_unit("rustfs.service")
 machine.wait_for_open_port(9000)
-machine.wait_for_unit("zhost.service")
+machine.wait_for_unit("xotero.service")
 machine.wait_for_open_port(8189)
 
 # Create the attachment bucket in the S3 store before any upload.
@@ -176,7 +176,7 @@ with subtest("an attachment file uploads to S3 and downloads via a presigned URL
         f"| jq -r .uploadKey"
     ).strip()
     assert token and token != "ATTACH22", token
-    # Bytes are POSTed to the token URL (zhost verifies them and PUTs to S3);
+    # Bytes are POSTed to the token URL (xotero verifies them and PUTs to S3);
     # registration then commits via the token.
     machine.succeed(f"printf hello | curl -sf -X POST {base}/uploads/{token} --data-binary @-")
     machine.succeed(

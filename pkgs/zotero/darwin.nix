@@ -29,7 +29,7 @@ let
   };
   dmgHash =
     dmgHashes.${version}
-      or (throw "zhost: no Zotero dmg hash for ${version}; prefetch it and add it to pkgs/zotero/darwin.nix");
+      or (throw "xotero: no Zotero dmg hash for ${version}; prefetch it and add it to pkgs/zotero/darwin.nix");
 in
 stdenv.mkDerivation (finalAttrs: {
   pname = "zotero";
@@ -101,7 +101,7 @@ stdenv.mkDerivation (finalAttrs: {
     name = "zotero-darwin-install";
     text = ''
       target="''${1:-$HOME/Applications}/Zotero.app"
-      marker="$(dirname "$target")/.zotero-zhost-src"
+      marker="$(dirname "$target")/.zotero-xotero-src"
       src="${finalAttrs.finalPackage}"
 
       if [ -d "$target" ] && [ -f "$marker" ] && [ "$(cat "$marker")" = "$src" ]; then
@@ -119,7 +119,7 @@ stdenv.mkDerivation (finalAttrs: {
   };
 
   meta = {
-    description = "Zotero (official build) patched to sync against a self-hosted zhost server";
+    description = "Zotero (official build) patched to sync against a self-hosted xotero server";
     homepage = "https://www.zotero.org";
     license = lib.licenses.agpl3Only;
     sourceProvenance = [ lib.sourceTypes.binaryNativeCode ];

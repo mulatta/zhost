@@ -2528,6 +2528,22 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1ffae5123b2d3fc086436f8834ae3ab053a283cfac8fe0a0b8eaae044768a4c4"
 
 [[package]]
+name = "xotero"
+version = "0.1.0"
+dependencies = [
+ "axum",
+ "flate2",
+ "md-5",
+ "rust-s3",
+ "serde_json",
+ "serde_urlencoded",
+ "sqlx",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "yoke"
 version = "0.8.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2628,22 +2644,6 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn",
-]
-
-[[package]]
-name = "zhost"
-version = "0.1.0"
-dependencies = [
- "axum",
- "flate2",
- "md-5",
- "rust-s3",
- "serde_json",
- "serde_urlencoded",
- "sqlx",
- "tokio",
- "tracing",
- "tracing-subscriber",
 ]
 
 [[package]]

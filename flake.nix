@@ -1,5 +1,5 @@
 {
-  description = "zhost";
+  description = "xotero";
 
   inputs = {
     # keep-sorted start
@@ -57,7 +57,7 @@
       # Consumers inject their server with pkgs.zotero.override { apiUrl = ...; }.
       overlays.default = _final: prev: {
         zotero = prev.callPackage ./pkgs/zotero { inherit (prev) zotero; };
-        zhost = prev.callPackage ./pkgs/zhost { };
+        xotero = prev.callPackage ./pkgs/xotero { };
       };
 
       # programs.zotero — install + configure + (darwin) sign-on-activation. The
@@ -65,13 +65,13 @@
       # set the endpoints; applying overlays.default is not required. Curried
       # with this flake's nixpkgs so the base Zotero release is pinned here,
       # independent of the consumer's (possibly newer) nixpkgs.
-      homeModules.zotero = import ./homeModules/zotero.nix { zhostpkgs = nixpkgs; };
+      homeModules.zotero = import ./homeModules/zotero.nix { xoteropkgs = nixpkgs; };
       homeModules.default = self.homeModules.zotero;
 
       # malt deployment: systemd service + local postgres + credential-loaded key.
       # The host wires the sops secret, wg bind and reverse proxy.
-      nixosModules.zhost = ./nixosModules/zhost.nix;
-      nixosModules.default = ./nixosModules/zhost.nix;
+      nixosModules.xotero = ./nixosModules/xotero.nix;
+      nixosModules.default = ./nixosModules/xotero.nix;
 
       packages = eachSystem (
         { pkgs, ... }:
@@ -79,7 +79,7 @@
           # Default build keeps upstream endpoints; consumers override the URLs.
           # Useful for `nix build`/eval smoke tests.
           zotero = pkgs.callPackage ./pkgs/zotero { };
-          zhost = pkgs.callPackage ./pkgs/zhost { };
+          xotero = pkgs.callPackage ./pkgs/xotero { };
         }
       );
 

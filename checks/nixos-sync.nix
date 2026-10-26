@@ -1,6 +1,6 @@
 { pkgs, self }:
 
-# Headless VM running only the zhost server + postgres (no Zotero / no desktop);
+# Headless VM running only the xotero server + postgres (no Zotero / no desktop);
 # the test driver exercises the sync API directly over HTTP. The overlay is
 # applied to the host pkgs (the VM inherits it read-only) rather than set on the
 # node, which runNixOSTest forbids.
@@ -8,19 +8,19 @@ let
   testPkgs = pkgs.extend self.overlays.default;
 in
 testPkgs.testers.runNixOSTest {
-  name = "zhost-sync";
+  name = "xotero-sync";
 
   nodes.machine = {
-    imports = [ self.nixosModules.zhost ];
+    imports = [ self.nixosModules.xotero ];
 
-    services.zhost = {
+    services.xotero = {
       enable = true;
       bind = "127.0.0.1:8189";
       publicUrl = "http://localhost:8189";
       keys = {
-        app.file = testPkgs.writeText "zhost-app-key" "testtoken";
+        app.file = testPkgs.writeText "xotero-app-key" "testtoken";
         cli = {
-          file = testPkgs.writeText "zhost-cli-key" "readonlytoken";
+          file = testPkgs.writeText "xotero-cli-key" "readonlytoken";
           readOnly = true;
         };
       };
@@ -32,8 +32,8 @@ testPkgs.testers.runNixOSTest {
         endpoint = "http://127.0.0.1:9000";
         region = "us-east-1";
         bucket = "zotero";
-        accessKeyFile = testPkgs.writeText "zhost-s3-access" "rustfsadmin";
-        secretKeyFile = testPkgs.writeText "zhost-s3-secret" "rustfsadmin";
+        accessKeyFile = testPkgs.writeText "xotero-s3-access" "rustfsadmin";
+        secretKeyFile = testPkgs.writeText "xotero-s3-secret" "rustfsadmin";
       };
     };
 
@@ -49,7 +49,7 @@ testPkgs.testers.runNixOSTest {
         ''
       );
     };
-    systemd.services.zhost.after = [ "rustfs.service" ];
+    systemd.services.xotero.after = [ "rustfs.service" ];
 
     environment.systemPackages = [
       testPkgs.curl
