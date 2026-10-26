@@ -9,7 +9,7 @@ use axum::{
 use serde_json::json;
 use sha2::{Digest, Sha256};
 
-use crate::domain::{LibraryId, Permissions, RequestContext};
+use crate::domain::{LibraryId, RequestContext};
 use crate::error::{s3_error, server_error};
 use crate::http::access::{request_access, request_library};
 use crate::http::headers::{conflict, current_headers, header_value, version_headers};
@@ -61,7 +61,15 @@ pub(crate) async fn file_post(
         if upload.state != store::PendingUploadState::Uploaded {
             return (StatusCode::BAD_REQUEST, "no uploaded bytes").into_response();
         }
-        let outcome = store::register_file(&state.pool, &token_hash, request_library(), &key).await;
+        let outcome = store::register_file(
+            &state.pool,
+            &token_hash,
+            &key,
+            request_access(),
+            &context,
+            &state.config,
+        )
+        .await;
         return match outcome {
             Ok(store::FileRegistrationOutcome::Done(version)) => {
                 (StatusCode::NO_CONTENT, version_headers(version)).into_response()
@@ -76,6 +84,9 @@ pub(crate) async fn file_post(
             }
             Ok(store::FileRegistrationOutcome::InvalidUpload) => {
                 (StatusCode::BAD_REQUEST, "no pending upload").into_response()
+            }
+            Ok(store::FileRegistrationOutcome::Denied) => {
+                (StatusCode::FORBIDDEN, "upload access revoked").into_response()
             }
             Err(error) => server_error("register file", error),
         };
@@ -202,36 +213,6 @@ pub(crate) async fn file_post(
     .into_response()
 }
 
-async fn upload_scope_authorized(
-    state: &AppState,
-    upload: &store::PendingUpload,
-    principal: &crate::domain::Principal,
-    api_key_id: Option<crate::domain::ApiKeyId>,
-    permissions: Permissions,
-    static_permissions: Option<Permissions>,
-) -> sqlx::Result<bool> {
-    let Some(group_id) = upload.group_id else {
-        return Ok(principal.library_id == upload.library_id
-            && permissions.library
-            && permissions.write
-            && permissions.files);
-    };
-    match store::resolve_group_library(
-        &state.pool,
-        group_id,
-        principal.user_id,
-        api_key_id,
-        static_permissions,
-    )
-    .await?
-    {
-        store::GroupLibraryResolution::Allowed(access) => {
-            Ok(access.library_id == upload.library_id && access.file_write)
-        }
-        store::GroupLibraryResolution::Denied | store::GroupLibraryResolution::Missing => Ok(false),
-    }
-}
-
 pub(crate) async fn cleanup_pending_uploads(state: &AppState) {
     loop {
         let garbage = match store::claim_pending_upload_garbage(&state.pool, 32).await {
@@ -285,58 +266,10 @@ pub(crate) async fn upload_put(
     if upload.state != store::PendingUploadState::Authorized {
         return (StatusCode::CONFLICT, "upload token already used").into_response();
     }
-    if upload.bootstrap_user_id.is_none() {
-        let authenticated =
-            match store::authenticate_api_key(&state.pool, &upload.authorizer_key_hash).await {
-                Ok(authenticated) => authenticated,
-                Err(error) => return server_error("upload authorization", error),
-            };
-        let Some((api_key_id, principal, permissions)) = authenticated else {
-            return (StatusCode::FORBIDDEN, "API key revoked").into_response();
-        };
-        match upload_scope_authorized(
-            &state,
-            &upload,
-            &principal,
-            Some(api_key_id),
-            permissions,
-            None,
-        )
-        .await
-        {
-            Ok(true) => {}
-            Ok(false) => return (StatusCode::FORBIDDEN, "upload access revoked").into_response(),
-            Err(error) => return server_error("upload authorization", error),
-        }
-    } else if let Some(user_id) = upload.bootstrap_user_id {
-        if user_id != state.config.user_id {
-            return (StatusCode::FORBIDDEN, "bootstrap user changed").into_response();
-        }
-        let principal = match store::bootstrap_principal(&state.pool, state.config.user_id).await {
-            Ok(Some(principal)) => principal,
-            Ok(None) => return (StatusCode::FORBIDDEN, "bootstrap user disabled").into_response(),
-            Err(error) => return server_error("upload authorization", error),
-        };
-        let Some(permissions) = state
-            .config
-            .recovery_permissions(&upload.authorizer_key_hash)
-        else {
-            return (StatusCode::FORBIDDEN, "recovery key removed").into_response();
-        };
-        match upload_scope_authorized(
-            &state,
-            &upload,
-            &principal,
-            None,
-            permissions,
-            Some(permissions),
-        )
-        .await
-        {
-            Ok(true) => {}
-            Ok(false) => return (StatusCode::FORBIDDEN, "upload access revoked").into_response(),
-            Err(error) => return server_error("upload authorization", error),
-        }
+    match upload.authorized(&state.pool, &state.config).await {
+        Ok(true) => {}
+        Ok(false) => return (StatusCode::FORBIDDEN, "upload access revoked").into_response(),
+        Err(error) => return server_error("upload authorization", error),
     }
     let (parts, body) = request.into_parts();
     let body = match buffered_body(body, &parts.headers, MAX_BODY).await {

@@ -1,8 +1,12 @@
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use sqlx::postgres::PgRow;
 use sqlx::{PgPool, Row};
 
-use crate::domain::{GroupId, LibraryId, UserId};
+use crate::config::Config;
+use crate::domain::{
+    ApiKeyId, GroupId, LibraryAccess, LibraryId, Permissions, Principal, RequestContext, UserId,
+};
 
 use super::is_stored_file_attachment;
 
@@ -85,6 +89,262 @@ pub struct PendingUpload {
     pub mtime: i64,
     pub compressed: bool,
     pub state: PendingUploadState,
+}
+
+struct UploadAuthority {
+    api_key_id: Option<ApiKeyId>,
+    principal: Principal,
+    permissions: Permissions,
+}
+
+impl UploadAuthority {
+    async fn resolve(
+        conn: &mut sqlx::PgConnection,
+        config: &Config,
+        key_hash: &[u8],
+        bootstrap_user_id: Option<UserId>,
+    ) -> sqlx::Result<Option<Self>> {
+        match bootstrap_user_id {
+            Some(user_id) => {
+                if user_id != config.user_id {
+                    return Ok(None);
+                }
+                let Some(permissions) = config.recovery_permissions(key_hash) else {
+                    return Ok(None);
+                };
+                Ok(super::bootstrap_principal(conn, user_id)
+                    .await?
+                    .map(|principal| Self {
+                        api_key_id: None,
+                        principal,
+                        permissions,
+                    }))
+            }
+            None => Ok(super::authenticate_api_key(conn, key_hash).await?.map(
+                |(api_key_id, principal, permissions)| Self {
+                    api_key_id: Some(api_key_id),
+                    principal,
+                    permissions,
+                },
+            )),
+        }
+    }
+
+    async fn allows(
+        &self,
+        conn: &mut sqlx::PgConnection,
+        upload: &PendingUpload,
+        grant_rows: (bool, bool),
+    ) -> sqlx::Result<bool> {
+        let Some(group_id) = upload.group_id else {
+            return Ok(self.principal.library_id == upload.library_id
+                && self.permissions.library
+                && self.permissions.write
+                && self.permissions.files);
+        };
+        match super::groups::resolve_group_library_with_grants(
+            conn,
+            group_id,
+            self.principal.user_id,
+            self.api_key_id,
+            self.api_key_id.is_none().then_some(self.permissions),
+            grant_rows,
+        )
+        .await?
+        {
+            super::GroupLibraryResolution::Allowed(access) => {
+                Ok(access.library_id == upload.library_id && access.file_write)
+            }
+            super::GroupLibraryResolution::Denied | super::GroupLibraryResolution::Missing => {
+                Ok(false)
+            }
+        }
+    }
+}
+
+impl PendingUpload {
+    pub(crate) async fn authorized(&self, pool: &PgPool, config: &Config) -> sqlx::Result<bool> {
+        let mut conn = pool.acquire().await?;
+        let Some(authority) = UploadAuthority::resolve(
+            &mut conn,
+            config,
+            &self.authorizer_key_hash,
+            self.bootstrap_user_id,
+        )
+        .await?
+        else {
+            return Ok(false);
+        };
+        authority.allows(&mut conn, self, (true, true)).await
+    }
+}
+
+/// Discovery supplies lock candidates only. Rebinding discovered identities
+/// fails closed rather than acquiring an earlier library lock out of order.
+async fn lock_upload_authorities(
+    conn: &mut sqlx::PgConnection,
+    upload: &PendingUpload,
+    context: &RequestContext,
+    config: &Config,
+) -> sqlx::Result<Option<i64>> {
+    let caller_hash = Sha256::digest(context.presented_key.as_bytes());
+    let credentials = [
+        (
+            upload.authorizer_key_hash.as_slice(),
+            upload.bootstrap_user_id,
+        ),
+        (
+            caller_hash.as_slice(),
+            context
+                .api_key_id
+                .is_none()
+                .then_some(context.principal.user_id),
+        ),
+    ];
+    let mut authorities = Vec::with_capacity(2);
+    for (hash, bootstrap_user_id) in credentials {
+        let Some(authority) =
+            UploadAuthority::resolve(&mut *conn, config, hash, bootstrap_user_id).await?
+        else {
+            return Ok(None);
+        };
+        authorities.push(authority);
+    }
+    let mut libraries = vec![upload.library_id.get()];
+    let mut users = Vec::new();
+    let mut keys = Vec::new();
+    for authority in &authorities {
+        libraries.push(authority.principal.library_id.get());
+        users.push(authority.principal.user_id.get());
+        if let Some(key) = authority.api_key_id {
+            keys.push(key.get());
+        }
+    }
+    libraries.sort_unstable();
+    libraries.dedup();
+    let mut current_version = None;
+    for library in libraries {
+        let query = if library == upload.library_id.get() {
+            "select version from library where id = $1 for update"
+        } else {
+            "select version from library where id = $1 for share"
+        };
+        let version: Option<i64> = sqlx::query_scalar(query)
+            .bind(library)
+            .fetch_optional(&mut *conn)
+            .await?;
+        let Some(version) = version else {
+            return Ok(None);
+        };
+        if library == upload.library_id.get() {
+            current_version = Some(version);
+        }
+    }
+    if let Some(group) = upload.group_id {
+        let owner: Option<i64> = sqlx::query_scalar(
+            "select owner_user_id from groups where id = $1 and library_id = $2 for share",
+        )
+        .bind(group.get())
+        .bind(upload.library_id.get())
+        .fetch_optional(&mut *conn)
+        .await?;
+        let Some(owner) = owner else {
+            return Ok(None);
+        };
+        users.push(owner);
+    }
+    users.sort_unstable();
+    users.dedup();
+    sqlx::query("select id from users where id = any($1) order by id for share")
+        .bind(&users)
+        .fetch_all(&mut *conn)
+        .await?;
+    // Only the two credential owners need personal ownership mappings.
+    let mut owners: Vec<i64> = authorities
+        .iter()
+        .map(|authority| authority.principal.user_id.get())
+        .collect();
+    owners.sort_unstable();
+    owners.dedup();
+    let mappings = sqlx::query(
+        "select user_id from personal_libraries \
+         where user_id = any($1) order by user_id for share",
+    )
+    .bind(&owners)
+    .fetch_all(&mut *conn)
+    .await?;
+    if mappings.len() != owners.len() {
+        return Ok(None);
+    }
+    keys.sort_unstable();
+    keys.dedup();
+    for query in [
+        "select id from api_keys where id = any($1) order by id for share",
+        "select api_key_id from api_key_user_permissions \
+         where api_key_id = any($1) order by api_key_id for share",
+    ] {
+        let rows = sqlx::query(query).bind(&keys).fetch_all(&mut *conn).await?;
+        if rows.len() != keys.len() {
+            return Ok(None);
+        }
+    }
+    let mut all_grants: Vec<i64> = Vec::new();
+    let mut explicit_grants: Vec<i64> = Vec::new();
+    if let Some(group) = upload.group_id {
+        let memberships = sqlx::query(
+            "select user_id from group_memberships \
+             where group_id = $1 and user_id = any($2) order by user_id for share",
+        )
+        .bind(group.get())
+        .bind(&owners)
+        .fetch_all(&mut *conn)
+        .await?;
+        if memberships.len() != owners.len() {
+            return Ok(None);
+        }
+        all_grants = sqlx::query_scalar(
+            "select api_key_id from api_key_all_groups_permissions \
+             where api_key_id = any($1) order by api_key_id for share",
+        )
+        .bind(&keys)
+        .fetch_all(&mut *conn)
+        .await?;
+        explicit_grants = sqlx::query_scalar(
+            "select api_key_id from api_key_group_permissions \
+             where group_id = $1 and api_key_id = any($2) order by api_key_id for share",
+        )
+        .bind(group.get())
+        .bind(&keys)
+        .fetch_all(&mut *conn)
+        .await?;
+    }
+    // Re-read after all waits. Missing optional grants must not become new,
+    // unlocked positive evidence if a concurrent transaction inserts them.
+    for ((hash, bootstrap_user_id), discovered) in credentials.into_iter().zip(authorities) {
+        let Some(current) =
+            UploadAuthority::resolve(&mut *conn, config, hash, bootstrap_user_id).await?
+        else {
+            return Ok(None);
+        };
+        if current.api_key_id != discovered.api_key_id
+            || current.principal.user_id != discovered.principal.user_id
+            || current.principal.library_id != discovered.principal.library_id
+        {
+            return Ok(None);
+        }
+        let grant_rows = (
+            current
+                .api_key_id
+                .is_some_and(|id| all_grants.contains(&id.get())),
+            current
+                .api_key_id
+                .is_some_and(|id| explicit_grants.contains(&id.get())),
+        );
+        if !current.allows(&mut *conn, upload, grant_rows).await? {
+            return Ok(None);
+        }
+    }
+    Ok(current_version)
 }
 
 const PENDING_UPLOAD_COLUMNS: &str = "\
@@ -275,6 +535,7 @@ pub enum FileRegistrationOutcome {
     Conflict(i64),
     InvalidItem,
     InvalidUpload,
+    Denied,
 }
 
 /// Atomically make one immutable candidate the registered attachment and consume
@@ -283,9 +544,12 @@ pub enum FileRegistrationOutcome {
 pub async fn register_file(
     pool: &PgPool,
     token_hash: &[u8],
-    library_id: LibraryId,
     item_key: &str,
+    access: LibraryAccess,
+    context: &RequestContext,
+    config: &Config,
 ) -> sqlx::Result<FileRegistrationOutcome> {
+    let library_id = access.library_id;
     let mut tx = pool.begin().await?;
     let query = format!(
         "select {PENDING_UPLOAD_COLUMNS}, expires_at > now() as valid \
@@ -310,16 +574,16 @@ pub async fn register_file(
     }
     if upload.state != PendingUploadState::Uploaded
         || upload.library_id != library_id
+        || upload.group_id != access.group_id
         || upload.item_key != item_key
     {
         return Ok(FileRegistrationOutcome::InvalidUpload);
     }
 
-    let current_version: i64 =
-        sqlx::query_scalar("select version from library where id = $1 for update")
-            .bind(library_id.get())
-            .fetch_one(&mut *tx)
-            .await?;
+    let Some(current_version) = lock_upload_authorities(&mut tx, &upload, context, config).await?
+    else {
+        return Ok(FileRegistrationOutcome::Denied);
+    };
     let item: Option<Value> = sqlx::query_scalar(
         "select data from object \
          where library_id = $1 and kind = 'item' and key = $2 for update",

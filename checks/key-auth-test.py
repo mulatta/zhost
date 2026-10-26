@@ -2319,3 +2319,342 @@ pathlib.Path("/run/xotero-collision").write_bytes(bytes(key[:24]))
     finally:
         machine.succeed(f"rm -f {override} /run/xotero-collision && systemctl daemon-reload")
         restart_xotero()
+
+
+def registration_snapshot(library_id: int, item_key: str) -> str:
+    return psql(
+        f"""select json_build_object(
+            'library_version', (select version from library where id = {library_id}),
+            'file', (select row_to_json(f) from file f
+                     where library_id = {library_id} and item_key = '{item_key}'),
+            'item', (select row_to_json(o) from object o
+                     where library_id = {library_id} and kind = 'item' and key = '{item_key}'),
+            'pending', (select json_agg(p order by token_hash) from pending_uploads p
+                        where library_id = {library_id} and item_key = '{item_key}'))"""
+    )
+
+
+def authorize_bytes(path: str, token: str, payload: str, previous: str | None = None) -> str:
+    condition = "If-None-Match: *" if previous is None else f"If-Match: {previous}"
+    digest = hashlib.md5(payload.encode()).hexdigest()
+    response = machine.succeed(
+        f"curl -sS --max-time 10 -w '\\n%{{http_code}}' -X POST {base}{path} {api_headers} "
+        f"-H 'Zotero-API-Key: {token}' -H '{condition}' "
+        f"-d 'md5={digest}&filename=authority.txt&filesize={len(payload)}&mtime=1'"
+    )
+    body, status = response.rsplit("\n", 1)
+    assert status == "200", (path, status, body)
+    result = json.loads(body)
+    upload = result["uploadKey"]
+    assert http_code(f"/uploads/{upload}", method="POST", body=payload) == "201"
+    return upload
+
+
+def register_upload(path: str, token: str, upload: str) -> str:
+    return machine.succeed(
+        f"curl -sS --max-time 15 -o /dev/null -w '%{{http_code}}' -X POST "
+        f"{base}{path} {api_headers} -H 'Zotero-API-Key: {token}' -d 'upload={upload}'"
+    ).strip()
+
+
+with subtest("registration revalidates original authority with a different live caller"):
+    original_personal = "Task6PersonalOriginal2345"
+    registrar_personal = "Task6PersonalRegistrar23"
+    original_group = "Task6GroupOriginal234567"
+    registrar_group = "Task6GroupRegistrar23456"
+    for key_id, user_id, token, personal in (
+        (6001, 202, original_personal, True),
+        (6002, 202, registrar_personal, True),
+        (6003, 202, original_group, False),
+        (6004, 101, registrar_group, False),
+    ):
+        psql(
+            f"""insert into api_keys (id, user_id, name, token_hash)
+                values ({key_id}, {user_id}, 'registration authority fixture',
+                        decode('{sha256_hex(token)}', 'hex'));
+                insert into api_key_user_permissions (api_key_id, library, notes, write, files)
+                values ({key_id}, {str(personal).lower()}, {str(personal).lower()},
+                        {str(personal).lower()}, {str(personal).lower()})"""
+        )
+    psql(
+        """begin;
+           insert into library (id, version, kind) values (88, 0, 'group');
+           insert into groups (id, library_id, owner_user_id, name,
+                               library_editing, file_editing)
+           values (808, 88, 101, 'Registration authority fixture', 'admins', 'members');
+           insert into group_memberships (group_id, user_id, role)
+           values (808, 101, 'owner'), (808, 202, 'member');
+           insert into api_key_group_permissions (api_key_id, user_id, group_id, library, write)
+           values (6003, 202, 808, true, true), (6004, 101, 808, true, true);
+           commit"""
+    )
+    group_grant_restore = (
+        "insert into api_key_group_permissions "
+        "(api_key_id, user_id, group_id, library, write) values (6003, 202, 808, true, true)"
+    )
+    authority_failures = []
+    for label, library_id, scope, original, registrar, revoke, restore in (
+        (
+            "original-key-revoked", 22, "/users/202", original_personal, registrar_personal,
+            "update api_keys set revoked_at = now() where id = 6001",
+            "update api_keys set revoked_at = null where id = 6001",
+        ),
+        (
+            "original-personal-files-removed", 22, "/users/202", original_personal, registrar_personal,
+            "update api_key_user_permissions set files = false where api_key_id = 6001",
+            "update api_key_user_permissions set files = true where api_key_id = 6001",
+        ),
+        (
+            "original-membership-removed", 88, "/groups/808", original_group, registrar_group,
+            "delete from group_memberships where group_id = 808 and user_id = 202",
+            "insert into group_memberships (group_id, user_id, role) values (808, 202, 'member'); "
+            + group_grant_restore,
+        ),
+        (
+            "original-group-grant-removed", 88, "/groups/808", original_group, registrar_group,
+            "delete from api_key_group_permissions where api_key_id = 6003",
+            group_grant_restore,
+        ),
+        (
+            "original-group-file-policy-denied", 88, "/groups/808", original_group, registrar_group,
+            "update groups set file_editing = 'admins' where id = 808",
+            "update groups set file_editing = 'members' where id = 808",
+        ),
+        (
+            "original-key-owner-disabled", 88, "/groups/808", original_group, registrar_group,
+            "update users set disabled_at = now() where id = 202",
+            "update users set disabled_at = null where id = 202",
+        ),
+    ):
+        # Given: a real registered baseline and uploaded replacement authorized
+        # by a different credential from the still-live registering caller.
+        item_key = "T6AUTH22"
+        path = f"{scope}/items/{item_key}/file"
+        psql(
+            f"""insert into object (library_id, kind, key, version, data)
+                values ({library_id}, 'item', '{item_key}', 0,
+                        '{{"key":"{item_key}","itemType":"attachment",
+                          "linkMode":"imported_file","filename":"authority.txt"}}')"""
+        )
+        baseline = authorize_bytes(path, registrar, "hello")
+        assert register_upload(path, registrar, baseline) == "204"
+        pending = authorize_bytes(path, original, "world", hashlib.md5(b"hello").hexdigest())
+        try:
+            psql(revoke)
+            assert http_code("/keys/current", registrar) == "200"
+            assert http_code(path, registrar) == "302"
+            before = registration_snapshot(library_id, item_key)
+            # When: original authority is gone but the caller remains allowed.
+            status = register_upload(path, registrar, pending)
+            # Then: denial cannot consume the token or mutate pointer/version.
+            after = registration_snapshot(library_id, item_key)
+            receipt = {
+                "case": label, "status": int(status),
+                "before": json.loads(before), "after": json.loads(after),
+                "snapshot_unchanged": after == before,
+            }
+            print("REGISTRATION-AUTHORITY " + json.dumps(receipt, sort_keys=True))
+            if status != "403" or after != before:
+                authority_failures.append(label)
+        finally:
+            psql(restore)
+            psql(
+                f"delete from pending_uploads where library_id = {library_id} and item_key = '{item_key}'; "
+                f"delete from file where library_id = {library_id} and item_key = '{item_key}'; "
+                f"delete from object where library_id = {library_id} and kind = 'item' and key = '{item_key}'"
+            )
+    assert not authority_failures, (
+        f"stale original authorization published: {authority_failures}"
+    )
+
+with subtest("live explicit group authority registers once without personal file permission"):
+    psql(
+        """insert into object (library_id, kind, key, version, data)
+           values (88, 'item', 'T6LIVE22', 0,
+                   '{"key":"T6LIVE22","itemType":"attachment",
+                     "linkMode":"imported_file","filename":"live.txt"}')"""
+    )
+    path = "/groups/808/items/T6LIVE22/file"
+    pending = authorize_bytes(path, original_group, "hello")
+    before = int(psql("select version from library where id = 88"))
+    assert register_upload(path, registrar_group, pending) == "204"
+    snapshot = registration_snapshot(88, "T6LIVE22")
+    assert int(psql("select version from library where id = 88")) == before + 1
+    assert register_upload(path, registrar_group, pending) == "400"
+    assert registration_snapshot(88, "T6LIVE22") == snapshot
+    assert machine.succeed(
+        f"curl -sfL --max-time 10 {api_headers} -H 'Zotero-API-Key: {registrar_group}' {base}{path}"
+    ) == "hello"
+    print("REGISTRATION-AUTHORITY live-explicit-group personal-files=false statuses=204,400 bytes=hello")
+
+
+def registration_lock_race(path: str, token: str, upload: str, mutation: str,
+                           item_lock: str | None = None) -> dict:
+    """Release contenders only after PostgreSQL reports the exact blocking edge."""
+    script = f"""
+import json
+import select
+import subprocess
+from contextlib import ExitStack
+
+command = ["sudo", "-u", "xotero", "psql", "-X", "-qAt",
+           "-v", "ON_ERROR_STOP=1", "-d", "xotero"]
+
+def send(process, sql):
+    process.stdin.write((sql + "\\n").encode())
+    process.stdin.flush()
+
+def receive(process):
+    ready, _, _ = select.select([process.stdout], [], [], 15)
+    assert ready, "database observer timed out"
+    line = process.stdout.readline()
+    assert line, ("database session exited", process.poll())
+    return line.decode().strip()
+
+def observe(process, blocker, query_fragment):
+    # statement_timeout bounds a broken fixture. Success requires an observed
+    # PostgreSQL lock edge, never elapsed time or a sleep-based head start.
+    predicate = ("datname = 'xotero' and pid <> pg_backend_pid() "
+                 "and wait_event_type = 'Lock' "
+                 f"and {{blocker}} = any(pg_blocking_pids(pid)) "
+                 f"and query like '%{{query_fragment}}%'")
+    send(process, "set statement_timeout = '10s'; select 'OBSERVING'; "
+         "do $$ begin loop perform pg_stat_clear_snapshot(); "
+         f"exit when exists(select 1 from pg_stat_activity where {{predicate}}); "
+         "end loop; end $$; "
+         "select json_build_object('pid', pid, 'blockers', pg_blocking_pids(pid), "
+         "'wait_event_type', wait_event_type, 'wait_event', wait_event, 'query', query) "
+         f"from pg_stat_activity where {{predicate}};")
+    assert receive(process) == "OBSERVING"
+
+with ExitStack() as stack:
+    blocker = stack.enter_context(subprocess.Popen(command, stdin=subprocess.PIPE,
+                                  stdout=subprocess.PIPE, bufsize=0))
+    observer = stack.enter_context(subprocess.Popen(command, stdin=subprocess.PIPE,
+                                   stdout=subprocess.PIPE, bufsize=0))
+    # Termination callbacks run before Popen.__exit__ waits, even on assertion.
+    stack.callback(blocker.terminate)
+    stack.callback(observer.terminate)
+    send(blocker, "begin; " + ({item_lock!r} or {mutation!r}) +
+         "; select 'HELD:' || pg_backend_pid();")
+    held = receive(blocker)
+    while not held.startswith("HELD:"):
+        held = receive(blocker)
+    blocker_pid = int(held.removeprefix("HELD:"))
+    fragment = "from object" if {item_lock is not None!r} else "for share"
+    observe(observer, blocker_pid, fragment)
+    request = stack.enter_context(subprocess.Popen(
+        ["curl", "-sS", "--max-time", "15", "-D", "-", "-X", "POST",
+         {base + path!r}, "-H", "Zotero-API-Version: 3",
+         "-H", "Content-Type: application/x-www-form-urlencoded",
+         "-H", {"Zotero-API-Key: " + token!r}, "--data", {"upload=" + upload!r}],
+        stdout=subprocess.PIPE))
+    stack.callback(request.terminate)
+    registration_wait = json.loads(receive(observer))
+    revocation_wait = None
+    if {item_lock is not None!r}:
+        revoker = stack.enter_context(subprocess.Popen(command, stdin=subprocess.PIPE,
+                                      stdout=subprocess.PIPE, bufsize=0))
+        stack.callback(revoker.terminate)
+        observe(observer, registration_wait["pid"], "update api_keys")
+        send(revoker, {mutation!r} + "; select 'REVOKED';")
+        revocation_wait = json.loads(receive(observer))
+    send(blocker, "commit; select 'RELEASED';")
+    assert receive(blocker) == "RELEASED"
+    wire, _ = request.communicate(timeout=15)
+    assert request.returncode == 0, (request.returncode, wire.decode())
+    if {item_lock is not None!r}:
+        assert receive(revoker) == "REVOKED"
+    print(json.dumps({{"registration_wait": registration_wait,
+                      "revocation_wait": revocation_wait,
+                      "response": wire.decode()}}))
+"""
+    return json.loads(machine.succeed(f"python3 -c {shlex.quote(script)}"))
+
+
+with subtest("committed revocation wins after observed registration authority lock wait"):
+    race_cases = (
+        ("original-key", 22, "/users/202", original_personal, registrar_personal,
+         "update api_keys set revoked_at = now() where id = 6001",
+         "update api_keys set revoked_at = null where id = 6001"),
+        ("current-key", 22, "/users/202", original_personal, registrar_personal,
+         "update api_keys set revoked_at = now() where id = 6002",
+         "update api_keys set revoked_at = null where id = 6002"),
+        ("current-personal-files", 22, "/users/202", original_personal, registrar_personal,
+         "update api_key_user_permissions set files = false where api_key_id = 6002",
+         "update api_key_user_permissions set files = true where api_key_id = 6002"),
+        ("original-group-grant", 88, "/groups/808", original_group, registrar_group,
+         "update api_key_group_permissions set write = false where api_key_id = 6003",
+         "update api_key_group_permissions set write = true where api_key_id = 6003"),
+        ("current-group-grant", 88, "/groups/808", original_group, registrar_group,
+         "update api_key_group_permissions set write = false where api_key_id = 6004",
+         "update api_key_group_permissions set write = true where api_key_id = 6004"),
+        ("original-membership", 88, "/groups/808", original_group, registrar_group,
+         "delete from group_memberships where group_id = 808 and user_id = 202",
+         "insert into group_memberships (group_id, user_id, role) values (808, 202, 'member'); "
+         + group_grant_restore),
+        ("group-file-policy", 88, "/groups/808", original_group, registrar_group,
+         "update groups set file_editing = 'none' where id = 808",
+         "update groups set file_editing = 'members' where id = 808"),
+        ("group-owner-disabled", 88, "/groups/808", original_group, registrar_group,
+         "update users set disabled_at = now() where id = 101",
+         "update users set disabled_at = null where id = 101"),
+    )
+    for index, (label, library_id, scope, original, registrar, revoke, restore) in enumerate(race_cases):
+        item_key = "T6RACE" + "23456789"[index] + "2"
+        path = f"{scope}/items/{item_key}/file"
+        psql(
+            f"""insert into object (library_id, kind, key, version, data)
+                values ({library_id}, 'item', '{item_key}', 0,
+                        '{{"key":"{item_key}","itemType":"attachment",
+                          "linkMode":"imported_file","filename":"race.txt"}}')"""
+        )
+        pending = authorize_bytes(path, original, "hello")
+        before = registration_snapshot(library_id, item_key)
+        try:
+            receipt = registration_lock_race(path, registrar, pending, revoke)
+            after = registration_snapshot(library_id, item_key)
+            receipt.update({"case": label, "winner": "revocation",
+                            "before": json.loads(before), "after": json.loads(after)})
+            print("REGISTRATION-LOCK " + json.dumps(receipt, sort_keys=True))
+            assert receipt["response"].splitlines()[0].split()[1] == "403", receipt
+            assert after == before, receipt
+        finally:
+            psql(restore)
+        # Denial leaves an intact capability: restored authority can commit once.
+        assert register_upload(path, registrar, pending) == "204"
+        snapshot = registration_snapshot(library_id, item_key)
+        assert register_upload(path, registrar, pending) == "400"
+        assert registration_snapshot(library_id, item_key) == snapshot
+
+with subtest("locked registration commits before a later revocation"):
+    psql(
+        """insert into object (library_id, kind, key, version, data)
+           values (22, 'item', 'T6FIRST2', 0,
+                   '{"key":"T6FIRST2","itemType":"attachment",
+                     "linkMode":"imported_file","filename":"first.txt"}')"""
+    )
+    path = "/users/202/items/T6FIRST2/file"
+    pending = authorize_bytes(path, original_personal, "hello")
+    before = registration_snapshot(22, "T6FIRST2")
+    try:
+        receipt = registration_lock_race(
+            path, registrar_personal, pending,
+            "update api_keys set revoked_at = now() where id = 6001",
+            "select 1 from object where library_id = 22 and key = 'T6FIRST2' for update",
+        )
+        after = registration_snapshot(22, "T6FIRST2")
+        receipt.update({"case": "registration-first", "winner": "registration",
+                        "before": json.loads(before), "after": json.loads(after)})
+        print("REGISTRATION-LOCK " + json.dumps(receipt, sort_keys=True))
+        assert receipt["response"].splitlines()[0].split()[1] == "204", receipt
+        assert json.loads(after)["library_version"] == json.loads(before)["library_version"] + 1
+        assert json.loads(after)["pending"] is None
+        assert register_upload(path, registrar_personal, pending) == "400"
+        assert registration_snapshot(22, "T6FIRST2") == after
+        assert machine.succeed(
+            f"curl -sfL --max-time 10 {api_headers} "
+            f"-H 'Zotero-API-Key: {registrar_personal}' {base}{path}"
+        ) == "hello"
+    finally:
+        psql("update api_keys set revoked_at = null where id = 6001")

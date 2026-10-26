@@ -147,8 +147,8 @@ pub async fn bootstrap_external_identity(
 
 /// Resolve the bootstrap principal on every static-key request so disabling the
 /// user takes effect immediately.
-pub async fn bootstrap_principal(
-    pool: &PgPool,
+pub async fn bootstrap_principal<'e>(
+    executor: impl sqlx::PgExecutor<'e>,
     user_id: UserId,
 ) -> sqlx::Result<Option<Principal>> {
     let row = sqlx::query(
@@ -159,15 +159,15 @@ pub async fn bootstrap_principal(
          where u.id = $1 and u.disabled_at is null and l.kind = 'personal'",
     )
     .bind(user_id.get())
-    .fetch_optional(pool)
+    .fetch_optional(executor)
     .await?;
     row.as_ref().map(principal_from_row).transpose()
 }
 
 /// Resolve a user-owned key from its SHA-256 digest. No positive result is
 /// cached: revocation and user disablement apply on the next request.
-pub async fn authenticate_api_key(
-    pool: &PgPool,
+pub async fn authenticate_api_key<'e>(
+    executor: impl sqlx::PgExecutor<'e>,
     token_hash: &[u8],
 ) -> sqlx::Result<Option<(ApiKeyId, Principal, Permissions)>> {
     let row = sqlx::query(
@@ -182,7 +182,7 @@ pub async fn authenticate_api_key(
            and u.disabled_at is null and l.kind = 'personal'",
     )
     .bind(token_hash)
-    .fetch_optional(pool)
+    .fetch_optional(executor)
     .await?;
     row.as_ref()
         .map(|row| {

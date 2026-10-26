@@ -151,12 +151,31 @@ pub enum GroupLibraryResolution {
     Allowed(LibraryAccess),
 }
 
-pub async fn resolve_group_library(
-    pool: &PgPool,
+pub async fn resolve_group_library<'e>(
+    executor: impl sqlx::PgExecutor<'e>,
     group_id: GroupId,
     user_id: UserId,
     api_key_id: Option<ApiKeyId>,
     static_permissions: Option<Permissions>,
+) -> sqlx::Result<GroupLibraryResolution> {
+    resolve_group_library_with_grants(
+        executor,
+        group_id,
+        user_id,
+        api_key_id,
+        static_permissions,
+        (true, true),
+    )
+    .await
+}
+
+pub(super) async fn resolve_group_library_with_grants<'e>(
+    executor: impl sqlx::PgExecutor<'e>,
+    group_id: GroupId,
+    user_id: UserId,
+    api_key_id: Option<ApiKeyId>,
+    static_permissions: Option<Permissions>,
+    grant_rows: (bool, bool),
 ) -> sqlx::Result<GroupLibraryResolution> {
     let row = sqlx::query(
         "select g.library_id, g.library_editing, g.file_editing, membership.role, \
@@ -171,15 +190,17 @@ pub async fn resolve_group_library(
          left join group_memberships membership \
            on membership.group_id = g.id and membership.user_id = $2 \
          left join api_key_all_groups_permissions all_grant \
-           on all_grant.api_key_id = $3 \
+           on all_grant.api_key_id = $3 and $4 \
          left join api_key_group_permissions explicit_grant \
-           on explicit_grant.api_key_id = $3 and explicit_grant.group_id = g.id \
+           on explicit_grant.api_key_id = $3 and explicit_grant.group_id = g.id and $5 \
          where g.id = $1",
     )
     .bind(group_id.get())
     .bind(user_id.get())
     .bind(api_key_id.map(ApiKeyId::get))
-    .fetch_optional(pool)
+    .bind(grant_rows.0)
+    .bind(grant_rows.1)
+    .fetch_optional(executor)
     .await?;
     let Some(row) = row else {
         return Ok(GroupLibraryResolution::Missing);
