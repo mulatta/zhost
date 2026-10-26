@@ -31,9 +31,10 @@ pub(crate) async fn read(
         // 304 as "no data", which then mismatches its library-version check and
         // makes it restart the sync forever. 304 is only for the header path
         // (settings), not for `?since=` versions reads.
-        let current = store::current_version(&state.pool, request_library())
-            .await
-            .unwrap_or(0);
+        let current = match store::current_version(&state.pool, request_library()).await {
+            Ok(current) => current,
+            Err(error) => return server_error("read version", error),
+        };
         return match store::versions(&state.pool, request_library(), kind, since, true).await {
             Ok(value) => (version_headers(current), Json(value)).into_response(),
             Err(error) => server_error("read", error),
@@ -41,7 +42,10 @@ pub(crate) async fn read(
     }
     let keys = csv_of(&params, &format!("{kind}Key"));
     match store::objects(&state.pool, request_library(), kind, &keys, true).await {
-        Ok(value) => (current_headers(state).await, Json(value)).into_response(),
+        Ok(value) => match current_headers(state).await {
+            Ok(headers) => (headers, Json(value)).into_response(),
+            Err(error) => server_error("read version", error),
+        },
         Err(error) => server_error("read", error),
     }
 }
@@ -57,9 +61,10 @@ async fn item_sync_read(state: &AppState, params: &query::Params, top: bool) -> 
             .and_then(|s| s.parse().ok())
             .unwrap_or(0);
         // Always 200 + map (never 304); see `read` — a 304 here loops the client.
-        let current = store::current_version(&state.pool, request_library())
-            .await
-            .unwrap_or(0);
+        let current = match store::current_version(&state.pool, request_library()).await {
+            Ok(current) => current,
+            Err(error) => return Some(server_error("items versions", error)),
+        };
         let result = if top {
             store::top_versions(
                 &state.pool,
@@ -95,7 +100,10 @@ async fn item_sync_read(state: &AppState, params: &query::Params, top: bool) -> 
             )
             .await
             {
-                Ok(value) => (current_headers(state).await, Json(value)).into_response(),
+                Ok(value) => match current_headers(state).await {
+                    Ok(headers) => (headers, Json(value)).into_response(),
+                    Err(error) => server_error("items batch version", error),
+                },
                 Err(error) => server_error("items batch", error),
             },
         );
@@ -121,7 +129,10 @@ async fn item_listing(
     .await
     {
         Ok((items, total)) => {
-            let mut headers = current_headers(state).await;
+            let mut headers = match current_headers(state).await {
+                Ok(headers) => headers,
+                Err(error) => return server_error("items query version", error),
+            };
             headers.insert("total-results", total.to_string().parse().unwrap());
             if q.start + q.limit < total {
                 let link = next_link(&state.config, path, raw, q.start + q.limit);
@@ -155,7 +166,10 @@ async fn item_keys_response(
         {
             // A `String` body sets `Content-Type: text/plain`, which is what the
             // client expects; current_headers adds `Last-Modified-Version`.
-            Ok(keys) => (current_headers(state).await, keys.join("\n")).into_response(),
+            Ok(keys) => match current_headers(state).await {
+                Ok(headers) => (headers, keys.join("\n")).into_response(),
+                Err(error) => server_error("item keys version", error),
+            },
             Err(error) => server_error("item keys", error),
         },
     )

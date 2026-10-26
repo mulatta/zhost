@@ -563,6 +563,161 @@ with subtest("current-key introspection returns the authenticated DB owner"):
         }}'"""
     )
 
+with subtest("library version lookup failures return 500 without version headers"):
+    # Given: warmed real queries and ordinary service-role column privileges.
+    acl_sql = """select json_build_array(
+        current_user, (select rolsuper from pg_roles where rolname = current_user),
+        (select pg_get_userbyid(relowner) from pg_class where oid = 'library'::regclass),
+        has_table_privilege('library', 'SELECT'),
+        has_column_privilege('library', 'id', 'SELECT'),
+        has_column_privilege('library', 'kind', 'SELECT'),
+        has_column_privilege('library', 'version', 'SELECT'),
+        (select count(*) from pg_attribute a, lateral aclexplode(a.attacl)
+         where attrelid = 'library'::regclass),
+        (select coalesce(json_agg(a order by a::text), '[]'::json)
+         from (select grantee, privilege_type, is_grantable
+               from pg_class c, lateral aclexplode(c.relacl)
+               where c.oid = 'library'::regclass and grantee <> c.relowner) a)
+    )"""
+    acl_before = json.loads(psql(acl_sql))
+    assert acl_before[:8] == ["xotero", False, "xotero", True, True, True, True, 0], acl_before
+    print("VERSION-FAULT engine=" + psql("select version()") + " acl=" + json.dumps(acl_before))
+    snapshot_sql = " union all ".join(
+        f"select '{table}', md5(coalesce(string_agg(row_to_json(t)::text, "
+        f"'' order by row_to_json(t)::text), '')) from {table} t"
+        for table in (
+            "library", "object", "file", "setting", "fulltext", "deletion",
+            "pending_uploads", "users", "personal_libraries", "api_keys",
+            "api_key_user_permissions", "api_key_group_permissions",
+            "api_key_all_groups_permissions", "groups", "group_memberships",
+        )
+    )
+    snapshot_before = psql(snapshot_sql)
+    versions_before = psql("select id, version from library order by id")
+    failures = []
+
+    def version_response(
+        path: str, expected: int, phase: str, extra: str = "",
+        method: str = "GET", token: str = alice,
+    ) -> tuple[int, list[str], str]:
+        command = (
+            f"curl --max-time 10 -sS -i -X {method} {api_headers} "
+            f"-H 'Zotero-API-Key: {token}' {extra} {shlex.quote(base + path)}"
+        )
+        raw = machine.succeed(command).replace("\r\n", "\n")
+        headers, _, body = raw.partition("\n\n")
+        status = int(headers.splitlines()[0].split()[1])
+        version_headers = [
+            line.split(":", 1)[1].strip()
+            for line in headers.splitlines()
+            if line.lower().startswith("last-modified-version:")
+        ]
+        receipt = dict(phase=phase, command=command, status=status,
+                       versions=version_headers, headers=headers, body=body)
+        print("VERSION-FAULT " + json.dumps(receipt))
+        if status != expected or (phase == "fault" and version_headers):
+            failures.append(receipt)
+        return status, version_headers, body
+
+    requests = []
+    for scope, library_id, item_key in (
+        ("/users/101", 1, "LEGACY22"), ("/groups/303", 33, "GRPBKK22"),
+    ):
+        current = int(psql(f"select version from library where id = {library_id}"))
+        requests.extend([
+            (f"{scope}/settings?since=0", 200, "", "GET", current),
+            (f"{scope}/settings", 304, f"-H 'If-Modified-Since-Version: {current}'", "GET", current),
+            (f"{scope}/settings?since={current}", 304, "", "GET", current),
+            (f"{scope}/items?itemKey={item_key}&format=json", 200, "", "GET", current),
+            (f"{scope}/collections?collectionKey=MISS2222&format=json", 200, "", "GET", current),
+            (f"{scope}/searches?searchKey=MISS2222&format=json", 200, "", "GET", current),
+            (f"{scope}/items?limit=1", 200, "", "GET", current),
+            (f"{scope}/items?format=keys", 200, "", "GET", current),
+            (f"{scope}/tags", 200, "", "GET", current),
+            (f"{scope}/deleted?since=0", 200, "", "GET", current),
+        ])
+        for endpoint in ("items", "items/top", "collections", "searches", "fulltext"):
+            for since in (0, current):
+                requests.append((f"{scope}/{endpoint}?format=versions&since={since}", 200, "", "GET", current))
+        for endpoint, method, body, status in (
+            ("items", "POST", "[]", 200), ("settings", "POST", "{}", 204),
+            ("settings?settingKey=", "DELETE", None, 204),
+            ("tags?tags=", "DELETE", None, 204),
+            ("fulltext", "POST", "[]", 200),
+            ("items?itemKey=", "DELETE", None, 204),
+            ("items", "POST", '[{"key":"FAULT222","itemType":"book"}]', 412),
+        ):
+            expected_version = current - 1 if status == 412 else current
+            extra = f"-H 'If-Unmodified-Since-Version: {expected_version}'"
+            if body is not None:
+                extra += f" -H 'Content-Type: application/json' --data {shlex.quote(body)}"
+            requests.append((f"{scope}/{endpoint}", status, extra, method, current))
+    file_form = "filename=legacy.pdf&filesize=5&mtime=1700000000000&md5="
+    for precondition, md5, status in (
+        ("If-None-Match: *", "5d41402abc4b2a76b9719d911017c592", 200),
+        ("If-None-Match: *", "00000000000000000000000000000000", 412),
+        ("If-Match: 00000000000000000000000000000000", "5d41402abc4b2a76b9719d911017c592", 412),
+    ):
+        requests.append(("/users/101/items/LEGACY22/file", status,
+                         f"-H '{precondition}' --data '{file_form}{md5}'", "POST",
+                         int(psql("select version from library where id = 1"))))
+
+    def version_controls(phase: str) -> None:
+        for token, owner in ((alice, 101), (bob, 202), (recovery, 101)):
+            assert get_json("/keys/current", token)["userID"] == owner
+        for path, token, method, extra, status in (
+            ("/keys/current", "invalidkey", "GET", "", 403),
+            ("/users/101/settings", bob, "GET", "", 403),
+            ("/groups/303/items?format=versions", bob_full, "GET", "", 403),
+            ("/groups/999/items?format=versions", alice, "GET", "", 404),
+            ("/users/101/items/bad!/file", alice, "POST", "-H 'If-None-Match: *' --data md5=0", 400),
+            ("/users/101/items", alice, "POST", "--data invalid-json", 400),
+            ("/users/101/items", alice, "POST", "--data '[]'", 428),
+        ):
+            assert version_response(path, status, phase + "-control", extra, method, token)[0] == status
+        assert get_json("/users/101/groups?format=versions", alice) == {"303": 4}
+        print("VERSION-FAULT controls=" + phase + " owners=101,202,101 invalid=403 group-discovery=200")
+
+    for path, status, extra, method, current in requests:
+        actual, headers, body = version_response(path, status, "warm", extra, method)
+        assert actual == status and headers == [str(current)], (path, actual, headers)
+        if "format=versions&since=" in path and path.endswith(f"since={current}"):
+            assert json.loads(body) == {}
+    version_controls("warm")
+
+    # When: deny only library-version SELECT, leaving live authentication intact.
+    try:
+        print("VERSION-FAULT SQL: BEGIN; REVOKE SELECT ON TABLE public.library FROM xotero; GRANT SELECT (id, kind) ON TABLE public.library TO xotero; COMMIT;")
+        psql("begin; revoke select on table public.library from xotero; grant select (id, kind) on table public.library to xotero; commit")
+        acl_fault = json.loads(psql(acl_sql))
+        assert acl_fault[:7] == ["xotero", False, "xotero", False, True, True, False], acl_fault
+        assert psql("select id, kind from library where id = 1") == "1|personal"
+        denied, denial = machine.execute(
+            "sudo -u xotero psql -v ON_ERROR_STOP=1 -v VERBOSITY=verbose -At "
+            "-d xotero -c 'select version from library where id = 1' 2>&1"
+        )
+        print("VERSION-FAULT SQLSTATE receipt: " + denial)
+        assert denied != 0 and "42501" in denial, (denied, denial)
+        version_controls("fault")
+        # Then: all version-dependent paths fail without a fabricated header.
+        for path, _, extra, method, _ in requests:
+            version_response(path, 500, "fault", extra, method)
+    finally:
+        print("VERSION-FAULT SQL: BEGIN; REVOKE SELECT (id, kind) ON TABLE public.library FROM xotero; GRANT SELECT ON TABLE public.library TO xotero; COMMIT;")
+        psql("begin; revoke select (id, kind) on table public.library from xotero; grant select on table public.library to xotero; commit")
+        assert json.loads(psql(acl_sql)) == acl_before
+        assert psql(snapshot_sql) == snapshot_before
+        assert psql("select id, version from library order by id") == versions_before
+        print("VERSION-FAULT restore=effective-privileges-equal snapshots=unchanged versions=" + versions_before)
+        version_controls("restored")
+        for path, status, extra, method, current in requests:
+            actual, headers, body = version_response(path, status, "restored", extra, method)
+            assert actual == status and headers == [str(current)], (path, actual, headers)
+            if "format=versions&since=" in path and path.endswith(f"since={current}"):
+                assert json.loads(body) == {}
+        assert psql(snapshot_sql) == snapshot_before
+    assert not failures, json.dumps(failures)
+
 with subtest("group listings intersect user membership with key grants"):
     assert (
         psql(

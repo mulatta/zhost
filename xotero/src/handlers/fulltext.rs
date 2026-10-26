@@ -22,9 +22,10 @@ pub(crate) async fn fulltext_versions(
 ) -> Response {
     let since = since_of(&params);
     // Always 200 + map (never 304); see `read` — a 304 here loops the client.
-    let current = store::current_version(&state.pool, request_library())
-        .await
-        .unwrap_or(0);
+    let current = match store::current_version(&state.pool, request_library()).await {
+        Ok(current) => current,
+        Err(error) => return server_error("fulltext versions", error),
+    };
     match store::fulltext_versions(&state.pool, request_library(), since).await {
         Ok(value) => (version_headers(current), Json(value)).into_response(),
         Err(error) => server_error("fulltext versions", error),

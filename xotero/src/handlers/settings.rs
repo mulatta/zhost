@@ -26,7 +26,10 @@ pub(crate) async fn settings_read(
     // The client may send the cursor as ?since= or the If-Modified-Since-Version
     // header; honour whichever is higher.
     let since = since_of(&params).max(if_modified_since(&headers));
-    let (current, fresh) = since_check(&state, since).await;
+    let (current, fresh) = match since_check(&state, since).await {
+        Ok(result) => result,
+        Err(error) => return server_error("settings version", error),
+    };
     if fresh {
         return (StatusCode::NOT_MODIFIED, version_headers(current)).into_response();
     }
@@ -110,7 +113,10 @@ pub(crate) async fn deleted(
 ) -> Response {
     let since = since_of(&params);
     match store::deleted(&state.pool, request_library(), since).await {
-        Ok(value) => (current_headers(&state).await, Json(value)).into_response(),
+        Ok(value) => match current_headers(&state).await {
+            Ok(headers) => (headers, Json(value)).into_response(),
+            Err(error) => server_error("deleted version", error),
+        },
         Err(error) => server_error("deleted", error),
     }
 }

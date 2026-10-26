@@ -15,7 +15,10 @@ use crate::{store, AppState};
 /// `GET /users/<id>/tags`: distinct tags with item counts.
 pub(crate) async fn tags_get(State(state): State<AppState>) -> Response {
     match store::tags(&state.pool, request_library()).await {
-        Ok(value) => (current_headers(&state).await, Json(value)).into_response(),
+        Ok(value) => match current_headers(&state).await {
+            Ok(headers) => (headers, Json(value)).into_response(),
+            Err(error) => server_error("tags version", error),
+        },
         Err(error) => server_error("tags", error),
     }
 }

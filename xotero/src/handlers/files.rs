@@ -137,14 +137,15 @@ pub(crate) async fn file_post(
         // different existing file → conflict.
         if let Some(existing) = &stored_md5 {
             if existing.eq_ignore_ascii_case(&md5) {
-                return (current_headers(&state).await, Json(json!({ "exists": 1 })))
-                    .into_response();
+                return match current_headers(&state).await {
+                    Ok(headers) => (headers, Json(json!({ "exists": 1 }))).into_response(),
+                    Err(error) => server_error("file authorization version", error),
+                };
             }
-            return conflict(
-                store::current_version(&state.pool, request_library())
-                    .await
-                    .unwrap_or(0),
-            );
+            return match store::current_version(&state.pool, request_library()).await {
+                Ok(current) => conflict(current),
+                Err(error) => server_error("file authorization version", error),
+            };
         }
     } else if let Some(want) = &if_match {
         // "Only if the current md5 matches." Otherwise → conflict.
@@ -152,11 +153,10 @@ pub(crate) async fn file_post(
             .as_deref()
             .is_some_and(|m| m.eq_ignore_ascii_case(want))
         {
-            return conflict(
-                store::current_version(&state.pool, request_library())
-                    .await
-                    .unwrap_or(0),
-            );
+            return match store::current_version(&state.pool, request_library()).await {
+                Ok(current) => conflict(current),
+                Err(error) => server_error("file authorization version", error),
+            };
         }
     }
 

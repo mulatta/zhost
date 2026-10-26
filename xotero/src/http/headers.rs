@@ -16,12 +16,10 @@ pub(crate) fn version_headers(version: i64) -> HeaderMap {
     headers
 }
 
-pub(crate) async fn current_headers(state: &AppState) -> HeaderMap {
-    version_headers(
-        store::current_version(&state.pool, request_library())
-            .await
-            .unwrap_or(0),
-    )
+pub(crate) async fn current_headers(state: &AppState) -> sqlx::Result<HeaderMap> {
+    Ok(version_headers(
+        store::current_version(&state.pool, request_library()).await?,
+    ))
 }
 
 /// For a since/versions read: the current library version, and whether the
@@ -29,11 +27,9 @@ pub(crate) async fn current_headers(state: &AppState) -> HeaderMap {
 /// version greater than `since`). `since == 0` is the initial pull, so never
 /// 304 it. One DB read, so the caller reuses `current` for the response's
 /// `Last-Modified-Version` instead of querying it again.
-pub(crate) async fn since_check(state: &AppState, since: i64) -> (i64, bool) {
-    let current = store::current_version(&state.pool, request_library())
-        .await
-        .unwrap_or(0);
-    (current, since > 0 && since >= current)
+pub(crate) async fn since_check(state: &AppState, since: i64) -> sqlx::Result<(i64, bool)> {
+    let current = store::current_version(&state.pool, request_library()).await?;
+    Ok((current, since > 0 && since >= current))
 }
 
 /// The `If-Modified-Since-Version` request header (0 if absent/unparseable). The
