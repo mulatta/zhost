@@ -1,4 +1,8 @@
-# zhost sync server — Zotero Web API v3 implementation spec
+# xotero API
+
+> Rewrite pending. This text predates multi-user support. It still says single
+> user and omits `/groups/...` and `/xotero/...`. Use `checks/contracts` and the
+> code until the rewrite lands.
 
 Derived from the Zotero client sync code (`~/git/zotero/chrome/content/zotero/xpcom/sync/`,
 `storage/zfs.js`), the official Web API v3 docs, and live testing against a real
@@ -6,7 +10,7 @@ Zotero 9 client. This is the contract the server must satisfy so a
 (URL-redirected) stock client syncs against it. The server implements the entire
 sync contract below; "out of scope" items remain unimplemented. The
 "Read/query API (CLI-facing extension)" section is also implemented, but is a
-zhost addition beyond the sync subset — it is not part of what the sync client
+xotero addition beyond the sync subset — it is not part of what the sync client
 needs.
 
 Client file references use `syncAPIClient.js` (the request layer), `syncEngine.js`
@@ -68,9 +72,9 @@ while the level is declared in deployment config:
 
 `GET /keys/current` reports the requesting key's own access (`access.user.write`
 reflects read-only); the login session (`/keys/sessions`) hands out a read/write
-key, since the app that drives it needs to write. Config: `ZHOST_KEYS` is a
+key, since the app that drives it needs to write. Config: `XOTERO_KEYS` is a
 comma-separated list of `<role>:<path>` entries (`rw`/`ro`); each path is a
-single-line token file. A single `ZHOST_API_KEY_FILE`/`ZHOST_API_KEY` is still
+single-line token file. A single `XOTERO_API_KEY_FILE`/`XOTERO_API_KEY` is still
 accepted as one read/write key.
 
 ### Enrollment & public exposure
@@ -254,7 +258,7 @@ newline-separated list rather than JSON. The sync client uses it on
 JSON listing would return.
 
 Matching is case-insensitive substring (`ILIKE`). The default `titleCreatorYear`
-search runs against an immutable `zhost_item_text(data)` expression (title, date
+search runs against an immutable `xotero_item_text(data)` expression (title, date
 and creator names) carrying a `pg_trgm` GIN index (migration `0005`), so it is
 index-backed rather than a sequential scan. Full-text search (`qmode=everything`)
 additionally matches the `fulltext` table — also `pg_trgm`-indexed on `content`
@@ -277,7 +281,7 @@ Tables (see `migrations/`):
   **metadata** only; the bytes live in the bucket under the item key.
 
 Not in the database: **attachment bytes** live in the S3 bucket (config via
-`ZHOST_S3_*`; credentials loaded from secret files at boot). **API keys** are held
+`XOTERO_S3_*`; credentials loaded from secret files at boot). **API keys** are held
 in memory, loaded from secret files at boot (see Auth → Access keys). **Pending
 uploads** (between the file authorisation and registration steps) and **login
 sessions** (between creation and authorization) are held in memory, keyed by

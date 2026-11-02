@@ -1,171 +1,158 @@
-# zhost
+# xotero
 
-A self-hosted [Zotero](https://www.zotero.org) sync stack: keep one library in
-sync across your own machines — metadata **and** attachment files — without
-zotero.org or any third-party cloud. A small server reimplements the subset of
-the Zotero Web API v3 that the client needs, and stock Zotero clients are
-pointed at it.
+A self-hosted, multi-user server for the [Zotero](https://www.zotero.org) Web API.
+One deployment holds many users, private personal libraries, and shared group
+libraries, with no zotero.org account or third-party cloud. Metadata lives in
+PostgreSQL and attachment bytes live in S3-compatible storage.
 
-> **Status: in active development (pre-1.0).** The sync contract is implemented
-> and tested, but interfaces, the schema, and the deployment surface may still
-> change without notice. Expect breaking changes.
+> **Status: in active development (pre-1.0).** Interfaces, the schema, and the
+> deployment surface may still change without notice. This pre-alpha server has
+> not received a security audit.
+>
+> See [`docs/ROADMAP.md`](docs/ROADMAP.md) for the release plan and debt list, and
+> [`docs/DESIGN.md`](docs/DESIGN.md) for how the system works.
 
 ## How it works
 
-- **Client redirect, no patching.** Zotero reads its sync endpoint from a hidden
-  pref, so setting `extensions.zotero.api.url` (and `streaming.url`) redirects
-  all sync and authentication to your server. No app patch or re-sign needed.
-- **Server.** A Rust/axum service backed by PostgreSQL. Library objects (items,
-  collections, searches) are stored as opaque `jsonb` blobs keyed by
-  `(kind, key)`; a single library version counter is bumped per write so the
-  client's `since` reads and `If-Unmodified-Since-Version` writes stay coherent.
-  Attachment bytes go to an S3-compatible bucket (Cloudflare R2): uploads pass
-  through the server (which verifies the md5), downloads redirect to a pre-signed
-  URL the client follows straight to the bucket.
-- **Auth.** Single user, single library. The client obtains a read/write API
-  token through Zotero's browser-login session flow, which the server gates so
-  the token is released only after the login is approved (via SSO when exposed
-  publicly, or the private network otherwise). The token is a bearer string
-  checked on every request. Multiple tokens can be configured, each read/write or
-  read-only — handy for giving a CLI or agent read-only access while the app keeps
-  write access.
+- **Server.** A Rust/axum service backed by PostgreSQL. Library objects stay
+  canonical `jsonb` documents, and each library has its own version counter so
+  `since` reads and `If-Unmodified-Since-Version` writes stay coherent.
+- **Identity.** OIDC stays at a trusted reverse proxy. The server maps the verified
+  `(issuer, subject)` claims to a local user, and email is never an identity key.
+- **Authorization.** Every request resolves to one user or group library and its
+  permissions before a handler reads data. Group roles are owner, admin, and
+  member.
+- **API keys.** Keys are stored as digests, owned by a user, scoped to libraries
+  and to read, write, notes, and files permissions, and revoked immediately.
+- **Attachments.** Uploads pass through the server for verification and go to a
+  library-scoped object. Downloads redirect to a short-lived pre-signed URL.
 
-The full request contract is documented in [`server/SPEC.md`](server/SPEC.md).
-The same endpoints serve any token-holding client, so a CLI can read items,
-files and full-text directly over HTTP without the Zotero app.
+The API contract is in [`docs/API.md`](docs/API.md). The executable inventory of
+supported routes is in `checks/contracts`.
+
+## Clients
+
+Pinned upstream [Web Library](https://github.com/zotero/web-library) is the
+supported client target, and its packaging is still in progress. Until then, use
+the HTTP API with an API key. The browser-approved login flow at `/keys/sessions`
+stays available for issuing keys, but desktop Zotero is not a supported client.
+The remaining `homeModules.zotero` and patched `zotero` outputs will be removed.
 
 ## Components (flake outputs)
 
-| Output | Purpose |
-| --- | --- |
-| `packages.zhost` | the sync server binary |
-| `nixosModules.zhost` | systemd service + local postgres + credential-loaded keys |
-| `homeModules.zotero` | `programs.zotero`: stock client configured at the server |
-| `overlays.default` | `pkgs.zotero` patched to point at a self-hosted server |
+| Output                | Purpose                                                  |
+| --------------------- | -------------------------------------------------------- |
+| `packages.xotero`     | the server binary                                        |
+| `nixosModules.xotero` | systemd service, local PostgreSQL, loaded credentials    |
+| `overlays.default`    | adds `pkgs.xotero`                                       |
 
 ## Deployment
 
-The server binds to localhost behind a reverse proxy. The data API is protected
-by the bearer token, so it is safe to expose over HTTPS; the one path that hands
-out a token — the login session's `/login` step — must be gated, either by SSO
-(public deployment) or by a private network (WireGuard/ZeroTier). The token is
-provisioned as a secret, never generated by the server.
+The server must bind to a loopback address behind a reverse proxy. The proxy
+authenticates the browser with OIDC, removes any identity headers sent by the
+caller, and sets `X-Xotero-OIDC-Issuer` and `X-Xotero-OIDC-Subject` from verified
+claims. Expose the server only over HTTPS.
 
-**Generate the tokens** (one line each, any high-entropy string):
+**Generate the secrets** (one line each):
 
 ```sh
 openssl rand -hex 32
 ```
 
-Store them with sops-nix / clan vars (or any secret manager); the server reads
-them from files. The S3 bucket needs a (bucket-scoped) access key / secret key
-the same way.
-
-**Server:**
+Store them with sops-nix, clan vars, or another secret manager. The server reads
+them from files.
 
 ```nix
-imports = [ inputs.zhost.nixosModules.zhost ];
-nixpkgs.overlays = [ inputs.zhost.overlays.default ];
+imports = [ inputs.xotero.nixosModules.xotero ];
+nixpkgs.overlays = [ inputs.xotero.overlays.default ];
 
-services.zhost = {
+services.xotero = {
   enable = true;
   bind = "127.0.0.1:8189";
-  publicUrl = "https://zotero.example.org";   # reverse-proxy address, no trailing slash
+  publicUrl = "https://zotero.example.org";   # no trailing slash
+
+  # The first user. This runs once, and later starts never repair the mapping.
+  bootstrapUserId = 1;
+  bootstrapUsername = "alice";
+  bootstrapDisplayName = "Alice";
+  bootstrapOidcIssuer = "https://id.example.org";
+  bootstrapOidcSubject = "248289761001";
+
+  # At least 32 bytes. Replicas must share this value.
+  loginKdfKeyFile = config.sops.secrets."xotero/login-kdf".path;
+
   s3 = {
     endpoint = "https://<account>.r2.cloudflarestorage.com";
     bucket = "zotero";
-    accessKeyFile = config.sops.secrets."zhost/s3-access".path;
-    secretKeyFile = config.sops.secrets."zhost/s3-secret".path;
+    accessKeyFile = config.sops.secrets."xotero/s3-access".path;
+    secretKeyFile = config.sops.secrets."xotero/s3-secret".path;
   };
-  keys = {
-    # The Zotero app needs write access.
-    app.file = config.sops.secrets."zhost/app-key".path;
-    # A CLI / agent that should only read.
-    cli = {
-      file = config.sops.secrets."zhost/cli-key".path;
-      readOnly = true;
-    };
-  };
-};
 
-# Reverse proxy -> http://127.0.0.1:8189, with /login behind your SSO
-# (e.g. oauth2-proxy) when the vhost is public. On a private network the network
-# is the gate and /login needs no extra auth.
-```
-
-For a single read/write key, `apiKeyFile = config.sops.secrets."zhost/api-key".path;`
-is shorthand for one `keys` entry.
-
-**Client (home-manager):**
-
-```nix
-imports = [ inputs.zhost.homeModules.zotero ];
-nixpkgs.overlays = [ inputs.zhost.overlays.default ];
-
-programs.zotero = {
-  enable = true;
-  apiUrl = "https://zotero.malt.wg/";
-  streamUrl = "wss://zotero.malt.wg/stream/";
+  # Optional recovery credentials. Users get their own database keys.
+  keys.recovery.file = config.sops.secrets."xotero/recovery-key".path;
 };
 ```
 
-Then sign in once per device via Zotero's Sync preferences.
+Attachment upload limits are set with `uploadConcurrency`, `uploadParts`,
+`uploadMaxBytes`, and `uploadTimeout`.
 
 ## Security
 
-- **Token-gated data API.** Every request carries the bearer token over HTTPS;
-  the read/write token is the crown jewel, so a CLI / agent gets a read-only one.
-- **Gated enrollment.** The only path that hands out a token is the login
-  session, released only after `/login` approves it — behind SSO when public, or
-  the private network otherwise. File downloads use unguessable, expiring
-  pre-signed URLs, so they need no token (mirroring pre-signed storage URLs).
-- **Secrets at rest:** the API tokens and the S3 keys are provisioned out of band
-  and loaded as systemd credentials; never placed in the Nix store or environment.
-- **Encryption at rest** for attachment bytes is the object store's concern (e.g.
-  bucket-level encryption), not the application's.
+- **Authorize first.** The server authorizes a request before it reads the body.
+  Lookup failures stop the request.
+- **User-owned keys.** Each key belongs to one user and has explicit scopes. No
+  shared key is returned to several users.
+- **Recovery credentials.** Configured keys are validated at startup and kept only
+  as digests.
+- **File access.** Registration rechecks the original upload authority. File
+  downloads use expiring pre-signed URLs, so they need no API key.
+- **Secrets at rest.** API secrets and S3 keys are provisioned out of band and
+  loaded as systemd credentials. They never enter the Nix store or environment.
+- **Encryption at rest** for attachment bytes is the object store's concern.
 
 ## Status
 
-Validated end-to-end against a real Zotero 9 client (cross-machine sync of
-metadata and attachment files, both directions) and by a NixOS VM test
-(`checks/nixos-sync`) exercising the API and the module on Linux.
+Implemented and covered by NixOS VM tests:
 
-Implemented: the full sync contract — objects, settings, deletions, write
-conflict semantics (`If-Unmodified-Since-Version` → `412`), the three-step file
-upload and S3-backed download, full-text content storage, read-only API keys, and
-authorization-gated login sessions — plus the CLI-facing read/query API:
-`GET /items` with search (`q`, and
-`qmode=everything` over stored full-text), `itemType`/`tag` filters, sorting and
-paginated results (`Total-Results` + `Link: …; rel="next"`), and the
-`/items/top`, `/items/trash`, `/collections/<key>/items` and `/tags` listings.
-See `server/SPEC.md` for the full contract.
+- objects, settings, deletions, conditional writes, and full-text content
+- the three-step attachment upload and S3-backed download
+- OIDC identity mapping, database API keys, and browser login sessions
+- personal and private group libraries with role-based access
+- the read and query API, including search, filters, sorting, and pagination
 
-Out of scope: group libraries, the streaming server, binary-diff uploads, and
-styled bibliography/citation rendering (done downstream from the raw data).
+Remaining work includes the packaged Web Library, full public API coverage,
+exports, health endpoints, graceful shutdown, and backup and restore drills.
+Internal Zotero.org infrastructure is out of scope.
 
 ## Development
 
 ```sh
-nix develop            # postgres + sqlx-cli + rust toolchain
-nix build .#zhost
+nix develop            # postgres + sqlx-cli + rust toolchain + clippy
+cargo fmt
+cargo clippy --all-targets --all-features
+cargo test
+nix build .#xotero
 ```
 
-Run against a local database and an S3-compatible store (e.g. RustFS or MinIO on
-`:9000`):
+Run against a local database and an S3-compatible store (e.g. RustFS on `:9000`):
 
 ```sh
-ZHOST_DATABASE_URL='postgres:///zhost?host=/run/postgresql' \
-ZHOST_S3_ENDPOINT='http://127.0.0.1:9000' ZHOST_S3_BUCKET='zotero' \
-ZHOST_S3_ACCESS_KEY='...' ZHOST_S3_SECRET_KEY='...' \
-  result/bin/zhost
+XOTERO_DATABASE_URL='postgres:///xotero?host=/run/postgresql' \
+XOTERO_S3_ENDPOINT='http://127.0.0.1:9000' XOTERO_S3_BUCKET='zotero' \
+XOTERO_S3_ACCESS_KEY='...' XOTERO_S3_SECRET_KEY='...' \
+XOTERO_BOOTSTRAP_OIDC_ISSUER='https://id.example.org' \
+XOTERO_BOOTSTRAP_OIDC_SUBJECT='dev-user' \
+XOTERO_LOGIN_KDF_KEY_FILE='./login-kdf' \
+  result/bin/xotero
 ```
 
-Configuration is via environment variables: `ZHOST_BIND`, `ZHOST_PUBLIC_URL`,
-`ZHOST_DATABASE_URL`, the `ZHOST_S3_*` group (`ENDPOINT`, `REGION`, `BUCKET`,
-`ACCESS_KEY[_FILE]`, `SECRET_KEY[_FILE]`, `PATH_STYLE`, `PRESIGN_TTL`), and `ZHOST_KEYS` (or
-`ZHOST_API_KEY_FILE` / `ZHOST_API_KEY` for a single key in local development).
-The NixOS integration test (`nix build .#checks.x86_64-linux.nixos-sync`) runs the
-full flow against a RustFS instance.
+Configuration uses environment variables. The main groups are `XOTERO_BIND`,
+`XOTERO_PUBLIC_URL`, `XOTERO_DATABASE_URL`, `XOTERO_S3_*`, `XOTERO_BOOTSTRAP_*`,
+`XOTERO_UPLOAD_*`, `XOTERO_USER_ID`, `XOTERO_USERNAME`, `XOTERO_DISPLAY_NAME`,
+`XOTERO_LOGIN_KDF_KEY_FILE`, and `XOTERO_KEYS`.
+
+See [`docs/TESTING.md`](docs/TESTING.md) for the verification tiers. For example,
+`nix build .#checks.x86_64-linux.nixos-sync` runs the full flow against RustFS.
 
 ## License
 
