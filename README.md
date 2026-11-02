@@ -36,7 +36,6 @@ Pinned upstream [Web Library](https://github.com/zotero/web-library) is the
 supported client target, and its packaging is still in progress. Until then, use
 the HTTP API with an API key. The browser-approved login flow at `/keys/sessions`
 stays available for issuing keys, but desktop Zotero is not a supported client.
-The remaining `homeModules.zotero` and patched `zotero` outputs will be removed.
 
 ## Components (flake outputs)
 

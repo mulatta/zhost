@@ -39,7 +39,7 @@ browser or API client
 | `xotero/src/store/`   | store facade and one module per persistence domain       |
 | `xotero/src/upload.rs` | bounded attachment upload path (_unmerged_)             |
 | `xotero/migrations/`  | ordered SQL migrations                                   |
-| `nix/`                | packages, NixOS and Home Manager modules, check wiring   |
+| `nix/`                | package, NixOS module, check wiring                      |
 | `checks/`             | integration test scripts and API contract inventory      |
 
 ## Identity and authentication
